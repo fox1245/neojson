@@ -684,7 +684,6 @@ public:
                 return (*m_object->m_value.array)[static_cast<std::size_t>(idx_)];
             }
             case value_t::null:
-            case value_t::discarded:
                 throw invalid_iterator::create(214, "cannot get value");
             default:
                 if (idx_ == 0) {
@@ -714,7 +713,6 @@ public:
                 return &((*m_object->m_value.array)[static_cast<std::size_t>(idx_)]);
             }
             case value_t::null:
-            case value_t::discarded:
                 throw invalid_iterator::create(214, "cannot get value");
             default:
                 if (idx_ == 0) {

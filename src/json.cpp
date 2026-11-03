@@ -859,20 +859,71 @@ json json::parse(std::string_view s, parser_callback_t /*cb*/, const bool allow_
             const std::string token(s.substr(err.pos, idx - err.pos));
             throw out_of_range::create(406, "number overflow parsing '" + token + "'");
         }
-        const std::size_t byte_pos = err.pos + 1;
-        std::size_t line = 1;
-        std::size_t col = 0;
-        const std::size_t limit = std::min(err.pos, s.size());
-        for (std::size_t idx = 0; idx < limit; ++idx) {
-            if (s[idx] == '\n') {
-                ++line;
-                col = 0;
-            } else {
-                ++col;
+        std::size_t err_pos = err.pos;
+        const char* msg = err.msg != nullptr ? err.msg : "syntax error";
+        if (err.code == YYJSON_READ_ERROR_JSON_STRUCTURE && err_pos < s.size() &&
+            s[err_pos] == ',') {
+            ++err_pos;
+            while (err_pos < s.size()) {
+                if (s[err_pos] == ' ' || s[err_pos] == '\t' || s[err_pos] == '\n' ||
+                    s[err_pos] == '\r') {
+                    ++err_pos;
+                } else if (ignore_comments && err_pos + 1 < s.size() && s[err_pos] == '/' &&
+                           s[err_pos + 1] == '/') {
+                    err_pos += 2;
+                    while (err_pos < s.size() && s[err_pos] != '\n' && s[err_pos] != '\r') {
+                        ++err_pos;
+                    }
+                } else if (ignore_comments && err_pos + 1 < s.size() && s[err_pos] == '/' &&
+                           s[err_pos + 1] == '*') {
+                    err_pos += 2;
+                    while (err_pos + 1 < s.size() &&
+                           !(s[err_pos] == '*' && s[err_pos + 1] == '/')) {
+                        ++err_pos;
+                    }
+                    if (err_pos + 1 < s.size()) {
+                        err_pos += 2;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if (err_pos < s.size() && s[err_pos] == ']') {
+                msg = "syntax error while parsing value - unexpected ']'; expected '[', '{', or a "
+                      "literal";
+            } else if (err_pos < s.size() && s[err_pos] == '}') {
+                msg = "syntax error while parsing object key - unexpected '}'; expected string "
+                      "literal";
+            }
+        } else if (err.code == YYJSON_READ_ERROR_LITERAL && err_pos < s.size()) {
+            std::string_view expected;
+            if (s[err_pos] == 't') {
+                expected = "true";
+            } else if (s[err_pos] == 'f') {
+                expected = "false";
+            } else if (s[err_pos] == 'n') {
+                expected = "null";
+            }
+            if (!expected.empty()) {
+                std::size_t k = 0;
+                while (k < expected.size() && err_pos < s.size() && s[err_pos] == expected[k]) {
+                    ++err_pos;
+                    ++k;
+                }
             }
         }
-        ++col;
-        const char* msg = err.msg != nullptr ? err.msg : "syntax error";
+        const std::size_t byte_pos = err_pos + 1;
+        std::size_t lines_read = 0;
+        std::size_t col = 0;
+        const std::size_t limit = std::min(err_pos, s.size());
+        for (std::size_t idx = 0; idx <= limit; ++idx) {
+            ++col;
+            if (idx < s.size() && s[idx] == '\n') {
+                ++lines_read;
+                col = 0;
+            }
+        }
+        const std::size_t line = lines_read + 1;
         throw parse_error::create(101, byte_pos, line, col, msg);
     }
 

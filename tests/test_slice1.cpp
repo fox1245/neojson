@@ -987,4 +987,310 @@ TEST(Slice1, RandomOperationSequences) {
     }
 }
 
+// ==================== Edge-Case Contracts ====================
+
+TEST(Slice1, EdgeCaseContracts) {
+    // 1. Dereferencing end()/rend() and calling key() at end()/rend() throw invalid_iterator.214.
+    {
+        nlohmann::ordered_json o_null;
+        jsonkit::json s_null;
+        expect_same_exception([&] { (void)*o_null.end(); }, [&] { (void)*s_null.end(); });
+
+        nlohmann::ordered_json o_num = 42;
+        jsonkit::json s_num = 42;
+        expect_same_exception([&] { (void)*o_num.end(); }, [&] { (void)*s_num.end(); });
+
+        nlohmann::ordered_json o_disc(nlohmann::ordered_json::value_t::discarded);
+        jsonkit::json s_disc(jsonkit::json::value_t::discarded);
+        expect_same_exception([&] { (void)*o_disc.end(); }, [&] { (void)*s_disc.end(); });
+
+        jsonkit::json s_obj = {{"a", 1}, {"b", 2}};
+        const jsonkit::json& cs_obj = s_obj;
+        auto expect_214 = [](auto&& fn) {
+            bool threw = false;
+            try {
+                fn();
+            } catch (const jsonkit::json::invalid_iterator& e) {
+                threw = true;
+                EXPECT_EQ(e.id, 214);
+                EXPECT_EQ(std::string_view(e.what()).substr(0, 36),
+                          "[json.exception.invalid_iterator.214");
+            }
+            EXPECT_TRUE(threw);
+        };
+        expect_214([&] { (void)s_obj.end().key(); });
+        expect_214([&] { (void)cs_obj.end().key(); });
+        expect_214([&] { (void)s_obj.rend().key(); });
+        expect_214([&] { (void)cs_obj.rend().key(); });
+        expect_214([&] { (void)*s_obj.end(); });
+        expect_214([&] { (void)*cs_obj.end(); });
+        expect_214([&] { (void)*s_obj.rend(); });
+
+        jsonkit::json s_arr = {10, 20};
+        expect_214([&] { (void)*s_arr.end(); });
+        expect_214([&] { (void)*s_arr.cend(); });
+    }
+
+    // 2. Default-constructed iterators: equality and relational operators on iterator and
+    //    const_iterator.
+    {
+        jsonkit::json::iterator it1{};
+        jsonkit::json::iterator it2{};
+        jsonkit::json::const_iterator cit1{};
+        jsonkit::json::const_iterator cit2{};
+
+        EXPECT_TRUE(it1 == it2);
+        EXPECT_FALSE(it1 != it2);
+        EXPECT_FALSE(it1 < it2);
+        EXPECT_TRUE(it1 <= it2);
+        EXPECT_FALSE(it1 > it2);
+        EXPECT_TRUE(it1 >= it2);
+
+        EXPECT_TRUE(cit1 == cit2);
+        EXPECT_FALSE(cit1 != cit2);
+        EXPECT_FALSE(cit1 < cit2);
+        EXPECT_TRUE(cit1 <= cit2);
+        EXPECT_FALSE(cit1 > cit2);
+        EXPECT_TRUE(cit1 >= cit2);
+
+        EXPECT_TRUE(it1 == cit1);
+        EXPECT_FALSE(it1 != cit1);
+        EXPECT_FALSE(it1 < cit1);
+        EXPECT_FALSE(cit1 < it1);
+    }
+
+    // 3. Range insert: non-array target (309), foreign pos (202), same array (211),
+    //    iterators of two different values (210), inverted range (204), and valid range insert.
+    {
+        nlohmann::ordered_json o_a = {1, 2, 3};
+        jsonkit::json s_a = {1, 2, 3};
+        nlohmann::ordered_json o_b = {4, 5};
+        jsonkit::json s_b = {4, 5};
+        nlohmann::ordered_json o_c = {6, 7};
+        jsonkit::json s_c = {6, 7};
+        nlohmann::ordered_json o_obj = {{"k", 1}};
+        jsonkit::json s_obj = {{"k", 1}};
+
+        // Non-array target -> type_error.309
+        expect_same_exception([&] { o_obj.insert(o_a.begin(), o_b.begin(), o_b.end()); },
+                              [&] { s_obj.insert(s_a.begin(), s_b.begin(), s_b.end()); });
+
+        // Foreign pos -> invalid_iterator.202
+        expect_same_exception([&] { o_a.insert(o_b.begin(), o_b.begin(), o_b.end()); },
+                              [&] { s_a.insert(s_b.begin(), s_b.begin(), s_b.end()); });
+
+        // Same array -> invalid_iterator.211
+        expect_same_exception([&] { o_a.insert(o_a.begin(), o_a.begin(), o_a.end()); },
+                              [&] { s_a.insert(s_a.begin(), s_a.begin(), s_a.end()); });
+
+        // Iterators of two different values -> invalid_iterator.210
+        expect_same_exception([&] { o_a.insert(o_a.begin(), o_b.begin(), o_c.end()); },
+                              [&] { s_a.insert(s_a.begin(), s_b.begin(), s_c.end()); });
+
+        // Inverted range -> invalid_iterator.204
+        nlohmann::ordered_json o_prim = 99;
+        jsonkit::json s_prim = 99;
+        expect_same_exception(
+            [&] { (void)nlohmann::ordered_json(o_prim.end(), o_prim.begin()); },
+            [&] { (void)jsonkit::json(s_prim.end(), s_prim.begin()); });
+        expect_same_exception([&] { (void)o_prim.erase(o_prim.end(), o_prim.begin()); },
+                              [&] { (void)s_prim.erase(s_prim.end(), s_prim.begin()); });
+        {
+            bool threw_204 = false;
+            try {
+                s_a.insert(s_a.begin(), s_b.end(), s_b.begin());
+            } catch (const jsonkit::json::invalid_iterator& e) {
+                threw_204 = true;
+                EXPECT_EQ(e.id, 204);
+            }
+            EXPECT_TRUE(threw_204);
+        }
+
+        // Valid range from another array that succeeds
+        expect_same_exception([&] { o_a.insert(o_a.begin() + 1, o_b.begin(), o_b.end()); },
+                              [&] { s_a.insert(s_a.begin() + 1, s_b.begin(), s_b.end()); });
+        assert_equivalent(o_a, s_a);
+    }
+
+    // 4. update(first, last) validation order and null target promotion.
+    {
+        nlohmann::ordered_json o_target = {{"k", 1}};
+        jsonkit::json s_target = {{"k", 1}};
+        nlohmann::ordered_json o_o1 = {{"a", 2}};
+        jsonkit::json s_o1 = {{"a", 2}};
+        nlohmann::ordered_json o_o2 = {{"b", 3}};
+        jsonkit::json s_o2 = {{"b", 3}};
+        nlohmann::ordered_json o_arr = {1, 2};
+        jsonkit::json s_arr = {1, 2};
+        nlohmann::ordered_json o_arr2 = {3, 4};
+        jsonkit::json s_arr2 = {3, 4};
+
+        // Two different objects -> invalid_iterator.210
+        expect_same_exception([&] { o_target.update(o_o1.begin(), o_o2.end()); },
+                              [&] { s_target.update(s_o1.begin(), s_o2.end()); });
+        assert_equivalent(o_target, s_target);
+
+        // Non-object range from a single array -> type_error.312
+        expect_same_exception([&] { o_target.update(o_arr.begin(), o_arr.end()); },
+                              [&] { s_target.update(s_arr.begin(), s_arr.end()); });
+        assert_equivalent(o_target, s_target);
+
+        // Two different arrays on object target: iterator match (210) precedes source-type (312)
+        expect_same_exception([&] { o_target.update(o_arr.begin(), o_arr2.end()); },
+                              [&] { s_target.update(s_arr.begin(), s_arr2.end()); });
+        assert_equivalent(o_target, s_target);
+
+        // Array target with two different objects: target-type (312) precedes iterator match (210)
+        nlohmann::ordered_json o_arr_target = {10};
+        jsonkit::json s_arr_target = {10};
+        expect_same_exception([&] { o_arr_target.update(o_o1.begin(), o_o2.end()); },
+                              [&] { s_arr_target.update(s_o1.begin(), s_o2.end()); });
+        assert_equivalent(o_arr_target, s_arr_target);
+
+        // Null target with non-object range: promotes null to {} before throwing type_error.312
+        nlohmann::ordered_json o_null_target;
+        jsonkit::json s_null_target;
+        expect_same_exception([&] { o_null_target.update(o_arr.begin(), o_arr.end()); },
+                              [&] { s_null_target.update(s_arr.begin(), s_arr.end()); });
+        assert_equivalent(o_null_target, s_null_target);
+
+        // Null target with two different arrays: promotes null to {} before throwing 210
+        nlohmann::ordered_json o_null_target2;
+        jsonkit::json s_null_target2;
+        expect_same_exception([&] { o_null_target2.update(o_arr.begin(), o_arr2.end()); },
+                              [&] { s_null_target2.update(s_arr.begin(), s_arr2.end()); });
+        assert_equivalent(o_null_target2, s_null_target2);
+    }
+
+    // 5. All six relational operators for every pair drawn from: discarded, a NaN number,
+    //    null, 0, 0.0, -0.0, "a", [], {} in both key orders, including discarded against itself.
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        std::vector<std::pair<nlohmann::ordered_json, jsonkit::json>> vals = {
+            {nlohmann::ordered_json(nlohmann::ordered_json::value_t::discarded),
+             jsonkit::json(jsonkit::json::value_t::discarded)},
+            {nlohmann::ordered_json(nan), jsonkit::json(nan)},
+            {nlohmann::ordered_json(nullptr), jsonkit::json(nullptr)},
+            {nlohmann::ordered_json(0), jsonkit::json(0)},
+            {nlohmann::ordered_json(0u), jsonkit::json(0u)},
+            {nlohmann::ordered_json(0.0), jsonkit::json(0.0)},
+            {nlohmann::ordered_json(-0.0), jsonkit::json(-0.0)},
+            {nlohmann::ordered_json("a"), jsonkit::json("a")},
+            {nlohmann::ordered_json::array(), jsonkit::json::array()},
+            {nlohmann::ordered_json::object(), jsonkit::json::object()},
+            {nlohmann::ordered_json({{"a", 1}, {"b", 2}}),
+             jsonkit::json({{"a", 1}, {"b", 2}})},
+            {nlohmann::ordered_json({{"b", 2}, {"a", 1}}),
+             jsonkit::json({{"b", 2}, {"a", 1}})},
+        };
+
+        for (std::size_t i = 0; i < vals.size(); ++i) {
+            for (std::size_t j = 0; j < vals.size(); ++j) {
+                SCOPED_TRACE("pair (" + std::to_string(i) + ", " + std::to_string(j) + ")");
+                const auto& o1 = vals[i].first;
+                const auto& s1 = vals[i].second;
+                const auto& o2 = vals[j].first;
+                const auto& s2 = vals[j].second;
+                EXPECT_EQ(o1 == o2, s1 == s2);
+                EXPECT_EQ(o1 != o2, s1 != s2);
+                EXPECT_EQ(o1 < o2, s1 < s2);
+                EXPECT_EQ(o1 <= o2, s1 <= s2);
+                EXPECT_EQ(o1 > o2, s1 > s2);
+                EXPECT_EQ(o1 >= o2, s1 >= s2);
+            }
+        }
+    }
+
+    // 6. json(value_t::discarded): size(), empty(), begin() == end(), and iteration count.
+    {
+        nlohmann::ordered_json o_disc(nlohmann::ordered_json::value_t::discarded);
+        jsonkit::json s_disc(jsonkit::json::value_t::discarded);
+
+        EXPECT_EQ(o_disc.size(), s_disc.size());
+        EXPECT_EQ(o_disc.empty(), s_disc.empty());
+        EXPECT_EQ(o_disc.begin() == o_disc.end(), s_disc.begin() == s_disc.end());
+        EXPECT_EQ(o_disc.cbegin() == o_disc.cend(), s_disc.cbegin() == s_disc.cend());
+
+        std::size_t o_count = 0;
+        for (auto it = o_disc.begin(); it != o_disc.end(); ++it) {
+            EXPECT_TRUE(it->is_discarded());
+            EXPECT_TRUE((*it).is_discarded());
+            ++o_count;
+        }
+        std::size_t s_count = 0;
+        for (auto it = s_disc.begin(); it != s_disc.end(); ++it) {
+            EXPECT_TRUE(it->is_discarded());
+            EXPECT_TRUE((*it).is_discarded());
+            ++s_count;
+        }
+        EXPECT_EQ(o_count, s_count);
+        EXPECT_EQ(s_count, 1u);
+    }
+
+    // 7. Parse errors: message line/column and byte for an unterminated array,
+    //    a bad literal on the second line, an unescaped LF in a string, and a trailing comma.
+    {
+        auto extract_line_col = [](std::string_view what) -> std::string_view {
+            const auto pos = what.find("parse error at line ");
+            if (pos == std::string_view::npos) {
+                return {};
+            }
+            const auto colon = what.find(':', pos);
+            if (colon == std::string_view::npos) {
+                return {};
+            }
+            return what.substr(pos, colon - pos);
+        };
+
+        const std::vector<std::string> bad_inputs = {
+            "[1, 2",
+            "\"a\n\"",
+            "[\n  tru]",
+            "[\n  tru\n]",
+            "[\n  fal]",
+            "[\n  nul]",
+            "[\n  bad]",
+            "[1,]",
+            "[1, ]",
+            "{\"a\":1,}",
+            "{\n  \"a\": 1,\n}",
+        };
+
+        for (const auto& input : bad_inputs) {
+            SCOPED_TRACE("input=" + input);
+            int o_id = 0;
+            std::size_t o_byte = 0;
+            std::string o_what;
+            try {
+                (void)nlohmann::ordered_json::parse(input);
+                FAIL() << "Expected oracle parse_error";
+            } catch (const nlohmann::ordered_json::parse_error& e) {
+                o_id = e.id;
+                o_byte = e.byte;
+                o_what = e.what();
+            }
+
+            int s_id = 0;
+            std::size_t s_byte = 0;
+            std::string s_what;
+            try {
+                (void)jsonkit::json::parse(input);
+                FAIL() << "Expected subject parse_error";
+            } catch (const jsonkit::json::parse_error& e) {
+                s_id = e.id;
+                s_byte = e.byte;
+                s_what = e.what();
+            }
+
+            EXPECT_EQ(o_id, s_id);
+            EXPECT_EQ(o_byte, s_byte);
+            EXPECT_FALSE(extract_line_col(o_what).empty());
+            EXPECT_EQ(extract_line_col(o_what), extract_line_col(s_what));
+            if (input.find(',') != std::string::npos && input.back() != '2') {
+                EXPECT_EQ(o_what, s_what);
+            }
+        }
+    }
+}
+
 } // namespace
