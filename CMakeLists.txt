@@ -44,6 +44,12 @@ if(JSONKIT_BUILD_TESTS)
     file(GLOB JSONKIT_TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/*.cpp)
     add_executable(jsonkit_tests ${JSONKIT_TEST_SOURCES})
     target_link_libraries(jsonkit_tests PRIVATE jsonkit::jsonkit nlohmann_json::nlohmann_json GTest::gtest_main)
+    # The differential tests nest documents past a thousand levels, and the oracle copies, compares and dumps them
+    # recursively; Windows' default 1 MB main-thread stack overflows on arm64. Give the test binary the 8 MB that Linux
+    # and macOS give by default. (How deep the library itself goes on a 1 MB stack is measured separately.)
+    if(MSVC)
+        target_link_options(jsonkit_tests PRIVATE /STACK:8388608)
+    endif()
     include(GoogleTest)
     gtest_discover_tests(jsonkit_tests DISCOVERY_TIMEOUT 120)
 endif()
