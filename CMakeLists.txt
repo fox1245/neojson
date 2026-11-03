@@ -32,12 +32,10 @@ if(JSONKIT_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG v1.15.2
-        GIT_SHALLOW TRUE)
+        GIT_TAG b514bdc898e2951020cbdca1304b75f5950d1f59)  # v1.15.2
     FetchContent_Declare(nlohmann_json
         GIT_REPOSITORY https://github.com/nlohmann/json.git
-        GIT_TAG v3.11.3
-        GIT_SHALLOW TRUE)
+        GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)  # v3.11.3, the oracle of the differential tests
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     set(JSON_BuildTests OFF CACHE INTERNAL "")
     FetchContent_MakeAvailable(googletest nlohmann_json)
