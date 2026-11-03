@@ -37,6 +37,8 @@ if(JSONKIT_BUILD_TESTS)
         GIT_REPOSITORY https://github.com/nlohmann/json.git
         GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)  # v3.11.3, the oracle of the differential tests
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    # MSVC: build googletest with the same runtime library as the tests (the default /MD), or the link fails.
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     set(JSON_BuildTests OFF CACHE INTERNAL "")
     FetchContent_MakeAvailable(googletest nlohmann_json)
     file(GLOB JSONKIT_TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/*.cpp)
