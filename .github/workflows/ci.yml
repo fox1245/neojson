@@ -1,54 +1,68 @@
 name: CI
 
-# Every push and pull request runs the two Linux jobs (x64 with sanitizers, arm64). The whole matrix (Linux,
-# macOS and Windows on x64 and arm64) runs on a push to main, once a day, and on demand.
+# Every push and pull request builds and tests on Linux x64 (GCC and Clang, with AddressSanitizer and
+# UndefinedBehaviorSanitizer) and Linux arm64. macOS (arm64 and x64) and Windows (x64 and arm64) run on pushes to main,
+# once a day and on demand, and on every event once the repository is public.
+
 on:
   push:
   pull_request:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "23 17 * * *"
   workflow_dispatch:
-    inputs:
-      full:
-        description: "Run the whole platform matrix"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  test:
-    name: ${{ matrix.platform.name }}
-    runs-on: ${{ matrix.platform.os }}
+  linux:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.full)) && '[
-          {"name":"linux-x64-gcc-sanitizers","os":"ubuntu-24.04","cc":"gcc","cxx":"g++","sanitize":"ON"},
-          {"name":"linux-x64-clang-sanitizers","os":"ubuntu-24.04","cc":"clang","cxx":"clang++","sanitize":"ON"},
-          {"name":"linux-arm64-gcc","os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++","sanitize":"OFF"},
-          {"name":"macos-arm64","os":"macos-15","cc":"clang","cxx":"clang++","sanitize":"OFF"},
-          {"name":"macos-x64","os":"macos-15-intel","cc":"clang","cxx":"clang++","sanitize":"OFF"},
-          {"name":"windows-x64-msvc","os":"windows-2022","cc":"","cxx":"","sanitize":"OFF"},
-          {"name":"windows-arm64-msvc","os":"windows-11-arm","cc":"","cxx":"","sanitize":"OFF"}]' || '[
-          {"name":"linux-x64-gcc-sanitizers","os":"ubuntu-24.04","cc":"gcc","cxx":"g++","sanitize":"ON"},
-          {"name":"linux-arm64-gcc","os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++","sanitize":"OFF"}]') }}
+        include:
+          - { name: linux-x64-gcc, runner: ubuntu-24.04, cc: gcc, cxx: g++ }
+          - { name: linux-x64-clang, runner: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: linux-arm64-gcc, runner: ubuntu-24.04-arm, cc: gcc, cxx: g++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure
-        shell: bash
-        run: |
-          args=(-S . -B build -DCMAKE_BUILD_TYPE=Debug -DJSONKIT_SANITIZE=${{ matrix.platform.sanitize }})
-          if [ -n "${{ matrix.platform.cxx }}" ]; then
-            args+=(-DCMAKE_C_COMPILER=${{ matrix.platform.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.platform.cxx }})
-          fi
-          cmake "${args[@]}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure (Debug, sanitizers)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DJSONKIT_SANITIZE=ON
       - name: Build
-        run: cmake --build build --config Debug --parallel
+        run: cmake --build build --parallel
       - name: Test
-        run: ctest --test-dir build -C Debug --output-on-failure --timeout 900
+        run: ctest --test-dir build --output-on-failure --timeout 900
+
+  other-platforms:
+    name: ${{ matrix.name }}
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      github.event.repository.private == false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, runner: macos-15 }
+          - { name: macos-x64, runner: macos-15-intel }
+          - { name: windows-x64-msvc, runner: windows-2022 }
+          - { name: windows-arm64-msvc, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 900
