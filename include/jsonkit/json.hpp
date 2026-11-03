@@ -497,7 +497,7 @@ public:
               std::enable_if_t<
                   std::is_constructible<value_type, Args...>::value &&
                       !(sizeof...(Args) == 1 &&
-                        (std::is_same<std::decay_t<Args>, json_ref>::value || ...)),
+                        std::disjunction<std::is_same<std::decay_t<Args>, json_ref>...>::value),
                   int> = 0>
     json_ref(Args&&... args)
         : owned_value(std::forward<Args>(args)...) {}
