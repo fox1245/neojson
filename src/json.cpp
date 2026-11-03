@@ -798,6 +798,973 @@ json materialize_yyjson(yyjson_val* val) {
     }
 }
 
+struct diag_position_t {
+    std::size_t chars_read_total = 0;
+    std::size_t chars_read_current_line = 0;
+    std::size_t lines_read = 0;
+};
+
+enum class diag_token_type {
+    uninitialized,
+    literal_true,
+    literal_false,
+    literal_null,
+    value_string,
+    value_unsigned,
+    value_integer,
+    value_float,
+    begin_array,
+    begin_object,
+    end_array,
+    end_object,
+    name_separator,
+    value_separator,
+    parse_error,
+    end_of_input,
+    literal_or_value
+};
+
+const char* diag_token_type_name(const diag_token_type t) noexcept {
+    switch (t) {
+        case diag_token_type::uninitialized:
+            return "<uninitialized>";
+        case diag_token_type::literal_true:
+            return "true literal";
+        case diag_token_type::literal_false:
+            return "false literal";
+        case diag_token_type::literal_null:
+            return "null literal";
+        case diag_token_type::value_string:
+            return "string literal";
+        case diag_token_type::value_unsigned:
+        case diag_token_type::value_integer:
+        case diag_token_type::value_float:
+            return "number literal";
+        case diag_token_type::begin_array:
+            return "'['";
+        case diag_token_type::begin_object:
+            return "'{'";
+        case diag_token_type::end_array:
+            return "']'";
+        case diag_token_type::end_object:
+            return "'}'";
+        case diag_token_type::name_separator:
+            return "':'";
+        case diag_token_type::value_separator:
+            return "','";
+        case diag_token_type::parse_error:
+            return "<parse error>";
+        case diag_token_type::end_of_input:
+            return "end of input";
+        case diag_token_type::literal_or_value:
+            return "'[', '{', or a literal";
+        default:
+            return "unknown token";
+    }
+}
+
+class diagnostic_lexer {
+public:
+    using char_type = char;
+    using char_int_type = std::char_traits<char>::int_type;
+
+    diagnostic_lexer(std::string_view input, bool ignore_comments) noexcept
+        : input_(input), ignore_comments_(ignore_comments) {}
+
+    constexpr json::number_float_t get_number_float() const noexcept {
+        return value_float_;
+    }
+
+    constexpr diag_position_t get_position() const noexcept {
+        return position_;
+    }
+
+    constexpr std::size_t accepted_prefix_size() const noexcept {
+        return current_ == '\0' ? cursor_ - 1 : cursor_;
+    }
+
+    std::string get_token_string() const {
+        std::string result;
+        for (const auto c : token_string_) {
+            if (static_cast<unsigned char>(c) <= '\x1F') {
+                std::array<char, 9> cs{{}};
+                static_cast<void>(std::snprintf(cs.data(), cs.size(), "<U+%.4X>",
+                                                static_cast<unsigned char>(c)));
+                result += cs.data();
+            } else {
+                result.push_back(c);
+            }
+        }
+        return result;
+    }
+
+    constexpr const char* get_error_message() const noexcept {
+        return error_message_;
+    }
+
+    diag_token_type scan() {
+        if (position_.chars_read_total == 0 && !skip_bom()) {
+            error_message_ = "invalid BOM; must be 0xEF 0xBB 0xBF if given";
+            return diag_token_type::parse_error;
+        }
+
+        skip_whitespace();
+
+        while (ignore_comments_ && current_ == '/') {
+            if (!scan_comment()) {
+                return diag_token_type::parse_error;
+            }
+            skip_whitespace();
+        }
+
+        switch (current_) {
+            case '[':
+                return diag_token_type::begin_array;
+            case ']':
+                return diag_token_type::end_array;
+            case '{':
+                return diag_token_type::begin_object;
+            case '}':
+                return diag_token_type::end_object;
+            case ':':
+                return diag_token_type::name_separator;
+            case ',':
+                return diag_token_type::value_separator;
+
+            case 't':
+                return scan_literal("true", 4, diag_token_type::literal_true);
+            case 'f':
+                return scan_literal("false", 5, diag_token_type::literal_false);
+            case 'n':
+                return scan_literal("null", 4, diag_token_type::literal_null);
+
+            case '\"':
+                return scan_string();
+
+            case '-':
+            case '0':
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+            case '5':
+            case '6':
+            case '7':
+            case '8':
+            case '9':
+                return scan_number();
+
+            case '\0':
+            case std::char_traits<char>::eof():
+                return diag_token_type::end_of_input;
+
+            default:
+                error_message_ = "invalid literal";
+                return diag_token_type::parse_error;
+        }
+    }
+
+private:
+    char_int_type get_character() noexcept {
+        if (cursor_ < input_.size()) {
+            return std::char_traits<char>::to_int_type(input_[cursor_++]);
+        }
+        return std::char_traits<char>::eof();
+    }
+
+    char_int_type get() {
+        ++position_.chars_read_total;
+        ++position_.chars_read_current_line;
+
+        if (next_unget_) {
+            next_unget_ = false;
+        } else {
+            current_ = get_character();
+        }
+
+        if (current_ != std::char_traits<char>::eof()) {
+            token_string_.push_back(std::char_traits<char>::to_char_type(current_));
+        }
+
+        if (current_ == '\n') {
+            ++position_.lines_read;
+            position_.chars_read_current_line = 0;
+        }
+
+        return current_;
+    }
+
+    void unget() {
+        next_unget_ = true;
+        --position_.chars_read_total;
+
+        if (position_.chars_read_current_line == 0) {
+            if (position_.lines_read > 0) {
+                --position_.lines_read;
+            }
+        } else {
+            --position_.chars_read_current_line;
+        }
+
+        if (current_ != std::char_traits<char>::eof()) {
+            assert(!token_string_.empty());
+            token_string_.pop_back();
+        }
+    }
+
+    void reset() noexcept {
+        token_buffer_.clear();
+        token_string_.clear();
+        token_string_.push_back(std::char_traits<char>::to_char_type(current_));
+    }
+
+    void add(char_int_type c) {
+        token_buffer_.push_back(static_cast<char>(c));
+    }
+
+    bool skip_bom() {
+        if (get() == 0xEF) {
+            return get() == 0xBB && get() == 0xBF;
+        }
+        unget();
+        return true;
+    }
+
+    void skip_whitespace() {
+        do {
+            get();
+        } while (current_ == ' ' || current_ == '\t' || current_ == '\n' || current_ == '\r');
+    }
+
+    int get_codepoint() {
+        assert(current_ == 'u');
+        int codepoint = 0;
+
+        for (const auto factor : {12u, 8u, 4u, 0u}) {
+            get();
+            if (current_ >= '0' && current_ <= '9') {
+                codepoint += static_cast<int>((static_cast<unsigned int>(current_) - 0x30u)
+                                              << factor);
+            } else if (current_ >= 'A' && current_ <= 'F') {
+                codepoint += static_cast<int>((static_cast<unsigned int>(current_) - 0x37u)
+                                              << factor);
+            } else if (current_ >= 'a' && current_ <= 'f') {
+                codepoint += static_cast<int>((static_cast<unsigned int>(current_) - 0x57u)
+                                              << factor);
+            } else {
+                return -1;
+            }
+        }
+        return codepoint;
+    }
+
+    bool next_byte_in_range(std::initializer_list<char_int_type> ranges) {
+        for (auto range = ranges.begin(); range != ranges.end(); ++range) {
+            get();
+            if (*range <= current_ && current_ <= *(++range)) {
+                // valid continuation byte
+            } else {
+                error_message_ = "invalid string: ill-formed UTF-8 byte";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    diag_token_type scan_string() {
+        reset();
+        assert(current_ == '\"');
+
+        while (true) {
+            switch (get()) {
+                case std::char_traits<char>::eof():
+                    error_message_ = "invalid string: missing closing quote";
+                    return diag_token_type::parse_error;
+
+                case '\"':
+                    return diag_token_type::value_string;
+
+                case '\\': {
+                    switch (get()) {
+                        case '\"':
+                        case '\\':
+                        case '/':
+                        case 'b':
+                        case 'f':
+                        case 'n':
+                        case 'r':
+                        case 't':
+                            break;
+
+                        case 'u': {
+                            const int codepoint1 = get_codepoint();
+                            if (codepoint1 == -1) {
+                                error_message_ =
+                                    "invalid string: '\\u' must be followed by 4 hex digits";
+                                return diag_token_type::parse_error;
+                            }
+
+                            if (0xD800 <= codepoint1 && codepoint1 <= 0xDBFF) {
+                                if (get() == '\\' && get() == 'u') {
+                                    const int codepoint2 = get_codepoint();
+                                    if (codepoint2 == -1) {
+                                        error_message_ =
+                                            "invalid string: '\\u' must be followed by 4 hex digits";
+                                        return diag_token_type::parse_error;
+                                    }
+                                    if (!(0xDC00 <= codepoint2 && codepoint2 <= 0xDFFF)) {
+                                        error_message_ =
+                                            "invalid string: surrogate U+D800..U+DBFF must be "
+                                            "followed by U+DC00..U+DFFF";
+                                        return diag_token_type::parse_error;
+                                    }
+                                } else {
+                                    error_message_ =
+                                        "invalid string: surrogate U+D800..U+DBFF must be "
+                                        "followed by U+DC00..U+DFFF";
+                                    return diag_token_type::parse_error;
+                                }
+                            } else if (0xDC00 <= codepoint1 && codepoint1 <= 0xDFFF) {
+                                error_message_ =
+                                    "invalid string: surrogate U+DC00..U+DFFF must follow "
+                                    "U+D800..U+DBFF";
+                                return diag_token_type::parse_error;
+                            }
+                            break;
+                        }
+
+                        default:
+                            error_message_ = "invalid string: forbidden character after backslash";
+                            return diag_token_type::parse_error;
+                    }
+                    break;
+                }
+
+                case 0x00:
+                    error_message_ =
+                        "invalid string: control character U+0000 (NUL) must be escaped to \\u0000";
+                    return diag_token_type::parse_error;
+                case 0x01:
+                    error_message_ =
+                        "invalid string: control character U+0001 (SOH) must be escaped to \\u0001";
+                    return diag_token_type::parse_error;
+                case 0x02:
+                    error_message_ =
+                        "invalid string: control character U+0002 (STX) must be escaped to \\u0002";
+                    return diag_token_type::parse_error;
+                case 0x03:
+                    error_message_ =
+                        "invalid string: control character U+0003 (ETX) must be escaped to \\u0003";
+                    return diag_token_type::parse_error;
+                case 0x04:
+                    error_message_ =
+                        "invalid string: control character U+0004 (EOT) must be escaped to \\u0004";
+                    return diag_token_type::parse_error;
+                case 0x05:
+                    error_message_ =
+                        "invalid string: control character U+0005 (ENQ) must be escaped to \\u0005";
+                    return diag_token_type::parse_error;
+                case 0x06:
+                    error_message_ =
+                        "invalid string: control character U+0006 (ACK) must be escaped to \\u0006";
+                    return diag_token_type::parse_error;
+                case 0x07:
+                    error_message_ =
+                        "invalid string: control character U+0007 (BEL) must be escaped to \\u0007";
+                    return diag_token_type::parse_error;
+                case 0x08:
+                    error_message_ =
+                        "invalid string: control character U+0008 (BS) must be escaped to \\u0008 "
+                        "or \\b";
+                    return diag_token_type::parse_error;
+                case 0x09:
+                    error_message_ =
+                        "invalid string: control character U+0009 (HT) must be escaped to \\u0009 "
+                        "or \\t";
+                    return diag_token_type::parse_error;
+                case 0x0A:
+                    error_message_ =
+                        "invalid string: control character U+000A (LF) must be escaped to \\u000A "
+                        "or \\n";
+                    return diag_token_type::parse_error;
+                case 0x0B:
+                    error_message_ =
+                        "invalid string: control character U+000B (VT) must be escaped to \\u000B";
+                    return diag_token_type::parse_error;
+                case 0x0C:
+                    error_message_ =
+                        "invalid string: control character U+000C (FF) must be escaped to \\u000C "
+                        "or \\f";
+                    return diag_token_type::parse_error;
+                case 0x0D:
+                    error_message_ =
+                        "invalid string: control character U+000D (CR) must be escaped to \\u000D "
+                        "or \\r";
+                    return diag_token_type::parse_error;
+                case 0x0E:
+                    error_message_ =
+                        "invalid string: control character U+000E (SO) must be escaped to \\u000E";
+                    return diag_token_type::parse_error;
+                case 0x0F:
+                    error_message_ =
+                        "invalid string: control character U+000F (SI) must be escaped to \\u000F";
+                    return diag_token_type::parse_error;
+                case 0x10:
+                    error_message_ =
+                        "invalid string: control character U+0010 (DLE) must be escaped to \\u0010";
+                    return diag_token_type::parse_error;
+                case 0x11:
+                    error_message_ =
+                        "invalid string: control character U+0011 (DC1) must be escaped to \\u0011";
+                    return diag_token_type::parse_error;
+                case 0x12:
+                    error_message_ =
+                        "invalid string: control character U+0012 (DC2) must be escaped to \\u0012";
+                    return diag_token_type::parse_error;
+                case 0x13:
+                    error_message_ =
+                        "invalid string: control character U+0013 (DC3) must be escaped to \\u0013";
+                    return diag_token_type::parse_error;
+                case 0x14:
+                    error_message_ =
+                        "invalid string: control character U+0014 (DC4) must be escaped to \\u0014";
+                    return diag_token_type::parse_error;
+                case 0x15:
+                    error_message_ =
+                        "invalid string: control character U+0015 (NAK) must be escaped to \\u0015";
+                    return diag_token_type::parse_error;
+                case 0x16:
+                    error_message_ =
+                        "invalid string: control character U+0016 (SYN) must be escaped to \\u0016";
+                    return diag_token_type::parse_error;
+                case 0x17:
+                    error_message_ =
+                        "invalid string: control character U+0017 (ETB) must be escaped to \\u0017";
+                    return diag_token_type::parse_error;
+                case 0x18:
+                    error_message_ =
+                        "invalid string: control character U+0018 (CAN) must be escaped to \\u0018";
+                    return diag_token_type::parse_error;
+                case 0x19:
+                    error_message_ =
+                        "invalid string: control character U+0019 (EM) must be escaped to \\u0019";
+                    return diag_token_type::parse_error;
+                case 0x1A:
+                    error_message_ =
+                        "invalid string: control character U+001A (SUB) must be escaped to \\u001A";
+                    return diag_token_type::parse_error;
+                case 0x1B:
+                    error_message_ =
+                        "invalid string: control character U+001B (ESC) must be escaped to \\u001B";
+                    return diag_token_type::parse_error;
+                case 0x1C:
+                    error_message_ =
+                        "invalid string: control character U+001C (FS) must be escaped to \\u001C";
+                    return diag_token_type::parse_error;
+                case 0x1D:
+                    error_message_ =
+                        "invalid string: control character U+001D (GS) must be escaped to \\u001D";
+                    return diag_token_type::parse_error;
+                case 0x1E:
+                    error_message_ =
+                        "invalid string: control character U+001E (RS) must be escaped to \\u001E";
+                    return diag_token_type::parse_error;
+                case 0x1F:
+                    error_message_ =
+                        "invalid string: control character U+001F (US) must be escaped to \\u001F";
+                    return diag_token_type::parse_error;
+
+                case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+                case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E:
+                case 0x2F: case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35:
+                case 0x36: case 0x37: case 0x38: case 0x39: case 0x3A: case 0x3B: case 0x3C:
+                case 0x3D: case 0x3E: case 0x3F: case 0x40: case 0x41: case 0x42: case 0x43:
+                case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49: case 0x4A:
+                case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F: case 0x50: case 0x51:
+                case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58:
+                case 0x59: case 0x5A: case 0x5B: case 0x5D: case 0x5E: case 0x5F: case 0x60:
+                case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
+                case 0x68: case 0x69: case 0x6A: case 0x6B: case 0x6C: case 0x6D: case 0x6E:
+                case 0x6F: case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
+                case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C:
+                case 0x7D: case 0x7E: case 0x7F:
+                    break;
+
+                case 0xC2: case 0xC3: case 0xC4: case 0xC5: case 0xC6: case 0xC7: case 0xC8:
+                case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+                case 0xD0: case 0xD1: case 0xD2: case 0xD3: case 0xD4: case 0xD5: case 0xD6:
+                case 0xD7: case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD:
+                case 0xDE: case 0xDF:
+                    if (!next_byte_in_range({0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                case 0xE0:
+                    if (!next_byte_in_range({0xA0, 0xBF, 0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+                case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0xEC: case 0xEE: case 0xEF:
+                    if (!next_byte_in_range({0x80, 0xBF, 0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                case 0xED:
+                    if (!next_byte_in_range({0x80, 0x9F, 0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                case 0xF0:
+                    if (!next_byte_in_range({0x90, 0xBF, 0x80, 0xBF, 0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                case 0xF1: case 0xF2: case 0xF3:
+                    if (!next_byte_in_range({0x80, 0xBF, 0x80, 0xBF, 0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                case 0xF4:
+                    if (!next_byte_in_range({0x80, 0x8F, 0x80, 0xBF, 0x80, 0xBF})) {
+                        return diag_token_type::parse_error;
+                    }
+                    break;
+
+                default:
+                    error_message_ = "invalid string: ill-formed UTF-8 byte";
+                    return diag_token_type::parse_error;
+            }
+        }
+    }
+
+    bool scan_comment() {
+        switch (get()) {
+            case '/': {
+                while (true) {
+                    switch (get()) {
+                        case '\n':
+                        case '\r':
+                        case std::char_traits<char>::eof():
+                        case '\0':
+                            return true;
+                        default:
+                            break;
+                    }
+                }
+            }
+
+            case '*': {
+                while (true) {
+                    switch (get()) {
+                        case std::char_traits<char>::eof():
+                        case '\0':
+                            error_message_ = "invalid comment; missing closing '*/'";
+                            return false;
+
+                        case '*': {
+                            switch (get()) {
+                                case '/':
+                                    return true;
+                                default:
+                                    unget();
+                                    continue;
+                            }
+                        }
+
+                        default:
+                            continue;
+                    }
+                }
+            }
+
+            default:
+                error_message_ = "invalid comment; expecting '/' or '*' after '/'";
+                return false;
+        }
+    }
+
+    diag_token_type scan_number() {
+        reset();
+        diag_token_type number_type = diag_token_type::value_unsigned;
+
+        switch (current_) {
+            case '-':
+                add(current_);
+                goto scan_number_minus;
+            case '0':
+                add(current_);
+                goto scan_number_zero;
+            case '1': case '2': case '3': case '4': case '5':
+            case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_any1;
+            default:
+                assert(false);
+                return diag_token_type::parse_error;
+        }
+
+    scan_number_minus:
+        number_type = diag_token_type::value_integer;
+        switch (get()) {
+            case '0':
+                add(current_);
+                goto scan_number_zero;
+            case '1': case '2': case '3': case '4': case '5':
+            case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_any1;
+            default:
+                error_message_ = "invalid number; expected digit after '-'";
+                return diag_token_type::parse_error;
+        }
+
+    scan_number_zero:
+        switch (get()) {
+            case '.':
+                add('.');
+                goto scan_number_decimal1;
+            case 'e':
+            case 'E':
+                add(current_);
+                goto scan_number_exponent;
+            default:
+                goto scan_number_done;
+        }
+
+    scan_number_any1:
+        switch (get()) {
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_any1;
+            case '.':
+                add('.');
+                goto scan_number_decimal1;
+            case 'e':
+            case 'E':
+                add(current_);
+                goto scan_number_exponent;
+            default:
+                goto scan_number_done;
+        }
+
+    scan_number_decimal1:
+        number_type = diag_token_type::value_float;
+        switch (get()) {
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_decimal2;
+            default:
+                error_message_ = "invalid number; expected digit after '.'";
+                return diag_token_type::parse_error;
+        }
+
+    scan_number_decimal2:
+        switch (get()) {
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_decimal2;
+            case 'e':
+            case 'E':
+                add(current_);
+                goto scan_number_exponent;
+            default:
+                goto scan_number_done;
+        }
+
+    scan_number_exponent:
+        number_type = diag_token_type::value_float;
+        switch (get()) {
+            case '+':
+            case '-':
+                add(current_);
+                goto scan_number_sign;
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_any2;
+            default:
+                error_message_ = "invalid number; expected '+', '-', or digit after exponent";
+                return diag_token_type::parse_error;
+        }
+
+    scan_number_sign:
+        switch (get()) {
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_any2;
+            default:
+                error_message_ = "invalid number; expected digit after exponent sign";
+                return diag_token_type::parse_error;
+        }
+
+    scan_number_any2:
+        switch (get()) {
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                add(current_);
+                goto scan_number_any2;
+            default:
+                goto scan_number_done;
+        }
+
+    scan_number_done:
+        unget();
+
+        char* endptr = nullptr;
+        errno = 0;
+
+        if (number_type == diag_token_type::value_unsigned) {
+            const auto x = std::strtoull(token_buffer_.c_str(), &endptr, 10);
+            if (errno == 0) {
+                const auto vu = static_cast<json::number_unsigned_t>(x);
+                if (vu == x) {
+                    return diag_token_type::value_unsigned;
+                }
+            }
+        } else if (number_type == diag_token_type::value_integer) {
+            const auto x = std::strtoll(token_buffer_.c_str(), &endptr, 10);
+            if (errno == 0) {
+                const auto vi = static_cast<json::number_integer_t>(x);
+                if (vi == x) {
+                    return diag_token_type::value_integer;
+                }
+            }
+        }
+
+        value_float_ = std::strtod(token_buffer_.c_str(), &endptr);
+        return diag_token_type::value_float;
+    }
+
+    diag_token_type scan_literal(const char* literal_text, const std::size_t length,
+                                 diag_token_type return_type) {
+        assert(std::char_traits<char>::to_char_type(current_) == literal_text[0]);
+        for (std::size_t i = 1; i < length; ++i) {
+            if (std::char_traits<char>::to_char_type(get()) != literal_text[i]) {
+                error_message_ = "invalid literal";
+                return diag_token_type::parse_error;
+            }
+        }
+        return return_type;
+    }
+
+    std::string_view input_;
+    std::size_t cursor_ = 0;
+    const bool ignore_comments_ = false;
+    char_int_type current_ = std::char_traits<char>::eof();
+    bool next_unget_ = false;
+    diag_position_t position_{};
+    std::vector<char> token_string_{};
+    std::string token_buffer_{};
+    const char* error_message_ = "";
+    json::number_float_t value_float_ = 0.0;
+};
+
+class diagnostic_parser {
+public:
+    diagnostic_parser(std::string_view input, bool ignore_comments)
+        : lexer_(input, ignore_comments) {
+        get_token();
+    }
+
+    bool diagnose(bool allow_exceptions) {
+        const bool ok = sax_parse_internal(allow_exceptions);
+        if (!ok) {
+            return false;
+        }
+        if (get_token() != diag_token_type::end_of_input) {
+            return fail_parse_error(
+                allow_exceptions,
+                exception_message(diag_token_type::end_of_input, "value"));
+        }
+        return true;
+    }
+
+    constexpr std::size_t accepted_prefix_size() const noexcept {
+        return lexer_.accepted_prefix_size();
+    }
+
+private:
+    diag_token_type get_token() {
+        return last_token_ = lexer_.scan();
+    }
+
+    bool fail_parse_error(bool allow_exceptions, const std::string& msg) {
+        if (allow_exceptions) {
+            const auto pos = lexer_.get_position();
+            throw json::parse_error::create(101, pos.chars_read_total, pos.lines_read + 1,
+                                            pos.chars_read_current_line, msg);
+        }
+        return false;
+    }
+
+    bool sax_parse_internal(bool allow_exceptions) {
+        std::vector<bool> states;
+        bool skip_to_state_evaluation = false;
+
+        while (true) {
+            if (!skip_to_state_evaluation) {
+                switch (last_token_) {
+                    case diag_token_type::begin_object: {
+                        if (get_token() == diag_token_type::end_object) {
+                            break;
+                        }
+                        if (last_token_ != diag_token_type::value_string) {
+                            return fail_parse_error(
+                                allow_exceptions,
+                                exception_message(diag_token_type::value_string, "object key"));
+                        }
+                        if (get_token() != diag_token_type::name_separator) {
+                            return fail_parse_error(
+                                allow_exceptions,
+                                exception_message(diag_token_type::name_separator,
+                                                  "object separator"));
+                        }
+                        states.push_back(false);
+                        get_token();
+                        continue;
+                    }
+
+                    case diag_token_type::begin_array: {
+                        if (get_token() == diag_token_type::end_array) {
+                            break;
+                        }
+                        states.push_back(true);
+                        continue;
+                    }
+
+                    case diag_token_type::value_float: {
+                        const auto res = lexer_.get_number_float();
+                        if (!std::isfinite(res)) {
+                            if (allow_exceptions) {
+                                throw json::out_of_range::create(
+                                    406, "number overflow parsing '" + lexer_.get_token_string() +
+                                             "'");
+                            }
+                            return false;
+                        }
+                        break;
+                    }
+
+                    case diag_token_type::literal_false:
+                    case diag_token_type::literal_null:
+                    case diag_token_type::literal_true:
+                    case diag_token_type::value_integer:
+                    case diag_token_type::value_string:
+                    case diag_token_type::value_unsigned:
+                        break;
+
+                    case diag_token_type::parse_error:
+                        return fail_parse_error(
+                            allow_exceptions,
+                            exception_message(diag_token_type::uninitialized, "value"));
+
+                    case diag_token_type::end_of_input: {
+                        if (lexer_.get_position().chars_read_total == 1) {
+                            return fail_parse_error(
+                                allow_exceptions,
+                                "attempting to parse an empty input; check that your input string "
+                                "or stream contains the expected JSON");
+                        }
+                        return fail_parse_error(
+                            allow_exceptions,
+                            exception_message(diag_token_type::literal_or_value, "value"));
+                    }
+
+                    case diag_token_type::uninitialized:
+                    case diag_token_type::end_array:
+                    case diag_token_type::end_object:
+                    case diag_token_type::name_separator:
+                    case diag_token_type::value_separator:
+                    case diag_token_type::literal_or_value:
+                    default:
+                        return fail_parse_error(
+                            allow_exceptions,
+                            exception_message(diag_token_type::literal_or_value, "value"));
+                }
+            } else {
+                skip_to_state_evaluation = false;
+            }
+
+            if (states.empty()) {
+                return true;
+            }
+
+            if (states.back()) {
+                if (get_token() == diag_token_type::value_separator) {
+                    get_token();
+                    continue;
+                }
+                if (last_token_ == diag_token_type::end_array) {
+                    states.pop_back();
+                    skip_to_state_evaluation = true;
+                    continue;
+                }
+                return fail_parse_error(
+                    allow_exceptions,
+                    exception_message(diag_token_type::end_array, "array"));
+            }
+
+            if (get_token() == diag_token_type::value_separator) {
+                if (get_token() != diag_token_type::value_string) {
+                    return fail_parse_error(
+                        allow_exceptions,
+                        exception_message(diag_token_type::value_string, "object key"));
+                }
+                if (get_token() != diag_token_type::name_separator) {
+                    return fail_parse_error(
+                        allow_exceptions,
+                        exception_message(diag_token_type::name_separator, "object separator"));
+                }
+                get_token();
+                continue;
+            }
+
+            if (last_token_ == diag_token_type::end_object) {
+                states.pop_back();
+                skip_to_state_evaluation = true;
+                continue;
+            }
+
+            return fail_parse_error(
+                allow_exceptions,
+                exception_message(diag_token_type::end_object, "object"));
+        }
+    }
+
+    std::string exception_message(const diag_token_type expected,
+                                  const std::string& context) const {
+        std::string error_msg = "syntax error ";
+        if (!context.empty()) {
+            error_msg += "while parsing " + context + " ";
+        }
+        error_msg += "- ";
+        if (last_token_ == diag_token_type::parse_error) {
+            error_msg += std::string(lexer_.get_error_message()) + "; last read: '" +
+                         lexer_.get_token_string() + "'";
+        } else {
+            error_msg += std::string("unexpected ") + diag_token_type_name(last_token_);
+        }
+        if (expected != diag_token_type::uninitialized) {
+            error_msg += std::string("; expected ") + diag_token_type_name(expected);
+        }
+        return error_msg;
+    }
+
+    diagnostic_lexer lexer_;
+    diag_token_type last_token_ = diag_token_type::uninitialized;
+};
+
 } // namespace
 } // namespace detail
 
@@ -826,105 +1793,44 @@ std::ostream& operator<<(std::ostream& o, const json& j) {
 
 json json::parse(std::string_view s, parser_callback_t /*cb*/, const bool allow_exceptions,
                  const bool ignore_comments) {
-    const auto nul_pos = s.find('\0');
-    if (nul_pos != std::string_view::npos) {
-        s = s.substr(0, nul_pos);
-    }
-
     yyjson_read_flag flg = YYJSON_READ_ALLOW_BOM;
     if (ignore_comments) {
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    yyjson_read_err err{};
-    // yyjson_read_opts does not mutate the input buffer when YYJSON_READ_INSITU is not set.
-    yyjson_doc* doc =
-        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, &err);
-    if (doc == nullptr) {
-        if (!allow_exceptions) {
+    if (s.find('\0') != std::string_view::npos) {
+        detail::diagnostic_parser diag(s, ignore_comments);
+        if (!diag.diagnose(allow_exceptions)) {
             return json(value_t::discarded);
         }
-        if (err.code == YYJSON_READ_ERROR_INVALID_NUMBER && err.msg != nullptr &&
-            std::string_view(err.msg) == "number is infinity when parsed as double") {
-            std::size_t idx = err.pos;
-            while (idx < s.size()) {
-                const char c = s[idx];
-                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' ||
-                    c == '-') {
-                    ++idx;
-                } else {
-                    break;
-                }
-            }
-            const std::string token(s.substr(err.pos, idx - err.pos));
-            throw out_of_range::create(406, "number overflow parsing '" + token + "'");
+        const std::string_view prefix = s.substr(0, diag.accepted_prefix_size());
+        std::string clean_prefix;
+        const char* data = prefix.data();
+        const std::size_t size = prefix.size();
+        if (prefix.find('\0') != std::string_view::npos) {
+            clean_prefix.assign(prefix);
+            std::replace(clean_prefix.begin(), clean_prefix.end(), '\0', '\n');
+            data = clean_prefix.data();
         }
-        std::size_t err_pos = err.pos;
-        const char* msg = err.msg != nullptr ? err.msg : "syntax error";
-        if (err.code == YYJSON_READ_ERROR_JSON_STRUCTURE && err_pos < s.size() &&
-            s[err_pos] == ',') {
-            ++err_pos;
-            while (err_pos < s.size()) {
-                if (s[err_pos] == ' ' || s[err_pos] == '\t' || s[err_pos] == '\n' ||
-                    s[err_pos] == '\r') {
-                    ++err_pos;
-                } else if (ignore_comments && err_pos + 1 < s.size() && s[err_pos] == '/' &&
-                           s[err_pos + 1] == '/') {
-                    err_pos += 2;
-                    while (err_pos < s.size() && s[err_pos] != '\n' && s[err_pos] != '\r') {
-                        ++err_pos;
-                    }
-                } else if (ignore_comments && err_pos + 1 < s.size() && s[err_pos] == '/' &&
-                           s[err_pos + 1] == '*') {
-                    err_pos += 2;
-                    while (err_pos + 1 < s.size() &&
-                           !(s[err_pos] == '*' && s[err_pos + 1] == '/')) {
-                        ++err_pos;
-                    }
-                    if (err_pos + 1 < s.size()) {
-                        err_pos += 2;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if (err_pos < s.size() && s[err_pos] == ']') {
-                msg = "syntax error while parsing value - unexpected ']'; expected '[', '{', or a "
-                      "literal";
-            } else if (err_pos < s.size() && s[err_pos] == '}') {
-                msg = "syntax error while parsing object key - unexpected '}'; expected string "
-                      "literal";
-            }
-        } else if (err.code == YYJSON_READ_ERROR_LITERAL && err_pos < s.size()) {
-            std::string_view expected;
-            if (s[err_pos] == 't') {
-                expected = "true";
-            } else if (s[err_pos] == 'f') {
-                expected = "false";
-            } else if (s[err_pos] == 'n') {
-                expected = "null";
-            }
-            if (!expected.empty()) {
-                std::size_t k = 0;
-                while (k < expected.size() && err_pos < s.size() && s[err_pos] == expected[k]) {
-                    ++err_pos;
-                    ++k;
-                }
-            }
+        yyjson_doc* doc =
+            yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
+        if (doc == nullptr) {
+            return json(value_t::discarded);
         }
-        const std::size_t byte_pos = err_pos + 1;
-        std::size_t lines_read = 0;
-        std::size_t col = 0;
-        const std::size_t limit = std::min(err_pos, s.size());
-        for (std::size_t idx = 0; idx <= limit; ++idx) {
-            ++col;
-            if (idx < s.size() && s[idx] == '\n') {
-                ++lines_read;
-                col = 0;
-            }
-        }
-        const std::size_t line = lines_read + 1;
-        throw parse_error::create(101, byte_pos, line, col, msg);
+        struct DocGuard {
+            yyjson_doc* d;
+            ~DocGuard() { yyjson_doc_free(d); }
+        } guard{doc};
+        return detail::materialize_yyjson(yyjson_doc_get_root(doc));
+    }
+
+    // yyjson_read_opts does not mutate the input buffer when YYJSON_READ_INSITU is not set.
+    yyjson_doc* doc =
+        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
+    if (doc == nullptr) {
+        detail::diagnostic_parser diag(s, ignore_comments);
+        (void)diag.diagnose(allow_exceptions);
+        return json(value_t::discarded);
     }
 
     struct DocGuard {
@@ -943,20 +1849,39 @@ json json::parse(std::istream& i, parser_callback_t cb, const bool allow_excepti
 }
 
 bool json::accept(std::string_view s, const bool ignore_comments) {
-    const auto nul_pos = s.find('\0');
-    if (nul_pos != std::string_view::npos) {
-        s = s.substr(0, nul_pos);
-    }
-
     yyjson_read_flag flg = YYJSON_READ_ALLOW_BOM;
     if (ignore_comments) {
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    yyjson_read_err err{};
+    if (s.find('\0') != std::string_view::npos) {
+        detail::diagnostic_parser diag(s, ignore_comments);
+        if (!diag.diagnose(false)) {
+            return false;
+        }
+        const std::string_view prefix = s.substr(0, diag.accepted_prefix_size());
+        std::string clean_prefix;
+        const char* data = prefix.data();
+        const std::size_t size = prefix.size();
+        if (prefix.find('\0') != std::string_view::npos) {
+            clean_prefix.assign(prefix);
+            std::replace(clean_prefix.begin(), clean_prefix.end(), '\0', '\n');
+            data = clean_prefix.data();
+        }
+        yyjson_doc* doc =
+            yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
+        if (doc == nullptr) {
+            return false;
+        }
+        yyjson_doc_free(doc);
+        return true;
+    }
+
     yyjson_doc* doc =
-        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, &err);
+        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
     if (doc == nullptr) {
+        detail::diagnostic_parser diag(s, ignore_comments);
+        (void)diag.diagnose(false);
         return false;
     }
     yyjson_doc_free(doc);

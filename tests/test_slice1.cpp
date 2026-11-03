@@ -1095,6 +1095,10 @@ TEST(Slice1, EdgeCaseContracts) {
             [&] { (void)jsonkit::json(s_prim.end(), s_prim.begin()); });
         expect_same_exception([&] { (void)o_prim.erase(o_prim.end(), o_prim.begin()); },
                               [&] { (void)s_prim.erase(s_prim.end(), s_prim.begin()); });
+        // Inverted range on array insert -> invalid_iterator.204.
+        // Asserted on jsonkit alone because nlohmann::basic_json::insert(pos, first, last)
+        // forwards [first.m_it.array_iterator, last.m_it.array_iterator) unchecked to
+        // std::vector::insert, which is undefined behaviour when last < first.
         {
             bool threw_204 = false;
             try {
@@ -1227,19 +1231,121 @@ TEST(Slice1, EdgeCaseContracts) {
         EXPECT_EQ(s_count, 1u);
     }
 
-    // 7. Parse errors: message line/column and byte for an unterminated array,
-    //    a bad literal on the second line, an unescaped LF in a string, and a trailing comma.
+    // 7. Parse errors: full message text, id, line/column, and byte for explicit and
+    //    generated invalid documents (all prefixes and single-byte replacements of the
+    //    valid parse corpus).
     {
-        auto extract_line_col = [](std::string_view what) -> std::string_view {
-            const auto pos = what.find("parse error at line ");
-            if (pos == std::string_view::npos) {
-                return {};
+        auto escape_input = [](std::string_view sv) -> std::string {
+            std::string out;
+            out.reserve(sv.size() + 8);
+            for (unsigned char c : sv) {
+                if (c == '\\') {
+                    out += "\\\\";
+                } else if (c == '\"') {
+                    out += "\\\"";
+                } else if (c == '\n') {
+                    out += "\\n";
+                } else if (c == '\r') {
+                    out += "\\r";
+                } else if (c == '\t') {
+                    out += "\\t";
+                } else if (c >= 0x20 && c < 0x7F) {
+                    out.push_back(static_cast<char>(c));
+                } else {
+                    char buf[8]{};
+                    std::snprintf(buf, sizeof(buf), "\\x%02X", static_cast<unsigned int>(c));
+                    out += buf;
+                }
             }
-            const auto colon = what.find(':', pos);
-            if (colon == std::string_view::npos) {
-                return {};
+            return out;
+        };
+
+        auto check_parse_candidate = [&](std::string_view candidate, bool ignore_comments) {
+            SCOPED_TRACE("input=\"" + escape_input(candidate) +
+                         "\" ignore_comments=" + (ignore_comments ? "true" : "false"));
+
+            const bool o_acc = nlohmann::ordered_json::accept(candidate, ignore_comments);
+            const bool s_acc = jsonkit::json::accept(candidate, ignore_comments);
+            EXPECT_EQ(o_acc, s_acc);
+
+            // allow_exceptions = false
+            const auto o_noexc =
+                nlohmann::ordered_json::parse(candidate, nullptr, false, ignore_comments);
+            const auto s_noexc =
+                jsonkit::json::parse(candidate, nullptr, false, ignore_comments);
+            assert_equivalent(o_noexc, s_noexc);
+
+            // allow_exceptions = true
+            bool o_threw = false;
+            int o_id = 0;
+            std::size_t o_byte = std::numeric_limits<std::size_t>::max();
+            std::string o_cat;
+            std::string o_what;
+            nlohmann::ordered_json o_val;
+            try {
+                o_val = nlohmann::ordered_json::parse(candidate, nullptr, true, ignore_comments);
+            } catch (const nlohmann::ordered_json::parse_error& e) {
+                o_threw = true;
+                o_id = e.id;
+                o_byte = e.byte;
+                o_cat = "parse_error";
+                o_what = e.what();
+            } catch (const nlohmann::ordered_json::out_of_range& e) {
+                o_threw = true;
+                o_id = e.id;
+                o_byte = 0;
+                o_cat = "out_of_range";
+                o_what = e.what();
+            } catch (const nlohmann::ordered_json::exception& e) {
+                o_threw = true;
+                o_id = e.id;
+                o_cat = "exception";
+                o_what = e.what();
             }
-            return what.substr(pos, colon - pos);
+
+            bool s_threw = false;
+            int s_id = 0;
+            std::size_t s_byte = std::numeric_limits<std::size_t>::max() - 1;
+            std::string s_cat;
+            std::string s_what;
+            jsonkit::json s_val;
+            try {
+                s_val = jsonkit::json::parse(candidate, nullptr, true, ignore_comments);
+            } catch (const jsonkit::json::parse_error& e) {
+                s_threw = true;
+                s_id = e.id;
+                s_byte = e.byte;
+                s_cat = "parse_error";
+                s_what = e.what();
+            } catch (const jsonkit::json::out_of_range& e) {
+                s_threw = true;
+                s_id = e.id;
+                s_byte = 0;
+                s_cat = "out_of_range";
+                s_what = e.what();
+            } catch (const jsonkit::json::exception& e) {
+                s_threw = true;
+                s_id = e.id;
+                s_cat = "exception";
+                s_what = e.what();
+            }
+
+            ASSERT_EQ(o_threw, s_threw)
+                << "Oracle what: " << o_what << "\nSubject what: " << s_what;
+            if (o_threw) {
+                EXPECT_EQ(o_cat, s_cat)
+                    << "Oracle what: " << o_what << "\nSubject what: " << s_what;
+                EXPECT_EQ(o_id, s_id)
+                    << "Oracle what: " << o_what << "\nSubject what: " << s_what;
+                if (o_cat == "parse_error") {
+                    EXPECT_GT(o_byte, 0u);
+                }
+                EXPECT_EQ(o_byte, s_byte)
+                    << "Oracle what: " << o_what << "\nSubject what: " << s_what;
+                EXPECT_EQ(o_what, s_what);
+            } else {
+                assert_equivalent(o_val, s_val);
+            }
         };
 
         const std::vector<std::string> bad_inputs = {
@@ -1254,40 +1360,146 @@ TEST(Slice1, EdgeCaseContracts) {
             "[1, ]",
             "{\"a\":1,}",
             "{\n  \"a\": 1,\n}",
+            // 64-bit signed/unsigned integer boundaries and float overflows (out_of_range.406)
+            "9223372036854775806",
+            "9223372036854775807",
+            "9223372036854775808",
+            "9223372036854775809",
+            "-9223372036854775807",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "-9223372036854775810",
+            "18446744073709551614",
+            "18446744073709551615",
+            "18446744073709551616",
+            "18446744073709551617",
+            "-18446744073709551615",
+            "-18446744073709551616",
+            "-18446744073709551617",
+            "1.7976931348623157e+308",
+            "-1.7976931348623157e+308",
+            "1.7976931348623159e+308",
+            "-1.7976931348623159e+308",
+            "1e309",
+            "-1e309",
+            "[1, 1e309]",
+            "{\"a\": -1e309}",
+            std::string(310, '9'),
+            "-" + std::string(310, '9'),
+            // NUL byte cases (outside strings, inside strings, and inside // and /* */ comments)
+            std::string("true\0x", 6),
+            std::string("123\0", 4),
+            std::string("0/*\0*/", 6),
+            std::string("0//\0]", 5),
+            std::string("0//\0", 4),
+            std::string("[1,//\0 2]", 9),
+            std::string("// comment\0 123", 15),
+            std::string("\"a\0b\"", 5),
+            std::string("\0", 1),
         };
 
         for (const auto& input : bad_inputs) {
-            SCOPED_TRACE("input=" + input);
-            int o_id = 0;
-            std::size_t o_byte = 0;
-            std::string o_what;
-            try {
-                (void)nlohmann::ordered_json::parse(input);
-                FAIL() << "Expected oracle parse_error";
-            } catch (const nlohmann::ordered_json::parse_error& e) {
-                o_id = e.id;
-                o_byte = e.byte;
-                o_what = e.what();
+            check_parse_candidate(input, false);
+            check_parse_candidate(input, true);
+        }
+
+        // Deeply nested arrays and objects (valid and unclosed)
+        for (std::size_t depth : {64u, 256u, 512u, 1025u}) {
+            std::string nested_arr(depth, '[');
+            nested_arr += "0";
+            nested_arr.append(depth, ']');
+            check_parse_candidate(nested_arr, false);
+            check_parse_candidate(nested_arr, true);
+
+            std::string unclosed_arr(depth, '[');
+            unclosed_arr += "0";
+            unclosed_arr.append(depth - 1, ']');
+            check_parse_candidate(unclosed_arr, false);
+            check_parse_candidate(unclosed_arr, true);
+
+            std::string nested_obj;
+            nested_obj.reserve(depth * 7 + 2);
+            for (std::size_t d = 0; d < depth; ++d) {
+                nested_obj += "{\"a\":";
+            }
+            nested_obj += "0";
+            nested_obj.append(depth, '}');
+            check_parse_candidate(nested_obj, false);
+            check_parse_candidate(nested_obj, true);
+
+            std::string unclosed_obj = nested_obj.substr(0, nested_obj.size() - 1);
+            check_parse_candidate(unclosed_obj, false);
+            check_parse_candidate(unclosed_obj, true);
+        }
+
+        const std::vector<std::string> valid_corpus = {
+            "null",
+            "true",
+            "false",
+            "0",
+            "-0",
+            "0.0",
+            "-0.0",
+            "1",
+            "1.0",
+            "-1",
+            "-1.0",
+            "42",
+            "-42",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9223372036854775808",
+            "18446744073709551615",
+            "18446744073709551616",
+            "-9223372036854775809",
+            "1e-308",
+            "1e308",
+            "1.7976931348623157e+308",
+            "2.2250738585072014e-308",
+            "5e-324",
+            "\"\"",
+            "\"hello world\"",
+            "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"",
+            "\"\\u0000\\u001f\\u007f\\u0080\\u07ff\\u0800\\uffff\"",
+            "\"\\ud83d\\ude00\\ud834\\udd1e\"",
+            "\"한글과 日本語와 🚀\"",
+            "[]",
+            "[null,true,false,0,-0,0.0,-0.0,\"str\",[],{}]",
+            "{}",
+            "{\"z\":1,\"a\":2,\"m\":3}",
+            "{\"a\":1,\"b\":2,\"a\":3,\"b\":4,\"c\":5}",
+            "\xEF\xBB\xBF{\"bom\":true}",
+            "{\n  // single line comment\n  \"a\": 1, /* multi-line\n  comment */ \"b\": [2, /* inline */ 3]\n}",
+        };
+
+        const char replacement_bytes[] = {']', '}', ',', ':', '"', '\n', '\x01', '\xff', '\0'};
+
+        for (const auto& doc : valid_corpus) {
+            // Every prefix of doc
+            for (std::size_t len = 0; len <= doc.size(); ++len) {
+                std::string_view prefix(doc.data(), len);
+                check_parse_candidate(prefix, false);
+                check_parse_candidate(prefix, true);
             }
 
-            int s_id = 0;
-            std::size_t s_byte = 0;
-            std::string s_what;
-            try {
-                (void)jsonkit::json::parse(input);
-                FAIL() << "Expected subject parse_error";
-            } catch (const jsonkit::json::parse_error& e) {
-                s_id = e.id;
-                s_byte = e.byte;
-                s_what = e.what();
+            // Every single-byte replacement of each byte in doc
+            for (std::size_t pos = 0; pos < doc.size(); ++pos) {
+                for (char rep : replacement_bytes) {
+                    std::string mutated = doc;
+                    mutated[pos] = rep;
+                    check_parse_candidate(mutated, false);
+                    check_parse_candidate(mutated, true);
+                }
             }
 
-            EXPECT_EQ(o_id, s_id);
-            EXPECT_EQ(o_byte, s_byte);
-            EXPECT_FALSE(extract_line_col(o_what).empty());
-            EXPECT_EQ(extract_line_col(o_what), extract_line_col(s_what));
-            if (input.find(',') != std::string::npos && input.back() != '2') {
-                EXPECT_EQ(o_what, s_what);
+            // Every single-byte insertion of each replacement byte at every position in doc
+            for (std::size_t pos = 0; pos <= doc.size(); ++pos) {
+                for (char rep : replacement_bytes) {
+                    std::string mutated = doc;
+                    mutated.insert(pos, 1, rep);
+                    check_parse_candidate(mutated, false);
+                    check_parse_candidate(mutated, true);
+                }
             }
         }
     }

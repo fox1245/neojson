@@ -197,10 +197,10 @@ void expect_same_exception(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
 
         if (oracle_cat == "parse_error") {
             EXPECT_GT(oracle_byte, 0u);
-            EXPECT_GT(subject_byte, 0u);
-        } else {
-            EXPECT_EQ(oracle_what, subject_what);
+            EXPECT_EQ(oracle_byte, subject_byte)
+                << "Oracle what: " << oracle_what << "\nSubject what: " << subject_what;
         }
+        EXPECT_EQ(oracle_what, subject_what);
     }
 }
 
