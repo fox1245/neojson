@@ -798,6 +798,207 @@ json materialize_yyjson(yyjson_val* val) {
     }
 }
 
+class dom_callback_builder {
+public:
+    dom_callback_builder(json& r, const json::parser_callback_t& cb)
+        : root(r), callback(cb) {
+        keep_stack.push_back(true);
+    }
+
+    void parse_tree(yyjson_val* val) {
+        switch (yyjson_get_tag(val)) {
+            case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+                handle_value(nullptr);
+                break;
+
+            case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+                handle_value(true);
+                break;
+
+            case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+                handle_value(false);
+                break;
+
+            case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+                handle_value(static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
+                break;
+
+            case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+                handle_value(static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
+                break;
+
+            case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+                handle_value(static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
+                break;
+
+            case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+            case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
+                json::string_t s(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
+                handle_value(s);
+                break;
+            }
+
+            case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
+                start_array(unsafe_yyjson_get_len(val));
+                yyjson_arr_iter iter = yyjson_arr_iter_with(val);
+                yyjson_val* elem = nullptr;
+                while ((elem = yyjson_arr_iter_next(&iter)) != nullptr) {
+                    parse_tree(elem);
+                }
+                end_array();
+                break;
+            }
+
+            case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
+                start_object(unsafe_yyjson_get_len(val));
+                yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+                yyjson_val* k = nullptr;
+                while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+                    yyjson_val* v = yyjson_obj_iter_get_val(k);
+                    json::string_t key_str(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                    key(key_str);
+                    parse_tree(v);
+                }
+                end_object();
+                break;
+            }
+
+            default:
+                handle_value(nullptr);
+                break;
+        }
+    }
+
+private:
+    void start_object(std::size_t len) {
+        const bool keep = callback(static_cast<int>(ref_stack.size()),
+                                   json::parse_event_t::object_start, discarded);
+        keep_stack.push_back(keep);
+
+        auto val = handle_value(json::value_t::object, true);
+        ref_stack.push_back(val.second);
+        if (ref_stack.back() != nullptr) {
+            ref_stack.back()->get_ptr<json::object_t*>()->reserve(len);
+        }
+    }
+
+    void key(json::string_t& val) {
+        json k(val);
+
+        const bool keep =
+            callback(static_cast<int>(ref_stack.size()), json::parse_event_t::key, k);
+        key_keep_stack.push_back(keep);
+
+        if (keep && ref_stack.back() != nullptr) {
+            object_element =
+                &(ref_stack.back()->get_ptr<json::object_t*>()->operator[](val) = discarded);
+        }
+    }
+
+    void end_object() {
+        if (ref_stack.back() != nullptr) {
+            if (!callback(static_cast<int>(ref_stack.size()) - 1,
+                          json::parse_event_t::object_end, *ref_stack.back())) {
+                *ref_stack.back() = discarded;
+            }
+        }
+
+        ref_stack.pop_back();
+        keep_stack.pop_back();
+
+        if (!ref_stack.empty() && ref_stack.back() != nullptr &&
+            ref_stack.back()->is_structured()) {
+            for (auto it = ref_stack.back()->begin(); it != ref_stack.back()->end(); ++it) {
+                if (it->is_discarded()) {
+                    ref_stack.back()->erase(it);
+                    break;
+                }
+            }
+        }
+    }
+
+    void start_array(std::size_t len) {
+        const bool keep = callback(static_cast<int>(ref_stack.size()),
+                                   json::parse_event_t::array_start, discarded);
+        keep_stack.push_back(keep);
+
+        auto val = handle_value(json::value_t::array, true);
+        ref_stack.push_back(val.second);
+        if (ref_stack.back() != nullptr) {
+            ref_stack.back()->get_ptr<json::array_t*>()->reserve(len);
+        }
+    }
+
+    void end_array() {
+        bool keep = true;
+
+        if (ref_stack.back() != nullptr) {
+            keep = callback(static_cast<int>(ref_stack.size()) - 1,
+                            json::parse_event_t::array_end, *ref_stack.back());
+            if (!keep) {
+                *ref_stack.back() = discarded;
+            }
+        }
+
+        ref_stack.pop_back();
+        keep_stack.pop_back();
+
+        if (!keep && !ref_stack.empty() && ref_stack.back() != nullptr &&
+            ref_stack.back()->is_array()) {
+            ref_stack.back()->get_ptr<json::array_t*>()->pop_back();
+        }
+    }
+
+    template <typename Value>
+    std::pair<bool, json*> handle_value(Value&& v, const bool skip_callback = false) {
+        if (!keep_stack.back()) {
+            return {false, nullptr};
+        }
+
+        auto value = json(std::forward<Value>(v));
+
+        const bool keep =
+            skip_callback ||
+            callback(static_cast<int>(ref_stack.size()), json::parse_event_t::value, value);
+
+        if (!keep) {
+            return {false, nullptr};
+        }
+
+        if (ref_stack.empty()) {
+            root = std::move(value);
+            return {true, &root};
+        }
+
+        if (ref_stack.back() == nullptr) {
+            return {false, nullptr};
+        }
+
+        if (ref_stack.back()->is_array()) {
+            ref_stack.back()->get_ptr<json::array_t*>()->emplace_back(std::move(value));
+            return {true, &(ref_stack.back()->get_ptr<json::array_t*>()->back())};
+        }
+
+        const bool store_element = key_keep_stack.back();
+        key_keep_stack.pop_back();
+
+        if (!store_element) {
+            return {false, nullptr};
+        }
+
+        *object_element = std::move(value);
+        return {true, object_element};
+    }
+
+    json& root;
+    std::vector<json*> ref_stack{};
+    std::vector<bool> keep_stack{};
+    std::vector<bool> key_keep_stack{};
+    json* object_element = nullptr;
+    const json::parser_callback_t& callback;
+    json discarded = json::value_t::discarded;
+};
+
 struct diag_position_t {
     std::size_t chars_read_total = 0;
     std::size_t chars_read_current_line = 0;
@@ -1791,16 +1992,34 @@ std::ostream& operator<<(std::ostream& o, const json& j) {
     return o;
 }
 
-json json::parse(std::string_view s, parser_callback_t /*cb*/, const bool allow_exceptions,
+json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exceptions,
                  const bool ignore_comments) {
     yyjson_read_flag flg = YYJSON_READ_ALLOW_BOM;
     if (ignore_comments) {
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
+    auto finish_doc = [&cb](yyjson_doc* doc) -> json {
+        yyjson_val* root = yyjson_doc_get_root(doc);
+        if (cb) {
+            json result;
+            detail::dom_callback_builder builder(result, cb);
+            builder.parse_tree(root);
+            if (result.is_discarded()) {
+                result = nullptr;
+            }
+            return result;
+        }
+        return detail::materialize_yyjson(root);
+    };
+
     if (s.find('\0') != std::string_view::npos) {
         detail::diagnostic_parser diag(s, ignore_comments);
         if (!diag.diagnose(allow_exceptions)) {
+            if (allow_exceptions) {
+                throw other_error::create(
+                    599, "internal error: diagnostic scanner and yyjson disagreed");
+            }
             return json(value_t::discarded);
         }
         const std::string_view prefix = s.substr(0, diag.accepted_prefix_size());
@@ -1815,13 +2034,17 @@ json json::parse(std::string_view s, parser_callback_t /*cb*/, const bool allow_
         yyjson_doc* doc =
             yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
         if (doc == nullptr) {
+            if (allow_exceptions) {
+                throw other_error::create(
+                    599, "internal error: diagnostic scanner and yyjson disagreed");
+            }
             return json(value_t::discarded);
         }
         struct DocGuard {
             yyjson_doc* d;
             ~DocGuard() { yyjson_doc_free(d); }
         } guard{doc};
-        return detail::materialize_yyjson(yyjson_doc_get_root(doc));
+        return finish_doc(doc);
     }
 
     // yyjson_read_opts does not mutate the input buffer when YYJSON_READ_INSITU is not set.
@@ -1830,6 +2053,10 @@ json json::parse(std::string_view s, parser_callback_t /*cb*/, const bool allow_
     if (doc == nullptr) {
         detail::diagnostic_parser diag(s, ignore_comments);
         (void)diag.diagnose(allow_exceptions);
+        if (allow_exceptions) {
+            throw other_error::create(
+                599, "internal error: diagnostic scanner and yyjson disagreed");
+        }
         return json(value_t::discarded);
     }
 
@@ -1838,8 +2065,7 @@ json json::parse(std::string_view s, parser_callback_t /*cb*/, const bool allow_
         ~DocGuard() { yyjson_doc_free(d); }
     } guard{doc};
 
-    yyjson_val* root = yyjson_doc_get_root(doc);
-    return detail::materialize_yyjson(root);
+    return finish_doc(doc);
 }
 
 json json::parse(std::istream& i, parser_callback_t cb, const bool allow_exceptions,
