@@ -4,9 +4,12 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -21,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -40,6 +44,11 @@ namespace jsonkit {
 // Forward declarations
 class json;
 using ordered_json = json;
+
+template <typename T = void, typename SFINAE = void>
+struct adl_serializer;
+
+class json_pointer;
 
 namespace detail {
 
@@ -941,86 +950,1600 @@ public:
     }
 };
 
-// Traits for container and conversion detection
-template <typename T>
-struct is_std_array : std::false_type {};
+enum class parse_event_t : std::uint8_t {
+    object_start,
+    object_end,
+    array_start,
+    array_end,
+    key,
+    value
+};
 
-template <typename T, std::size_t N>
-struct is_std_array<std::array<T, N>> : std::true_type {};
+template <typename BasicJsonType>
+using parser_callback_t =
+    std::function<bool(int depth, parse_event_t event, BasicJsonType& parsed)>;
+
+template <typename StringType>
+void replace_substring(StringType& s, const StringType& f, const StringType& t) {
+    assert(!f.empty());
+    for (auto pos = s.find(f); pos != StringType::npos;
+         s.replace(pos, f.size(), t), pos = s.find(f, pos + t.size())) {}
+}
+
+template <typename StringType>
+StringType escape(StringType s) {
+    replace_substring(s, StringType{"~"}, StringType{"~0"});
+    replace_substring(s, StringType{"/"}, StringType{"~1"});
+    return s;
+}
+
+template <typename StringType>
+void unescape(StringType& s) {
+    replace_substring(s, StringType{"~1"}, StringType{"/"});
+    replace_substring(s, StringType{"~0"}, StringType{"~"});
+}
+
+template <unsigned N>
+struct priority_tag : priority_tag<N - 1> {};
+
+template <>
+struct priority_tag<0> {};
+
+template <class T>
+struct identity_tag {};
 
 template <typename T>
-struct is_std_pair : std::false_type {};
+using uncvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
+
+struct nonesuch {
+    nonesuch() = delete;
+    ~nonesuch() = delete;
+    nonesuch(nonesuch const&) = delete;
+    void operator=(nonesuch const&) = delete;
+};
+
+template <class Default, class AlwaysVoid, template <class...> class Op, class... Args>
+struct detector {
+    using value_t = std::false_type;
+    using type = Default;
+};
+
+template <class Default, template <class...> class Op, class... Args>
+struct detector<Default, std::void_t<Op<Args...>>, Op, Args...> {
+    using value_t = std::true_type;
+    using type = Op<Args...>;
+};
+
+template <template <class...> class Op, class... Args>
+using is_detected = typename detector<nonesuch, void, Op, Args...>::value_t;
+
+template <template <class...> class Op, class... Args>
+using detected_t = typename detector<nonesuch, void, Op, Args...>::type;
+
+template <class Expected, template <class...> class Op, class... Args>
+using is_detected_exact = std::is_same<Expected, detected_t<Op, Args...>>;
+
+using std::enable_if_t;
+using std::conjunction;
+using std::negation;
+
+template <template <class...> class Op, class... Args>
+struct is_detected_lazy : is_detected<Op, Args...> {};
+
+template <typename T>
+struct static_const {
+    static constexpr T value{};
+};
+
+template <typename T>
+constexpr T static_const<T>::value;
+
+template <typename>
+struct is_basic_json : std::false_type {};
+
+template <>
+struct is_basic_json<::jsonkit::json> : std::true_type {};
+
+template <typename>
+struct is_json_ref : std::false_type {};
+
+template <typename T>
+struct is_json_ref<json_ref<T>> : std::true_type {};
+
+template <typename>
+struct is_json_pointer : std::false_type {};
+
+template <>
+struct is_json_pointer<::jsonkit::json_pointer> : std::true_type {};
+
+template <typename>
+struct is_std_optional : std::false_type {};
+
+template <typename T>
+struct is_std_optional<std::optional<T>> : std::true_type {};
+
+template <typename T>
+using mapped_type_t = typename T::mapped_type;
+
+template <typename T>
+using key_type_t = typename T::key_type;
+
+template <typename T>
+using value_type_t = typename T::value_type;
+
+template <typename T>
+using difference_type_t = typename T::difference_type;
+
+template <typename T>
+using pointer_t = typename T::pointer;
+
+template <typename T>
+using reference_t = typename T::reference;
+
+template <typename T>
+using iterator_category_t = typename T::iterator_category;
+
+template <typename T, typename... Args>
+using to_json_function = decltype(T::to_json(std::declval<Args>()...));
+
+template <typename T, typename... Args>
+using from_json_function = decltype(T::from_json(std::declval<Args>()...));
+
+template <typename T, typename U>
+using get_template_function = decltype(std::declval<T>().template get<U>());
+
+template <typename It, typename = void>
+struct iterator_types {};
+
+template <typename It>
+struct iterator_types<
+    It,
+    std::void_t<typename It::difference_type, typename It::value_type, typename It::pointer,
+                typename It::reference, typename It::iterator_category>> {
+    using difference_type = typename It::difference_type;
+    using value_type = typename It::value_type;
+    using pointer = typename It::pointer;
+    using reference = typename It::reference;
+    using iterator_category = typename It::iterator_category;
+};
+
+template <typename T, typename = void>
+struct safe_iterator_traits {};
+
+template <typename T>
+struct safe_iterator_traits<T, std::enable_if_t<!std::is_pointer<T>::value>> : iterator_types<T> {};
+
+template <typename T>
+struct safe_iterator_traits<T*, std::enable_if_t<std::is_object<T>::value>> {
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = T*;
+    using reference = T&;
+};
+
+template <typename T, typename = void>
+struct is_safe_iterator_traits : std::false_type {};
+
+template <typename T>
+struct is_safe_iterator_traits<safe_iterator_traits<T>> {
+private:
+    using traits = safe_iterator_traits<T>;
+
+public:
+    static constexpr auto value =
+        is_detected<value_type_t, traits>::value &&
+        is_detected<difference_type_t, traits>::value &&
+        is_detected<pointer_t, traits>::value &&
+        is_detected<iterator_category_t, traits>::value &&
+        is_detected<reference_t, traits>::value;
+};
+
+namespace begin_detail {
+using std::begin;
+template <typename T>
+using result_of_begin = decltype(begin(std::declval<T>()));
+} // namespace begin_detail
+
+namespace end_detail {
+using std::end;
+template <typename T>
+using result_of_end = decltype(end(std::declval<T>()));
+} // namespace end_detail
+
+using begin_detail::result_of_begin;
+using end_detail::result_of_end;
+
+template <typename T>
+struct is_range {
+private:
+    using t_ref = typename std::add_lvalue_reference<T>::type;
+    using iterator = detected_t<result_of_begin, t_ref>;
+    using sentinel = detected_t<result_of_end, t_ref>;
+    static constexpr auto is_iterator_begin =
+        is_safe_iterator_traits<safe_iterator_traits<iterator>>::value;
+
+public:
+    static constexpr bool value = !std::is_same<iterator, nonesuch>::value &&
+                                  !std::is_same<sentinel, nonesuch>::value &&
+                                  is_iterator_begin;
+};
+
+template <typename R>
+using iterator_t = std::enable_if_t<is_range<R>::value, result_of_begin<decltype(std::declval<R&>())>>;
+
+template <typename T>
+using range_value_t = value_type_t<safe_iterator_traits<iterator_t<T>>>;
+
+template <typename T, typename = void>
+struct is_complete_type : std::false_type {};
+
+template <typename T>
+struct is_complete_type<T, decltype(void(sizeof(T)))> : std::true_type {};
+
+template <typename BasicJsonType, typename T, typename = void>
+struct has_from_json : std::false_type {};
+
+template <typename BasicJsonType, typename T>
+struct is_getable {
+    static constexpr bool value = is_detected<get_template_function, const BasicJsonType&, T>::value;
+};
+
+template <typename BasicJsonType, typename T>
+struct has_from_json<BasicJsonType, T, std::enable_if_t<!is_basic_json<T>::value>> {
+    using serializer = typename BasicJsonType::template json_serializer<T, void>;
+    static constexpr bool value =
+        is_detected_exact<void, from_json_function, serializer, const BasicJsonType&, T&>::value;
+};
+
+template <typename BasicJsonType, typename T, typename = void>
+struct has_non_default_from_json : std::false_type {};
+
+template <typename BasicJsonType, typename T>
+struct has_non_default_from_json<BasicJsonType, T, std::enable_if_t<!is_basic_json<T>::value>> {
+    using serializer = typename BasicJsonType::template json_serializer<T, void>;
+    static constexpr bool value =
+        is_detected_exact<T, from_json_function, serializer, const BasicJsonType&>::value;
+};
+
+template <typename BasicJsonType, typename T, typename = void>
+struct has_to_json : std::false_type {};
+
+template <typename BasicJsonType, typename T>
+struct has_to_json<BasicJsonType, T, std::enable_if_t<!is_basic_json<T>::value>> {
+    using serializer = typename BasicJsonType::template json_serializer<T, void>;
+    static constexpr bool value =
+        is_detected_exact<void, to_json_function, serializer, BasicJsonType&, T>::value;
+};
+
+template <typename T>
+struct is_default_constructible : std::is_default_constructible<T> {};
 
 template <typename T1, typename T2>
-struct is_std_pair<std::pair<T1, T2>> : std::true_type {};
+struct is_default_constructible<std::pair<T1, T2>>
+    : std::conjunction<is_default_constructible<T1>, is_default_constructible<T2>> {};
 
-template <typename T>
-struct is_std_tuple : std::false_type {};
+template <typename T1, typename T2>
+struct is_default_constructible<const std::pair<T1, T2>>
+    : std::conjunction<is_default_constructible<T1>, is_default_constructible<T2>> {};
 
-template <typename... Args>
-struct is_std_tuple<std::tuple<Args...>> : std::true_type {};
+template <typename... Ts>
+struct is_default_constructible<std::tuple<Ts...>>
+    : std::conjunction<is_default_constructible<Ts>...> {};
 
-template <typename T, typename = void>
-struct is_map_like_impl : std::false_type {};
+template <typename... Ts>
+struct is_default_constructible<const std::tuple<Ts...>>
+    : std::conjunction<is_default_constructible<Ts>...> {};
 
-template <typename T>
-struct is_map_like_impl<
-    T,
-    std::void_t<typename T::key_type,
-                typename T::mapped_type,
-                decltype(std::declval<const T&>().begin()),
-                decltype(std::declval<const T&>().end())>>
-    : std::integral_constant<bool, std::is_constructible<std::string, typename T::key_type>::value> {};
+template <typename T, typename... Args>
+struct is_constructible : std::is_constructible<T, Args...> {};
 
-template <typename T>
-struct is_map_like : is_map_like_impl<T> {};
+template <typename T1, typename T2>
+struct is_constructible<std::pair<T1, T2>> : is_default_constructible<std::pair<T1, T2>> {};
+
+template <typename T1, typename T2>
+struct is_constructible<const std::pair<T1, T2>> : is_default_constructible<const std::pair<T1, T2>> {};
+
+template <typename... Ts>
+struct is_constructible<std::tuple<Ts...>> : is_default_constructible<std::tuple<Ts...>> {};
+
+template <typename... Ts>
+struct is_constructible<const std::tuple<Ts...>> : is_default_constructible<const std::tuple<Ts...>> {};
+
+template <typename BasicJsonType, typename CompatibleObjectType, typename = void>
+struct is_compatible_object_type_impl : std::false_type {};
+
+template <typename BasicJsonType, typename CompatibleObjectType>
+struct is_compatible_object_type_impl<
+    BasicJsonType, CompatibleObjectType,
+    std::enable_if_t<is_detected<mapped_type_t, CompatibleObjectType>::value &&
+                     is_detected<key_type_t, CompatibleObjectType>::value>> {
+    using object_t = typename BasicJsonType::object_t;
+    static constexpr bool value =
+        is_constructible<typename object_t::key_type,
+                         typename CompatibleObjectType::key_type>::value &&
+        (std::is_same<typename object_t::mapped_type,
+                      typename CompatibleObjectType::mapped_type>::value ||
+         has_to_json<BasicJsonType, typename CompatibleObjectType::mapped_type>::value);
+};
+
+template <typename BasicJsonType, typename CompatibleObjectType>
+struct is_compatible_object_type
+    : is_compatible_object_type_impl<BasicJsonType, CompatibleObjectType> {};
+
+template <typename BasicJsonType, typename ConstructibleObjectType, typename = void>
+struct is_constructible_object_type_impl : std::false_type {};
+
+template <typename BasicJsonType, typename ConstructibleObjectType>
+struct is_constructible_object_type_impl<
+    BasicJsonType, ConstructibleObjectType,
+    std::enable_if_t<is_detected<mapped_type_t, ConstructibleObjectType>::value &&
+                     is_detected<key_type_t, ConstructibleObjectType>::value>> {
+    using object_t = typename BasicJsonType::object_t;
+    static constexpr bool value =
+        (is_constructible<typename ConstructibleObjectType::key_type,
+                          typename object_t::key_type>::value &&
+         (std::is_same<typename object_t::mapped_type,
+                       typename ConstructibleObjectType::mapped_type>::value ||
+          has_from_json<BasicJsonType, typename ConstructibleObjectType::mapped_type>::value ||
+          has_non_default_from_json<BasicJsonType,
+                                    typename ConstructibleObjectType::mapped_type>::value));
+};
+
+template <typename BasicJsonType, typename ConstructibleObjectType>
+struct is_constructible_object_type
+    : is_constructible_object_type_impl<BasicJsonType, ConstructibleObjectType> {};
+
+template <typename BasicJsonType, typename CompatibleStringType>
+struct is_compatible_string_type {
+    static constexpr auto value =
+        is_constructible<typename BasicJsonType::string_t, CompatibleStringType>::value;
+};
+
+template <typename BasicJsonType, typename ConstructibleStringType>
+struct is_constructible_string_type {
+    static constexpr auto value =
+        is_constructible<ConstructibleStringType, typename BasicJsonType::string_t>::value &&
+        is_detected_exact<typename BasicJsonType::string_t::value_type, value_type_t,
+                          ConstructibleStringType>::value;
+};
+
+template <typename BasicJsonType, typename CompatibleArrayType, typename = void>
+struct is_compatible_array_type_impl : std::false_type {};
+
+template <typename BasicJsonType, typename CompatibleArrayType>
+struct is_compatible_array_type_impl<
+    BasicJsonType, CompatibleArrayType,
+    std::enable_if_t<
+        is_detected<iterator_t, CompatibleArrayType>::value &&
+        is_safe_iterator_traits<safe_iterator_traits<detected_t<iterator_t, CompatibleArrayType>>>::value &&
+        !std::is_same<CompatibleArrayType, detected_t<range_value_t, CompatibleArrayType>>::value>> {
+    using elem_t = range_value_t<CompatibleArrayType>;
+    static constexpr bool value =
+        std::is_same<uncvref_t<elem_t>, BasicJsonType>::value ||
+        has_to_json<BasicJsonType, elem_t>::value;
+};
+
+template <typename BasicJsonType, typename CompatibleArrayType>
+struct is_compatible_array_type
+    : is_compatible_array_type_impl<BasicJsonType, CompatibleArrayType> {};
+
+template <typename BasicJsonType, typename ConstructibleArrayType, typename = void>
+struct is_constructible_array_type_impl : std::false_type {};
+
+template <typename BasicJsonType, typename ConstructibleArrayType>
+struct is_constructible_array_type_impl<
+    BasicJsonType, ConstructibleArrayType,
+    std::enable_if_t<std::is_same<ConstructibleArrayType, typename BasicJsonType::value_type>::value>>
+    : std::true_type {};
+
+template <typename BasicJsonType, typename ConstructibleArrayType>
+struct is_constructible_array_type_impl<
+    BasicJsonType, ConstructibleArrayType,
+    std::enable_if_t<
+        !std::is_same<ConstructibleArrayType, typename BasicJsonType::value_type>::value &&
+        !is_compatible_string_type<BasicJsonType, ConstructibleArrayType>::value &&
+        is_default_constructible<ConstructibleArrayType>::value &&
+        (std::is_move_assignable<ConstructibleArrayType>::value ||
+         std::is_copy_assignable<ConstructibleArrayType>::value) &&
+        is_detected<iterator_t, ConstructibleArrayType>::value &&
+        is_safe_iterator_traits<safe_iterator_traits<detected_t<iterator_t, ConstructibleArrayType>>>::value &&
+        is_detected<range_value_t, ConstructibleArrayType>::value &&
+        !std::is_same<ConstructibleArrayType, detected_t<range_value_t, ConstructibleArrayType>>::value &&
+        is_complete_type<detected_t<range_value_t, ConstructibleArrayType>>::value>> {
+    using value_type = range_value_t<ConstructibleArrayType>;
+    static constexpr bool value =
+        std::is_same<value_type, typename BasicJsonType::array_t::value_type>::value ||
+        has_from_json<BasicJsonType, value_type>::value ||
+        has_non_default_from_json<BasicJsonType, value_type>::value;
+};
+
+template <typename BasicJsonType, typename ConstructibleArrayType>
+struct is_constructible_array_type
+    : is_constructible_array_type_impl<BasicJsonType, ConstructibleArrayType> {};
+
+template <typename RealIntegerType, typename CompatibleNumberIntegerType, typename = void>
+struct is_compatible_integer_type_impl : std::false_type {};
+
+template <typename RealIntegerType, typename CompatibleNumberIntegerType>
+struct is_compatible_integer_type_impl<
+    RealIntegerType, CompatibleNumberIntegerType,
+    std::enable_if_t<std::is_integral<RealIntegerType>::value &&
+                     std::is_integral<CompatibleNumberIntegerType>::value &&
+                     !std::is_same<bool, CompatibleNumberIntegerType>::value>> {
+    using RealLimits = std::numeric_limits<RealIntegerType>;
+    using CompatibleLimits = std::numeric_limits<CompatibleNumberIntegerType>;
+    static constexpr auto value =
+        is_constructible<RealIntegerType, CompatibleNumberIntegerType>::value &&
+        CompatibleLimits::is_integer &&
+        RealLimits::is_signed == CompatibleLimits::is_signed;
+};
+
+template <typename RealIntegerType, typename CompatibleNumberIntegerType>
+struct is_compatible_integer_type
+    : is_compatible_integer_type_impl<RealIntegerType, CompatibleNumberIntegerType> {};
+
+template <typename BasicJsonType, typename CompatibleType, typename = void>
+struct is_compatible_type_impl : std::false_type {};
+
+template <typename BasicJsonType, typename CompatibleType>
+struct is_compatible_type_impl<
+    BasicJsonType, CompatibleType,
+    std::enable_if_t<is_complete_type<CompatibleType>::value>> {
+    static constexpr bool value = has_to_json<BasicJsonType, CompatibleType>::value;
+};
+
+template <typename BasicJsonType, typename CompatibleType>
+struct is_compatible_type : is_compatible_type_impl<BasicJsonType, CompatibleType> {};
+
+template <typename T1, typename T2>
+struct is_constructible_tuple : std::false_type {};
+
+template <typename T1, typename... Args>
+struct is_constructible_tuple<T1, std::tuple<Args...>>
+    : std::conjunction<is_constructible<T1, Args>...> {};
+
+template <value_t>
+struct external_constructor;
 
 template <>
-struct is_map_like<json> : std::false_type {};
-
-template <typename B>
-struct is_map_like<json_ref<B>> : std::false_type {};
-
-template <typename T, typename = void>
-struct is_sequence_like_impl : std::false_type {};
-
-template <typename T>
-struct is_sequence_like_impl<
-    T,
-    std::void_t<typename T::value_type,
-                decltype(std::begin(std::declval<const T&>())),
-                decltype(std::end(std::declval<const T&>()))>>
-    : std::integral_constant<
-          bool,
-          !is_map_like<T>::value &&
-              !std::is_convertible<const T&, std::string_view>::value &&
-              !std::is_same<std::decay_t<T>, json>::value> {};
-
-template <typename T>
-struct is_sequence_like : is_sequence_like_impl<T> {};
+struct external_constructor<value_t::boolean> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, typename BasicJsonType::boolean_t b) noexcept {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::boolean;
+        j.m_value.boolean = b;
+    }
+};
 
 template <>
-struct is_sequence_like<json> : std::false_type {};
+struct external_constructor<value_t::string> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, const typename BasicJsonType::string_t& s) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::string;
+        j.m_value.string = new typename BasicJsonType::string_t(s);
+    }
 
-template <typename B>
-struct is_sequence_like<json_ref<B>> : std::false_type {};
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, typename BasicJsonType::string_t&& s) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::string;
+        j.m_value.string = new typename BasicJsonType::string_t(std::move(s));
+    }
+
+    template <typename BasicJsonType, typename CompatibleStringType,
+              enable_if_t<!std::is_same<CompatibleStringType,
+                                        typename BasicJsonType::string_t>::value,
+                          int> = 0>
+    static void construct(BasicJsonType& j, const CompatibleStringType& str) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::string;
+        j.m_value.string = new typename BasicJsonType::string_t(str);
+    }
+};
 
 template <>
-struct is_sequence_like<std::string> : std::false_type {};
+struct external_constructor<value_t::number_float> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, typename BasicJsonType::number_float_t val) noexcept {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::number_float;
+        j.m_value.number_float = val;
+    }
+};
 
 template <>
-struct is_sequence_like<std::string_view> : std::false_type {};
+struct external_constructor<value_t::number_unsigned> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j,
+                          typename BasicJsonType::number_unsigned_t val) noexcept {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::number_unsigned;
+        j.m_value.number_unsigned = val;
+    }
+};
+
+template <>
+struct external_constructor<value_t::number_integer> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j,
+                          typename BasicJsonType::number_integer_t val) noexcept {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::number_integer;
+        j.m_value.number_integer = val;
+    }
+};
+
+template <>
+struct external_constructor<value_t::array> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, const typename BasicJsonType::array_t& arr) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::array;
+        j.m_value.array = new typename BasicJsonType::array_t(arr);
+    }
+
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, typename BasicJsonType::array_t&& arr) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::array;
+        j.m_value.array = new typename BasicJsonType::array_t(std::move(arr));
+    }
+
+    template <typename BasicJsonType, typename CompatibleArrayType,
+              enable_if_t<!std::is_same<CompatibleArrayType,
+                                        typename BasicJsonType::array_t>::value,
+                          int> = 0>
+    static void construct(BasicJsonType& j, const CompatibleArrayType& arr) {
+        using std::begin;
+        using std::end;
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::array;
+        j.m_value.array = new typename BasicJsonType::array_t(begin(arr), end(arr));
+    }
+
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, const std::vector<bool>& b) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::array;
+        j.m_value.array = new typename BasicJsonType::array_t();
+        j.m_value.array->reserve(b.size());
+        for (const bool x : b) {
+            j.m_value.array->emplace_back(x);
+        }
+    }
+
+    template <typename BasicJsonType, typename T,
+              enable_if_t<std::is_convertible<T, BasicJsonType>::value, int> = 0>
+    static void construct(BasicJsonType& j, const std::valarray<T>& arr) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::array;
+        j.m_value.array = new typename BasicJsonType::array_t(std::begin(arr), std::end(arr));
+    }
+};
+
+template <>
+struct external_constructor<value_t::object> {
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, const typename BasicJsonType::object_t& obj) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::object;
+        j.m_value.object = new typename BasicJsonType::object_t(obj);
+    }
+
+    template <typename BasicJsonType>
+    static void construct(BasicJsonType& j, typename BasicJsonType::object_t&& obj) {
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::object;
+        j.m_value.object = new typename BasicJsonType::object_t(std::move(obj));
+    }
+
+    template <typename BasicJsonType, typename CompatibleObjectType,
+              enable_if_t<!std::is_same<CompatibleObjectType,
+                                        typename BasicJsonType::object_t>::value,
+                          int> = 0>
+    static void construct(BasicJsonType& j, const CompatibleObjectType& obj) {
+        using std::begin;
+        using std::end;
+        j.m_value.destroy(j.m_type);
+        j.m_type = value_t::object;
+        j.m_value.object = new typename BasicJsonType::object_t();
+        for (auto it = begin(obj); it != end(obj); ++it) {
+            j.m_value.object->emplace(it->first, it->second);
+        }
+    }
+};
+
+// ==================== detail::from_json ====================
+
+template <typename BasicJsonType>
+inline void from_json(const BasicJsonType& j, typename std::nullptr_t& n) {
+    if (!j.is_null()) {
+        throw type_error::create(302, std::string("type must be null, but is ") + j.type_name());
+    }
+    n = nullptr;
+}
+
+template <typename BasicJsonType, typename ArithmeticType,
+          enable_if_t<std::is_arithmetic<ArithmeticType>::value &&
+                          !std::is_same<ArithmeticType, typename BasicJsonType::boolean_t>::value,
+                      int> = 0>
+inline void get_arithmetic_value(const BasicJsonType& j, ArithmeticType& val) {
+    switch (static_cast<value_t>(j)) {
+        case value_t::number_unsigned:
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::number_unsigned_t*>());
+            break;
+        case value_t::number_integer:
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::number_integer_t*>());
+            break;
+        case value_t::number_float:
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::number_float_t*>());
+            break;
+        default:
+            throw type_error::create(
+                302, std::string("type must be number, but is ") + j.type_name());
+    }
+}
+
+template <typename BasicJsonType>
+inline void from_json(const BasicJsonType& j, typename BasicJsonType::boolean_t& b) {
+    if (!j.is_boolean()) {
+        throw type_error::create(
+            302, std::string("type must be boolean, but is ") + j.type_name());
+    }
+    b = *j.template get_ptr<const typename BasicJsonType::boolean_t*>();
+}
+
+template <typename BasicJsonType>
+inline void from_json(const BasicJsonType& j, typename BasicJsonType::string_t& s) {
+    if (!j.is_string()) {
+        throw type_error::create(
+            302, std::string("type must be string, but is ") + j.type_name());
+    }
+    s = *j.template get_ptr<const typename BasicJsonType::string_t*>();
+}
+
+template <typename BasicJsonType, typename StringType,
+          enable_if_t<
+              std::is_assignable<StringType&, const typename BasicJsonType::string_t>::value &&
+                  !std::is_same<typename BasicJsonType::string_t, StringType>::value &&
+                  !is_json_ref<StringType>::value && !is_std_optional<StringType>::value,
+              int> = 0>
+inline void from_json(const BasicJsonType& j, StringType& s) {
+    if (!j.is_string()) {
+        throw type_error::create(
+            302, std::string("type must be string, but is ") + j.type_name());
+    }
+    s = *j.template get_ptr<const typename BasicJsonType::string_t*>();
+}
+
+template <typename BasicJsonType>
+inline void from_json(const BasicJsonType& j, typename BasicJsonType::number_float_t& val) {
+    get_arithmetic_value(j, val);
+}
+
+template <typename BasicJsonType>
+inline void from_json(const BasicJsonType& j, typename BasicJsonType::number_unsigned_t& val) {
+    get_arithmetic_value(j, val);
+}
+
+template <typename BasicJsonType>
+inline void from_json(const BasicJsonType& j, typename BasicJsonType::number_integer_t& val) {
+    get_arithmetic_value(j, val);
+}
+
+template <typename BasicJsonType, typename ArithmeticType,
+          enable_if_t<
+              std::is_arithmetic<ArithmeticType>::value &&
+                  !std::is_same<ArithmeticType, typename BasicJsonType::number_unsigned_t>::value &&
+                  !std::is_same<ArithmeticType, typename BasicJsonType::number_integer_t>::value &&
+                  !std::is_same<ArithmeticType, typename BasicJsonType::number_float_t>::value &&
+                  !std::is_same<ArithmeticType, typename BasicJsonType::boolean_t>::value,
+              int> = 0>
+inline void from_json(const BasicJsonType& j, ArithmeticType& val) {
+    switch (static_cast<value_t>(j)) {
+        case value_t::number_unsigned: {
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::number_unsigned_t*>());
+            break;
+        }
+        case value_t::number_integer: {
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::number_integer_t*>());
+            break;
+        }
+        case value_t::number_float: {
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::number_float_t*>());
+            break;
+        }
+        case value_t::boolean: {
+            val = static_cast<ArithmeticType>(
+                *j.template get_ptr<const typename BasicJsonType::boolean_t*>());
+            break;
+        }
+        case value_t::null:
+        case value_t::object:
+        case value_t::array:
+        case value_t::string:
+        case value_t::binary:
+        case value_t::discarded:
+        default:
+            throw type_error::create(
+                302, std::string("type must be number, but is ") + j.type_name());
+    }
+}
+
+template <typename BasicJsonType, typename EnumType,
+          enable_if_t<std::is_enum<EnumType>::value, int> = 0>
+inline void from_json(const BasicJsonType& j, EnumType& e) {
+    typename std::underlying_type<EnumType>::type val;
+    get_arithmetic_value(j, val);
+    e = static_cast<EnumType>(val);
+}
+
+template <typename BasicJsonType, typename T, typename Allocator,
+          enable_if_t<is_getable<BasicJsonType, T>::value, int> = 0>
+inline void from_json_forward_list(const BasicJsonType& j, std::forward_list<T, Allocator>& l) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    l.clear();
+    for (auto it = j.rbegin(), end = j.rend(); it != end; ++it) {
+        l.push_front(it->template get<T>());
+    }
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<is_getable<BasicJsonType, T>::value, int> = 0>
+inline void from_json_valarray(const BasicJsonType& j, std::valarray<T>& l) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    l.resize(j.size());
+    std::size_t i = 0;
+    for (const auto& elem : j) {
+        l[i++] = elem.template get<T>();
+    }
+}
+
+template <typename BasicJsonType, typename T, std::size_t N>
+auto from_json(const BasicJsonType& j, T (&arr)[N])
+    -> decltype(j.template get<T>(), void()) {
+    for (std::size_t i = 0; i < N; ++i) {
+        arr[i] = j.at(i).template get<T>();
+    }
+}
+
+template <typename BasicJsonType>
+inline void from_json_array_impl(const BasicJsonType& j, typename BasicJsonType::array_t& arr,
+                                 priority_tag<3> /*unused*/) {
+    arr = *j.template get_ptr<const typename BasicJsonType::array_t*>();
+}
+
+template <typename BasicJsonType, typename T, std::size_t N>
+auto from_json_array_impl(const BasicJsonType& j, std::array<T, N>& arr,
+                          priority_tag<2> /*unused*/)
+    -> decltype(j.template get<T>(), void()) {
+    for (std::size_t i = 0; i < N; ++i) {
+        arr[i] = j.at(i).template get<T>();
+    }
+}
+
+template <typename BasicJsonType, typename ConstructibleArrayType,
+          enable_if_t<std::is_assignable<ConstructibleArrayType&, ConstructibleArrayType>::value,
+                      int> = 0>
+auto from_json_array_impl(const BasicJsonType& j, ConstructibleArrayType& arr,
+                          priority_tag<1> /*unused*/)
+    -> decltype(arr.reserve(std::declval<typename ConstructibleArrayType::size_type>()),
+                j.template get<typename ConstructibleArrayType::value_type>(), void()) {
+    using std::end;
+    ConstructibleArrayType ret;
+    ret.reserve(j.size());
+    std::transform(j.begin(), j.end(), std::inserter(ret, end(ret)),
+                   [](const BasicJsonType& i) {
+                       return i.template get<typename ConstructibleArrayType::value_type>();
+                   });
+    arr = std::move(ret);
+}
+
+template <typename BasicJsonType, typename ConstructibleArrayType,
+          enable_if_t<std::is_assignable<ConstructibleArrayType&, ConstructibleArrayType>::value,
+                      int> = 0>
+inline void from_json_array_impl(const BasicJsonType& j, ConstructibleArrayType& arr,
+                                 priority_tag<0> /*unused*/) {
+    using std::end;
+    ConstructibleArrayType ret;
+    std::transform(j.begin(), j.end(), std::inserter(ret, end(ret)),
+                   [](const BasicJsonType& i) {
+                       return i.template get<typename ConstructibleArrayType::value_type>();
+                   });
+    arr = std::move(ret);
+}
+
+template <typename BasicJsonType, typename ConstructibleArrayType,
+          enable_if_t<
+              is_constructible_array_type<BasicJsonType, ConstructibleArrayType>::value &&
+                  !is_constructible_object_type<BasicJsonType, ConstructibleArrayType>::value &&
+                  !is_constructible_string_type<BasicJsonType, ConstructibleArrayType>::value &&
+                  !is_basic_json<ConstructibleArrayType>::value,
+              int> = 0>
+inline void from_json(const BasicJsonType& j, ConstructibleArrayType& arr) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    from_json_array_impl(j, arr, priority_tag<3>{});
+}
+
+template <typename BasicJsonType, typename T, typename Allocator,
+          enable_if_t<is_getable<BasicJsonType, T>::value, int> = 0>
+inline void from_json(const BasicJsonType& j, std::forward_list<T, Allocator>& l) {
+    from_json_forward_list(j, l);
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<is_getable<BasicJsonType, T>::value, int> = 0>
+inline void from_json(const BasicJsonType& j, std::valarray<T>& l) {
+    from_json_valarray(j, l);
+}
+
+template <typename BasicJsonType, typename ConstructibleObjectType,
+          enable_if_t<is_constructible_object_type<BasicJsonType, ConstructibleObjectType>::value,
+                      int> = 0>
+inline void from_json(const BasicJsonType& j, ConstructibleObjectType& obj) {
+    if (!j.is_object()) {
+        throw type_error::create(302, std::string("type must be object, but is ") + j.type_name());
+    }
+    ConstructibleObjectType ret;
+    const auto* inner_object = j.template get_ptr<const typename BasicJsonType::object_t*>();
+    using value_type = typename ConstructibleObjectType::value_type;
+    for (const auto& p : *inner_object) {
+        ret.emplace(
+            typename ConstructibleObjectType::key_type(p.first),
+            p.second.template get<typename value_type::second_type>());
+    }
+    obj = std::move(ret);
+}
+
+template <typename BasicJsonType, typename Key, typename Value, typename Compare,
+          typename Allocator,
+          typename = enable_if_t<
+              !std::is_constructible<typename BasicJsonType::string_t, Key>::value &&
+              is_getable<BasicJsonType, Key>::value && is_getable<BasicJsonType, Value>::value>>
+inline void from_json(const BasicJsonType& j, std::map<Key, Value, Compare, Allocator>& m) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    m.clear();
+    for (const auto& p : j) {
+        if (!p.is_array()) {
+            throw type_error::create(302,
+                                     std::string("type must be array, but is ") + p.type_name());
+        }
+        m.emplace(p.at(0).template get<Key>(), p.at(1).template get<Value>());
+    }
+}
+
+template <typename BasicJsonType, typename Key, typename Value, typename Hash, typename KeyEqual,
+          typename Allocator,
+          typename = enable_if_t<
+              !std::is_constructible<typename BasicJsonType::string_t, Key>::value &&
+              is_getable<BasicJsonType, Key>::value && is_getable<BasicJsonType, Value>::value>>
+inline void from_json(const BasicJsonType& j,
+                      std::unordered_map<Key, Value, Hash, KeyEqual, Allocator>& m) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    m.clear();
+    for (const auto& p : j) {
+        if (!p.is_array()) {
+            throw type_error::create(302,
+                                     std::string("type must be array, but is ") + p.type_name());
+        }
+        m.emplace(p.at(0).template get<Key>(), p.at(1).template get<Value>());
+    }
+}
+
+template <typename BasicJsonType, typename A1, typename A2,
+          enable_if_t<is_getable<BasicJsonType, A1>::value &&
+                          is_getable<BasicJsonType, A2>::value,
+                      int> = 0>
+inline void from_json(const BasicJsonType& j, std::pair<A1, A2>& p) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    p = {j.at(0).template get<A1>(), j.at(1).template get<A2>()};
+}
+
+template <typename BasicJsonType, typename... Args, std::size_t... Idx>
+inline std::tuple<Args...> from_json_tuple_impl_base(const BasicJsonType& j,
+                                                     std::index_sequence<Idx...> /*unused*/) {
+    return std::make_tuple(j.at(Idx).template get<Args>()...);
+}
+
+template <typename BasicJsonType>
+inline std::tuple<> from_json_tuple_impl_base(const BasicJsonType& /*unused*/,
+                                              std::index_sequence<> /*unused*/) {
+    return {};
+}
+
+template <typename BasicJsonType, class A1, class A2>
+inline std::pair<A1, A2> from_json_tuple_impl(const BasicJsonType& j,
+                                              identity_tag<std::pair<A1, A2>> /*unused*/,
+                                              priority_tag<0> /*unused*/) {
+    return {j.at(0).template get<A1>(), j.at(1).template get<A2>()};
+}
+
+template <typename BasicJsonType, typename A1, typename A2>
+inline void from_json_tuple_impl(const BasicJsonType& j, std::pair<A1, A2>& p,
+                                 priority_tag<1> /*unused*/) {
+    p = from_json_tuple_impl(j, identity_tag<std::pair<A1, A2>>{}, priority_tag<0>{});
+}
+
+template <typename BasicJsonType, typename... Args>
+inline std::tuple<Args...> from_json_tuple_impl(const BasicJsonType& j,
+                                                identity_tag<std::tuple<Args...>> /*unused*/,
+                                                priority_tag<2> /*unused*/) {
+    return from_json_tuple_impl_base<BasicJsonType, Args...>(j, std::index_sequence_for<Args...>{});
+}
+
+template <typename BasicJsonType, typename... Args>
+inline void from_json_tuple_impl(const BasicJsonType& j, std::tuple<Args...>& t,
+                                 priority_tag<3> /*unused*/) {
+    t = from_json_tuple_impl_base<BasicJsonType, Args...>(j, std::index_sequence_for<Args...>{});
+}
+
+template <typename BasicJsonType, typename... Args>
+inline void from_json(const BasicJsonType& j, std::tuple<Args...>& t) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    from_json_tuple_impl(j, t, priority_tag<3>{});
+}
+
+template <typename BasicJsonType, typename Ret,
+          enable_if_t<is_constructible_tuple<BasicJsonType, Ret>::value, int> = 0>
+inline Ret from_json(const BasicJsonType& j, identity_tag<Ret> tag) {
+    if (!j.is_array()) {
+        throw type_error::create(302, std::string("type must be array, but is ") + j.type_name());
+    }
+    return from_json_tuple_impl(j, tag, priority_tag<2>{});
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<is_getable<BasicJsonType, T>::value, int> = 0>
+inline void from_json(const BasicJsonType& j, std::optional<T>& opt) {
+    if (j.is_null()) {
+        opt = std::nullopt;
+    } else {
+        opt.emplace(j.template get<T>());
+    }
+}
+
+// ==================== detail::to_json ====================
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<std::is_same<T, typename BasicJsonType::boolean_t>::value, int> = 0>
+inline void to_json(BasicJsonType& j, T b) noexcept {
+    external_constructor<value_t::boolean>::construct(j, b);
+}
+
+template <typename BasicJsonType, typename BoolRef,
+          enable_if_t<
+              ((std::is_same<std::vector<bool>::reference, BoolRef>::value &&
+                !std::is_same<std::vector<bool>::reference,
+                              typename BasicJsonType::boolean_t&>::value) ||
+               (std::is_same<std::vector<bool>::const_reference, BoolRef>::value &&
+                !std::is_same<uncvref_t<std::vector<bool>::const_reference>,
+                              typename BasicJsonType::boolean_t>::value)) &&
+                  std::is_convertible<const BoolRef&, typename BasicJsonType::boolean_t>::value,
+              int> = 0>
+inline void to_json(BasicJsonType& j, const BoolRef& b) noexcept {
+    external_constructor<value_t::boolean>::construct(
+        j, static_cast<typename BasicJsonType::boolean_t>(b));
+}
+
+template <typename BasicJsonType, typename CompatibleString,
+          enable_if_t<std::is_constructible<typename BasicJsonType::string_t,
+                                            CompatibleString>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, const CompatibleString& s) {
+    external_constructor<value_t::string>::construct(j, s);
+}
+
+template <typename BasicJsonType>
+inline void to_json(BasicJsonType& j, typename BasicJsonType::string_t&& s) {
+    external_constructor<value_t::string>::construct(j, std::move(s));
+}
+
+template <typename BasicJsonType, typename FloatType,
+          enable_if_t<std::is_floating_point<FloatType>::value, int> = 0>
+inline void to_json(BasicJsonType& j, FloatType val) noexcept {
+    external_constructor<value_t::number_float>::construct(
+        j, static_cast<typename BasicJsonType::number_float_t>(val));
+}
+
+template <typename BasicJsonType, typename CompatibleNumberUnsignedType,
+          enable_if_t<is_compatible_integer_type<typename BasicJsonType::number_unsigned_t,
+                                                 CompatibleNumberUnsignedType>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, CompatibleNumberUnsignedType val) noexcept {
+    external_constructor<value_t::number_unsigned>::construct(
+        j, static_cast<typename BasicJsonType::number_unsigned_t>(val));
+}
+
+template <typename BasicJsonType, typename CompatibleNumberIntegerType,
+          enable_if_t<is_compatible_integer_type<typename BasicJsonType::number_integer_t,
+                                                 CompatibleNumberIntegerType>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, CompatibleNumberIntegerType val) noexcept {
+    external_constructor<value_t::number_integer>::construct(
+        j, static_cast<typename BasicJsonType::number_integer_t>(val));
+}
+
+template <typename BasicJsonType, typename EnumType,
+          enable_if_t<std::is_enum<EnumType>::value, int> = 0>
+inline void to_json(BasicJsonType& j, EnumType e) noexcept {
+    using underlying_type = typename std::underlying_type<EnumType>::type;
+    static constexpr value_t vt =
+        std::is_unsigned<underlying_type>::value ? value_t::number_integer : value_t::number_integer;
+    external_constructor<vt>::construct(
+        j, static_cast<typename BasicJsonType::number_integer_t>(static_cast<underlying_type>(e)));
+}
+
+template <typename BasicJsonType>
+inline void to_json(BasicJsonType& j, const std::vector<bool>& e) {
+    external_constructor<value_t::array>::construct(j, e);
+}
+
+template <typename BasicJsonType, typename CompatibleArrayType,
+          enable_if_t<
+              is_compatible_array_type<BasicJsonType, CompatibleArrayType>::value &&
+                  !is_compatible_object_type<BasicJsonType, CompatibleArrayType>::value &&
+                  !is_compatible_string_type<BasicJsonType, CompatibleArrayType>::value &&
+                  !is_basic_json<CompatibleArrayType>::value,
+              int> = 0>
+inline void to_json(BasicJsonType& j, const CompatibleArrayType& arr) {
+    external_constructor<value_t::array>::construct(j, arr);
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<std::is_convertible<T, BasicJsonType>::value, int> = 0>
+inline void to_json(BasicJsonType& j, const std::valarray<T>& arr) {
+    external_constructor<value_t::array>::construct(j, std::move(arr));
+}
+
+template <typename BasicJsonType>
+inline void to_json(BasicJsonType& j, typename BasicJsonType::array_t&& arr) {
+    external_constructor<value_t::array>::construct(j, std::move(arr));
+}
+
+template <typename BasicJsonType, typename CompatibleObjectType,
+          enable_if_t<is_compatible_object_type<BasicJsonType, CompatibleObjectType>::value &&
+                          !is_basic_json<CompatibleObjectType>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, const CompatibleObjectType& obj) {
+    external_constructor<value_t::object>::construct(j, obj);
+}
+
+template <typename BasicJsonType>
+inline void to_json(BasicJsonType& j, typename BasicJsonType::object_t&& obj) {
+    external_constructor<value_t::object>::construct(j, std::move(obj));
+}
+
+template <typename BasicJsonType, typename T, std::size_t N,
+          enable_if_t<!std::is_convertible<const T (&)[N],
+                                           typename BasicJsonType::string_t>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, const T (&arr)[N]) {
+    external_constructor<value_t::array>::construct(j, arr);
+}
+
+template <typename BasicJsonType, typename T1, typename T2,
+          enable_if_t<std::is_constructible<BasicJsonType, T1>::value &&
+                          std::is_constructible<BasicJsonType, T2>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, const std::pair<T1, T2>& p) {
+    j = {p.first, p.second};
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<std::is_same<T, iteration_proxy_value<typename BasicJsonType::iterator>>::value,
+                      int> = 0>
+inline void to_json(BasicJsonType& j, const T& b) {
+    j = {{b.key(), b.value()}};
+}
+
+template <typename BasicJsonType, typename Tuple>
+inline void to_json_tuple_impl(BasicJsonType& j, const Tuple& /*unused*/,
+                               std::index_sequence<> /*unused*/) {
+    j = BasicJsonType();
+}
+
+template <typename BasicJsonType, typename Tuple, std::size_t... Idx>
+inline void to_json_tuple_impl(BasicJsonType& j, const Tuple& t,
+                               std::index_sequence<Idx...> /*unused*/) {
+    j = {std::get<Idx>(t)...};
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<is_constructible_tuple<BasicJsonType, T>::value, int> = 0>
+inline void to_json(BasicJsonType& j, const T& t) {
+    to_json_tuple_impl(j, t, std::make_index_sequence<std::tuple_size<T>::value>{});
+}
+
+template <typename BasicJsonType, typename T,
+          enable_if_t<std::is_constructible<BasicJsonType, const T&>::value, int> = 0>
+inline void to_json(BasicJsonType& j, const std::optional<T>& opt) {
+    if (opt.has_value()) {
+        j = *opt;
+    } else {
+        j = nullptr;
+    }
+}
+
+struct to_json_fn {
+    template <typename BasicJsonType, typename T>
+    auto operator()(BasicJsonType& j, T&& val) const
+        noexcept(noexcept(to_json(j, std::forward<T>(val))))
+            -> decltype(to_json(j, std::forward<T>(val)), void()) {
+        return to_json(j, std::forward<T>(val));
+    }
+};
+
+struct from_json_fn {
+    template <typename BasicJsonType, typename T>
+    auto operator()(const BasicJsonType& j, T&& val) const
+        noexcept(noexcept(from_json(j, std::forward<T>(val))))
+            -> decltype(from_json(j, std::forward<T>(val))) {
+        return from_json(j, std::forward<T>(val));
+    }
+};
 
 } // namespace detail
+
+#ifndef JSONKIT_HAS_CPP_17_INLINE_VARIABLES
+namespace {
+#endif
+inline constexpr const auto& to_json = detail::static_const<detail::to_json_fn>::value;
+inline constexpr const auto& from_json = detail::static_const<detail::from_json_fn>::value;
+#ifndef JSONKIT_HAS_CPP_17_INLINE_VARIABLES
+} // namespace
+#endif
+
+template <typename ValueType, typename>
+struct adl_serializer {
+    template <typename BasicJsonType, typename TargetType = ValueType>
+    static auto from_json(const BasicJsonType& j, TargetType& val) noexcept(
+        noexcept(::jsonkit::from_json(j, val)))
+        -> decltype(::jsonkit::from_json(j, val), void()) {
+        ::jsonkit::from_json(j, val);
+    }
+
+    template <typename BasicJsonType, typename TargetType = ValueType>
+    static auto from_json(const BasicJsonType& j) noexcept(
+        noexcept(::jsonkit::from_json(j, detail::identity_tag<TargetType>{})))
+        -> decltype(::jsonkit::from_json(j, detail::identity_tag<TargetType>{})) {
+        return ::jsonkit::from_json(j, detail::identity_tag<TargetType>{});
+    }
+
+    template <typename BasicJsonType, typename TargetType = ValueType>
+    static auto to_json(BasicJsonType& j, TargetType&& val) noexcept(
+        noexcept(::jsonkit::to_json(j, std::forward<TargetType>(val))))
+        -> decltype(::jsonkit::to_json(j, std::forward<TargetType>(val)), void()) {
+        ::jsonkit::to_json(j, std::forward<TargetType>(val));
+    }
+};
+
+class json_pointer {
+    friend class json;
+
+public:
+    using string_t = std::string;
+
+    explicit json_pointer(const string_t& s = "") : reference_tokens(split(s)) {}
+
+    string_t to_string() const {
+        return std::accumulate(reference_tokens.begin(), reference_tokens.end(), string_t{},
+                               [](const string_t& a, const string_t& b) {
+                                   return a + "/" + detail::escape(b);
+                               });
+    }
+
+    operator string_t() const {
+        return to_string();
+    }
+
+    friend std::ostream& operator<<(std::ostream& o, const json_pointer& ptr) {
+        return o << ptr.to_string();
+    }
+
+    json_pointer& operator/=(const json_pointer& ptr) {
+        reference_tokens.insert(reference_tokens.end(), ptr.reference_tokens.begin(),
+                                ptr.reference_tokens.end());
+        return *this;
+    }
+
+    json_pointer& operator/=(string_t token) {
+        push_back(std::move(token));
+        return *this;
+    }
+
+    json_pointer& operator/=(std::size_t array_idx) {
+        return *this /= std::to_string(array_idx);
+    }
+
+    friend json_pointer operator/(const json_pointer& lhs, const json_pointer& rhs) {
+        return json_pointer(lhs) /= rhs;
+    }
+
+    friend json_pointer operator/(const json_pointer& lhs, string_t token) {
+        return json_pointer(lhs) /= std::move(token);
+    }
+
+    friend json_pointer operator/(const json_pointer& lhs, std::size_t array_idx) {
+        return json_pointer(lhs) /= array_idx;
+    }
+
+    json_pointer parent_pointer() const {
+        if (empty()) {
+            return *this;
+        }
+        json_pointer res = *this;
+        res.pop_back();
+        return res;
+    }
+
+    void pop_back() {
+        if (empty()) {
+            throw detail::out_of_range::create(405, "JSON pointer has no parent");
+        }
+        reference_tokens.pop_back();
+    }
+
+    const string_t& back() const {
+        if (empty()) {
+            throw detail::out_of_range::create(405, "JSON pointer has no parent");
+        }
+        return reference_tokens.back();
+    }
+
+    void push_back(const string_t& token) {
+        reference_tokens.push_back(token);
+    }
+
+    void push_back(string_t&& token) {
+        reference_tokens.push_back(std::move(token));
+    }
+
+    bool empty() const noexcept {
+        return reference_tokens.empty();
+    }
+
+    friend bool operator==(const json_pointer& lhs, const json_pointer& rhs) noexcept {
+        return lhs.reference_tokens == rhs.reference_tokens;
+    }
+
+    friend bool operator!=(const json_pointer& lhs, const json_pointer& rhs) noexcept {
+        return !(lhs == rhs);
+    }
+
+    friend bool operator<(const json_pointer& lhs, const json_pointer& rhs) noexcept {
+        return lhs.reference_tokens < rhs.reference_tokens;
+    }
+
+private:
+    static std::size_t array_index(const string_t& s) {
+        if (s.size() > 1 && s[0] == '0') {
+            throw detail::parse_error::create(
+                106, 0, "array index '" + s + "' must not begin with '0'");
+        }
+        if (s.size() > 1 && !(s[0] >= '1' && s[0] <= '9')) {
+            throw detail::parse_error::create(
+                109, 0, "array index '" + s + "' is not a number");
+        }
+
+        const char* p = s.c_str();
+        char* p_end = nullptr;
+        errno = 0;
+        const unsigned long long res = std::strtoull(p, &p_end, 10);
+        if (p == p_end || errno == ERANGE || p_end != p + s.size()) {
+            throw detail::out_of_range::create(
+                404, "unresolved reference token '" + s + "'");
+        }
+        if (res > static_cast<unsigned long long>((std::numeric_limits<std::size_t>::max)())) {
+            throw detail::out_of_range::create(
+                410, "array index " + s + " exceeds size_type");
+        }
+        return static_cast<std::size_t>(res);
+    }
+
+    json_pointer top() const {
+        if (empty()) {
+            throw detail::out_of_range::create(405, "JSON pointer has no parent");
+        }
+        json_pointer result = *this;
+        result.reference_tokens = {reference_tokens[0]};
+        return result;
+    }
+
+    template <typename BasicJsonType>
+    BasicJsonType& get_and_create(BasicJsonType& j) const {
+        auto* result = &j;
+        for (const auto& reference_token : reference_tokens) {
+            switch (result->type()) {
+                case detail::value_t::null: {
+                    if (reference_token == "0") {
+                        result = &result->operator[](0);
+                    } else {
+                        result = &result->operator[](reference_token);
+                    }
+                    break;
+                }
+                case detail::value_t::object: {
+                    result = &result->operator[](reference_token);
+                    break;
+                }
+                case detail::value_t::array: {
+                    result = &result->operator[](array_index(reference_token));
+                    break;
+                }
+                default:
+                    throw detail::type_error::create(313, "invalid value to unflatten");
+            }
+        }
+        return *result;
+    }
+
+    template <typename BasicJsonType>
+    BasicJsonType& get_unchecked(BasicJsonType* ptr) const {
+        for (const auto& reference_token : reference_tokens) {
+            if (ptr->is_null()) {
+                const bool nums = std::all_of(
+                    reference_token.begin(), reference_token.end(),
+                    [](const unsigned char x) { return std::isdigit(x); });
+                *ptr = (nums || reference_token == "-") ? detail::value_t::array
+                                                        : detail::value_t::object;
+            }
+
+            switch (ptr->type()) {
+                case detail::value_t::object: {
+                    ptr = &ptr->operator[](reference_token);
+                    break;
+                }
+                case detail::value_t::array: {
+                    if (reference_token == "-") {
+                        ptr->push_back(nullptr);
+                        ptr = &ptr->back();
+                    } else {
+                        const auto idx = array_index(reference_token);
+                        ptr = &ptr->operator[](idx);
+                    }
+                    break;
+                }
+                default:
+                    throw detail::out_of_range::create(
+                        404, "unresolved reference token '" + reference_token + "'");
+            }
+        }
+        return *ptr;
+    }
+
+    template <typename BasicJsonType>
+    BasicJsonType& get_checked(BasicJsonType* ptr) const {
+        for (const auto& reference_token : reference_tokens) {
+            switch (ptr->type()) {
+                case detail::value_t::object: {
+                    ptr = &ptr->at(reference_token);
+                    break;
+                }
+                case detail::value_t::array: {
+                    if (reference_token == "-") {
+                        throw detail::out_of_range::create(
+                            402, "array index '-' (" + std::to_string(ptr->size()) +
+                                     ") is out of range");
+                    }
+                    ptr = &ptr->at(array_index(reference_token));
+                    break;
+                }
+                default:
+                    throw detail::out_of_range::create(
+                        404, "unresolved reference token '" + reference_token + "'");
+            }
+        }
+        return *ptr;
+    }
+
+    template <typename BasicJsonType>
+    const BasicJsonType& get_unchecked(const BasicJsonType* ptr) const {
+        for (const auto& reference_token : reference_tokens) {
+            switch (ptr->type()) {
+                case detail::value_t::object: {
+                    ptr = &ptr->at(reference_token);
+                    break;
+                }
+                case detail::value_t::array: {
+                    if (reference_token == "-") {
+                        throw detail::out_of_range::create(
+                            402, "array index '-' (" + std::to_string(ptr->size()) +
+                                     ") is out of range");
+                    }
+                    ptr = &ptr->at(array_index(reference_token));
+                    break;
+                }
+                default:
+                    throw detail::out_of_range::create(
+                        404, "unresolved reference token '" + reference_token + "'");
+            }
+        }
+        return *ptr;
+    }
+
+    template <typename BasicJsonType>
+    const BasicJsonType& get_checked(const BasicJsonType* ptr) const {
+        for (const auto& reference_token : reference_tokens) {
+            switch (ptr->type()) {
+                case detail::value_t::object: {
+                    ptr = &ptr->at(reference_token);
+                    break;
+                }
+                case detail::value_t::array: {
+                    if (reference_token == "-") {
+                        throw detail::out_of_range::create(
+                            402, "array index '-' (" + std::to_string(ptr->size()) +
+                                     ") is out of range");
+                    }
+                    ptr = &ptr->at(array_index(reference_token));
+                    break;
+                }
+                default:
+                    throw detail::out_of_range::create(
+                        404, "unresolved reference token '" + reference_token + "'");
+            }
+        }
+        return *ptr;
+    }
+
+    template <typename BasicJsonType>
+    bool contains(const BasicJsonType* ptr) const {
+        for (const auto& reference_token : reference_tokens) {
+            switch (ptr->type()) {
+                case detail::value_t::object: {
+                    if (!ptr->contains(reference_token)) {
+                        return false;
+                    }
+                    ptr = &ptr->operator[](reference_token);
+                    break;
+                }
+                case detail::value_t::array: {
+                    if (reference_token == "-") {
+                        return false;
+                    }
+                    if (reference_token.size() == 1 &&
+                        !(reference_token >= "0" && reference_token <= "9")) {
+                        return false;
+                    }
+                    if (reference_token.size() > 1) {
+                        if (!(reference_token[0] >= '1' && reference_token[0] <= '9')) {
+                            return false;
+                        }
+                        for (std::size_t i = 1; i < reference_token.size(); i++) {
+                            if (!(reference_token[i] >= '0' && reference_token[i] <= '9')) {
+                                return false;
+                            }
+                        }
+                    }
+
+                    const auto idx = array_index(reference_token);
+                    if (idx >= ptr->size()) {
+                        return false;
+                    }
+
+                    ptr = &ptr->operator[](idx);
+                    break;
+                }
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    static std::vector<string_t> split(const string_t& reference_string) {
+        std::vector<string_t> result;
+        if (reference_string.empty()) {
+            return result;
+        }
+        if (reference_string[0] != '/') {
+            throw detail::parse_error::create(
+                107, 1,
+                "JSON pointer must be empty or begin with '/' - was: '" + reference_string + "'");
+        }
+        for (std::size_t slash = 0; slash != string_t::npos;) {
+            const std::size_t start = slash + 1;
+            slash = reference_string.find('/', start);
+            auto reference_token = reference_string.substr(start, slash - start);
+            for (std::size_t pos = reference_token.find('~'); pos != string_t::npos;
+                 pos = reference_token.find('~', pos + 1)) {
+                if (pos == reference_token.size() - 1 ||
+                    (reference_token[pos + 1] != '0' && reference_token[pos + 1] != '1')) {
+                    throw detail::parse_error::create(
+                        108, 0, "escape character '~' must be followed with '0' or '1'");
+                }
+            }
+            detail::unescape(reference_token);
+            result.push_back(std::move(reference_token));
+        }
+        return result;
+    }
+
+    template <typename BasicJsonType>
+    static void flatten(const string_t& reference_string, const BasicJsonType& value,
+                        BasicJsonType& result) {
+        switch (value.type()) {
+            case detail::value_t::array: {
+                if (value.empty()) {
+                    result[reference_string] = nullptr;
+                } else {
+                    for (std::size_t i = 0; i < value.size(); ++i) {
+                        flatten(reference_string + "/" + std::to_string(i), value[i], result);
+                    }
+                }
+                break;
+            }
+            case detail::value_t::object: {
+                if (value.empty()) {
+                    result[reference_string] = nullptr;
+                } else {
+                    for (auto it = value.begin(); it != value.end(); ++it) {
+                        flatten(reference_string + "/" + detail::escape(it.key()), it.value(),
+                                result);
+                    }
+                }
+                break;
+            }
+            default:
+                result[reference_string] = value;
+                break;
+        }
+    }
+
+    template <typename BasicJsonType>
+    static BasicJsonType unflatten(const BasicJsonType& value) {
+        if (!value.is_object()) {
+            throw detail::type_error::create(314, "only objects can be unflattened");
+        }
+        BasicJsonType result;
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (!it.value().is_primitive()) {
+                throw detail::type_error::create(315, "values in object must be primitive");
+            }
+            json_pointer(it.key()).get_and_create(result) = it.value();
+        }
+        return result;
+    }
+
+    std::vector<string_t> reference_tokens;
+};
 
 class json {
 private:
     template <typename BasicJsonType>
     friend class detail::iter_impl;
+    template <detail::value_t>
+    friend struct detail::external_constructor;
+    friend class ::jsonkit::json_pointer;
 
 public:
     using value_t = detail::value_t;
     using error_handler_t = detail::error_handler_t;
+    using json_pointer = ::jsonkit::json_pointer;
+    template <typename T = void, typename SFINAE = void>
+    using json_serializer = adl_serializer<T, SFINAE>;
 
     using exception = detail::exception;
     using parse_error = detail::parse_error;
@@ -1053,7 +2576,8 @@ public:
     using number_unsigned_t = std::uint64_t;
     using number_float_t = double;
     using initializer_list_t = std::initializer_list<detail::json_ref<json>>;
-    using parser_callback_t = std::nullptr_t;
+    using parse_event_t = detail::parse_event_t;
+    using parser_callback_t = detail::parser_callback_t<json>;
 
 private:
     union json_value {
@@ -1131,121 +2655,20 @@ public:
 
     json(const value_t v) : m_type(v), m_value(v) {}
 
-    json(boolean_t val) noexcept : m_type(value_t::boolean), m_value(val) {}
-
-    template <typename IntegerType,
-              std::enable_if_t<std::is_integral<IntegerType>::value &&
-                                   !std::is_same<IntegerType, bool>::value &&
-                                   std::is_signed<IntegerType>::value,
-                               int> = 0>
-    json(IntegerType val) noexcept
-        : m_type(value_t::number_integer),
-          m_value(static_cast<number_integer_t>(val)) {}
-
-    template <typename UnsignedType,
-              std::enable_if_t<std::is_integral<UnsignedType>::value &&
-                                   !std::is_same<UnsignedType, bool>::value &&
-                                   std::is_unsigned<UnsignedType>::value,
-                               int> = 0>
-    json(UnsignedType val) noexcept
-        : m_type(value_t::number_unsigned),
-          m_value(static_cast<number_unsigned_t>(val)) {}
-
-    template <typename FloatType,
-              std::enable_if_t<std::is_floating_point<FloatType>::value, int> = 0>
-    json(FloatType val) noexcept
-        : m_type(value_t::number_float),
-          m_value(static_cast<number_float_t>(val)) {}
-
-    template <typename EnumType,
-              std::enable_if_t<std::is_enum<EnumType>::value &&
-                                   !std::is_same<EnumType, value_t>::value,
-                               int> = 0>
-    json(EnumType val) noexcept
-        : json(static_cast<typename std::underlying_type<EnumType>::type>(val)) {}
-
-    json(const char* s) : m_type(value_t::string) {
-        m_value.string = new string_t(s ? s : "");
+    template <typename CompatibleType,
+              typename U = detail::uncvref_t<CompatibleType>,
+              std::enable_if_t<
+                  !detail::is_basic_json<U>::value &&
+                      !detail::is_json_ref<U>::value &&
+                      !std::is_same<U, value_t>::value &&
+                      detail::is_compatible_type<json, U>::value,
+                  int> = 0>
+    json(CompatibleType&& val) noexcept(noexcept(
+        adl_serializer<U>::to_json(std::declval<json&>(), std::forward<CompatibleType>(val)))) {
+        adl_serializer<U>::to_json(*this, std::forward<CompatibleType>(val));
     }
 
-    json(const string_t& s) : m_type(value_t::string) {
-        m_value.string = new string_t(s);
-    }
-
-    json(string_t&& s) : m_type(value_t::string) {
-        m_value.string = new string_t(std::move(s));
-    }
-
-    json(std::string_view sv) : m_type(value_t::string) {
-        m_value.string = new string_t(sv);
-    }
-
-    json(const object_t& obj) : m_type(value_t::object) {
-        m_value.object = new object_t(obj);
-    }
-
-    json(object_t&& obj) : m_type(value_t::object) {
-        m_value.object = new object_t(std::move(obj));
-    }
-
-    json(const array_t& arr) : m_type(value_t::array) {
-        m_value.array = new array_t(arr);
-    }
-
-    json(array_t&& arr) : m_type(value_t::array) {
-        m_value.array = new array_t(std::move(arr));
-    }
-
-    template <typename MapType,
-              std::enable_if_t<detail::is_map_like<std::decay_t<MapType>>::value &&
-                                   !std::is_same<std::decay_t<MapType>, object_t>::value &&
-                                   !std::is_same<std::decay_t<MapType>, json>::value,
-                               int> = 0>
-    json(const MapType& m) : m_type(value_t::object) {
-        m_value.object = new object_t();
-        m_value.object->reserve(m.size());
-        for (const auto& kv : m) {
-            m_value.object->emplace(string_t(kv.first), json(kv.second));
-        }
-    }
-
-    template <typename SeqType,
-              std::enable_if_t<detail::is_sequence_like<std::decay_t<SeqType>>::value &&
-                                   !std::is_same<std::decay_t<SeqType>, array_t>::value &&
-                                   !std::is_same<std::decay_t<SeqType>, json>::value &&
-                                   !std::is_same<std::decay_t<SeqType>, detail::json_ref<json>>::value,
-                               int> = 0>
-    json(const SeqType& seq) : m_type(value_t::array) {
-        m_value.array = new array_t();
-        for (const auto& elem : seq) {
-            m_value.array->emplace_back(elem);
-        }
-    }
-
-    template <typename T, std::size_t N,
-              std::enable_if_t<!std::is_same<std::remove_cv_t<T>, char>::value, int> = 0>
-    json(const T (&arr)[N]) : m_type(value_t::array) {
-        m_value.array = new array_t();
-        m_value.array->reserve(N);
-        for (std::size_t i = 0; i < N; ++i) {
-            m_value.array->emplace_back(arr[i]);
-        }
-    }
-
-    template <typename T1, typename T2>
-    json(const std::pair<T1, T2>& p) : m_type(value_t::array) {
-        m_value.array = new array_t();
-        m_value.array->reserve(2);
-        m_value.array->emplace_back(p.first);
-        m_value.array->emplace_back(p.second);
-    }
-
-    template <typename... Args>
-    json(const std::tuple<Args...>& t) : m_type(value_t::array) {
-        m_value.array = new array_t();
-        m_value.array->reserve(sizeof...(Args));
-        construct_tuple(t, std::index_sequence_for<Args...>{});
-    }
+    json(const detail::json_ref<json>& ref) : json(ref.moved_or_copied()) {}
 
     json(initializer_list_t init, bool type_deduction = true,
          value_t manual_type = value_t::array) {
@@ -1572,6 +2995,7 @@ public:
     template <typename KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value &&
                       !std::is_pointer<std::decay_t<KeyType>>::value &&
                       !std::is_integral<std::decay_t<KeyType>>::value,
@@ -1591,6 +3015,7 @@ public:
     template <typename KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value &&
                       !std::is_pointer<std::decay_t<KeyType>>::value &&
                       !std::is_integral<std::decay_t<KeyType>>::value,
@@ -1605,6 +3030,14 @@ public:
             return it->second;
         }
         throw type_error::create(304, std::string("cannot use at() with ") + type_name());
+    }
+
+    reference at(const json_pointer& ptr) {
+        return ptr.get_checked(this);
+    }
+
+    const_reference at(const json_pointer& ptr) const {
+        return ptr.get_checked(this);
     }
 
     reference operator[](size_type idx) {
@@ -1681,6 +3114,7 @@ public:
     template <typename KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value &&
                       !std::is_pointer<std::decay_t<KeyType>>::value &&
                       !std::is_integral<std::decay_t<KeyType>>::value,
@@ -1700,6 +3134,7 @@ public:
     template <typename KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value &&
                       !std::is_pointer<std::decay_t<KeyType>>::value &&
                       !std::is_integral<std::decay_t<KeyType>>::value,
@@ -1714,10 +3149,21 @@ public:
             305, std::string("cannot use operator[] with a string argument with ") + type_name());
     }
 
+    reference operator[](const json_pointer& ptr) {
+        return ptr.get_unchecked(this);
+    }
+
+    const_reference operator[](const json_pointer& ptr) const {
+        return ptr.get_unchecked(this);
+    }
+
     template <class ValueType,
-              std::enable_if_t<!std::is_same<std::decay_t<ValueType>, const char*>::value &&
-                                   !std::is_same<std::decay_t<ValueType>, char*>::value,
-                               int> = 0>
+              std::enable_if_t<
+                  detail::is_getable<json, ValueType>::value &&
+                      !std::is_same<value_t, detail::uncvref_t<ValueType>>::value &&
+                      !std::is_same<std::decay_t<ValueType>, const char*>::value &&
+                      !std::is_same<std::decay_t<ValueType>, char*>::value,
+                  int> = 0>
     ValueType value(const typename object_t::key_type& key, const ValueType& default_value) const {
         if (is_object()) {
             const auto it = find(key);
@@ -1729,13 +3175,14 @@ public:
         throw type_error::create(306, std::string("cannot use value() with ") + type_name());
     }
 
-    string_t value(const typename object_t::key_type& key, const char* default_value) const {
-        return value(key, string_t(default_value));
-    }
+    string_t value(const typename object_t::key_type& key, const char* default_value) const;
 
     template <class KeyType, class ValueType,
               std::enable_if_t<
-                  std::is_convertible<const KeyType&, std::string_view>::value &&
+                  detail::is_getable<json, ValueType>::value &&
+                      !std::is_same<value_t, detail::uncvref_t<ValueType>>::value &&
+                      std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value &&
                       !std::is_same<std::decay_t<ValueType>, const char*>::value &&
                       !std::is_same<std::decay_t<ValueType>, char*>::value,
@@ -1754,11 +3201,32 @@ public:
     template <class KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     string_t value(KeyType&& key, const char* default_value) const {
         return value(std::forward<KeyType>(key), string_t(default_value));
     }
+
+    template <class ValueType,
+              std::enable_if_t<
+                  detail::is_getable<json, ValueType>::value &&
+                      !std::is_same<value_t, detail::uncvref_t<ValueType>>::value &&
+                      !std::is_same<std::decay_t<ValueType>, const char*>::value &&
+                      !std::is_same<std::decay_t<ValueType>, char*>::value,
+                  int> = 0>
+    ValueType value(const json_pointer& ptr, const ValueType& default_value) const {
+        if (is_object()) {
+            try {
+                return ptr.get_checked(this).template get<ValueType>();
+            } catch (out_of_range&) {
+                return default_value;
+            }
+        }
+        throw type_error::create(306, std::string("cannot use value() with ") + type_name());
+    }
+
+    string_t value(const json_pointer& ptr, const char* default_value) const;
 
     reference front() { return *begin(); }
     const_reference front() const { return *cbegin(); }
@@ -1796,6 +3264,7 @@ public:
     template <class KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     iterator find(KeyType&& key) {
@@ -1810,6 +3279,7 @@ public:
     template <class KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     const_iterator find(KeyType&& key) const {
@@ -1828,6 +3298,7 @@ public:
     template <class KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     size_type count(KeyType&& key) const {
@@ -1841,10 +3312,15 @@ public:
     template <class KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     bool contains(KeyType&& key) const {
         return is_object() && m_value.object->contains(std::string_view(key));
+    }
+
+    bool contains(const json_pointer& ptr) const {
+        return ptr.contains(this);
     }
 
     // ==================== Iterators ====================
@@ -2185,6 +3661,7 @@ public:
     template <class KeyType,
               std::enable_if_t<
                   std::is_convertible<const KeyType&, std::string_view>::value &&
+                      !detail::is_json_pointer<detail::uncvref_t<KeyType>>::value &&
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value &&
                       !std::is_pointer<std::decay_t<KeyType>>::value &&
                       !std::is_integral<std::decay_t<KeyType>>::value,
@@ -2744,17 +4221,19 @@ private:
 
 public:
     template <typename PointerType,
-              std::enable_if_t<std::is_pointer<PointerType>::value, int> = 0>
-    auto get_ptr() noexcept -> decltype(this->get_impl_ptr(static_cast<PointerType>(nullptr))) {
+              typename std::enable_if<std::is_pointer<PointerType>::value, int>::type = 0>
+    auto get_ptr() noexcept
+        -> decltype(std::declval<json&>().get_impl_ptr(std::declval<PointerType>())) {
         return get_impl_ptr(static_cast<PointerType>(nullptr));
     }
 
     template <typename PointerType,
-              std::enable_if_t<std::is_pointer<PointerType>::value &&
-                                   std::is_const<std::remove_pointer_t<PointerType>>::value,
-                               int> = 0>
+              typename std::enable_if<
+                  std::is_pointer<PointerType>::value &&
+                      std::is_const<typename std::remove_pointer<PointerType>::type>::value,
+                  int>::type = 0>
     constexpr auto get_ptr() const noexcept
-        -> decltype(this->get_impl_ptr(static_cast<PointerType>(nullptr))) {
+        -> decltype(std::declval<const json&>().get_impl_ptr(std::declval<PointerType>())) {
         return get_impl_ptr(static_cast<PointerType>(nullptr));
     }
 
@@ -2784,209 +4263,417 @@ public:
                      type_name());
     }
 
+private:
     template <typename ValueType,
-              std::enable_if_t<std::is_pointer<ValueType>::value, int> = 0>
-    auto get() noexcept -> decltype(this->template get_ptr<ValueType>()) {
-        return get_ptr<ValueType>();
+              detail::enable_if_t<
+                  detail::is_default_constructible<ValueType>::value &&
+                      detail::has_from_json<json, ValueType>::value,
+                  int> = 0>
+    ValueType get_impl(detail::priority_tag<0> /*unused*/) const noexcept(noexcept(
+        json_serializer<ValueType>::from_json(std::declval<const json&>(),
+                                              std::declval<ValueType&>()))) {
+        auto ret = ValueType();
+        json_serializer<ValueType>::from_json(*this, ret);
+        return ret;
     }
 
     template <typename ValueType,
-              std::enable_if_t<std::is_pointer<ValueType>::value &&
-                                   std::is_const<std::remove_pointer_t<ValueType>>::value,
-                               int> = 0>
-    constexpr auto get() const noexcept -> decltype(this->template get_ptr<ValueType>()) {
-        return get_ptr<ValueType>();
+              detail::enable_if_t<
+                  detail::has_non_default_from_json<json, ValueType>::value,
+                  int> = 0>
+    ValueType get_impl(detail::priority_tag<1> /*unused*/) const noexcept(noexcept(
+        json_serializer<ValueType>::from_json(std::declval<const json&>()))) {
+        return json_serializer<ValueType>::from_json(*this);
     }
 
-    template <typename ValueType,
-              std::enable_if_t<!std::is_pointer<ValueType>::value &&
-                                   !std::is_reference<ValueType>::value,
-                               int> = 0>
-    ValueType get() const {
-        return get_impl(static_cast<std::remove_cv_t<ValueType>*>(nullptr));
+    template <typename BasicJsonType,
+              detail::enable_if_t<detail::is_basic_json<BasicJsonType>::value, int> = 0>
+    BasicJsonType get_impl(detail::priority_tag<2> /*unused*/) const {
+        return *this;
+    }
+
+    template <typename BasicJsonType,
+              detail::enable_if_t<std::is_same<BasicJsonType, json>::value, int> = 0>
+    json get_impl(detail::priority_tag<3> /*unused*/) const {
+        return *this;
+    }
+
+    template <typename PointerType,
+              detail::enable_if_t<std::is_pointer<PointerType>::value, int> = 0>
+    constexpr auto get_impl(detail::priority_tag<4> /*unused*/) const noexcept
+        -> decltype(std::declval<const json&>().template get_ptr<PointerType>()) {
+        return get_ptr<PointerType>();
+    }
+
+public:
+    template <typename ValueTypeCV, typename ValueType = detail::uncvref_t<ValueTypeCV>>
+    constexpr auto get() const noexcept(noexcept(
+        std::declval<const json&>().template get_impl<ValueType>(detail::priority_tag<4>{})))
+        -> decltype(std::declval<const json&>().template get_impl<ValueType>(
+            detail::priority_tag<4>{})) {
+        static_assert(!std::is_reference<ValueTypeCV>::value,
+                      "get() cannot be used with reference types, you might want to use get_ref()");
+        return get_impl<ValueType>(detail::priority_tag<4>{});
+    }
+
+    template <typename PointerType,
+              typename std::enable_if<std::is_pointer<PointerType>::value, int>::type = 0>
+    auto get() noexcept -> decltype(std::declval<json&>().template get_ptr<PointerType>()) {
+        return get_ptr<PointerType>();
     }
 
     template <typename ValueType,
               std::enable_if_t<!std::is_const<ValueType>::value &&
-                                   !std::is_same<std::decay_t<ValueType>, json>::value,
+                                   !detail::is_basic_json<ValueType>::value &&
+                                   detail::has_from_json<json, ValueType>::value,
                                int> = 0>
+    ValueType& get_to(ValueType& v) const noexcept(noexcept(
+        json_serializer<ValueType>::from_json(std::declval<const json&>(), v))) {
+        json_serializer<ValueType>::from_json(*this, v);
+        return v;
+    }
+
+    template <typename ValueType,
+              std::enable_if_t<detail::is_basic_json<ValueType>::value, int> = 0>
     ValueType& get_to(ValueType& v) const {
-        v = get<ValueType>();
+        v = *this;
+        return v;
+    }
+
+    template <typename T, std::size_t N, typename Array = T (&)[N],
+              std::enable_if_t<!std::is_const<T>::value &&
+                                   detail::has_from_json<json, Array>::value,
+                               int> = 0>
+    Array get_to(T (&v)[N]) const noexcept(noexcept(
+        json_serializer<Array>::from_json(std::declval<const json&>(), v))) {
+        json_serializer<Array>::from_json(*this, v);
         return v;
     }
 
     template <typename ValueType,
               std::enable_if_t<
-                  !std::is_pointer<ValueType>::value &&
-                      !std::is_same<ValueType, std::nullptr_t>::value &&
-                      !std::is_same<ValueType, std::string_view>::value &&
-                      !std::is_same<ValueType, value_t>::value &&
-                      !std::is_same<std::decay_t<ValueType>, json>::value &&
-                      !std::is_same<std::decay_t<ValueType>, detail::json_ref<json>>::value &&
-                      !std::is_same<ValueType,
-                                    std::initializer_list<typename string_t::value_type>>::value &&
-                      (std::is_arithmetic<ValueType>::value || std::is_enum<ValueType>::value ||
-                       std::is_same<ValueType, string_t>::value ||
-                       std::is_same<ValueType, object_t>::value ||
-                       std::is_same<ValueType, array_t>::value ||
-                       detail::is_map_like<ValueType>::value ||
-                       detail::is_sequence_like<ValueType>::value ||
-                       detail::is_std_pair<ValueType>::value ||
-                       detail::is_std_tuple<ValueType>::value),
+                  detail::conjunction<
+                      detail::negation<std::is_pointer<ValueType>>,
+                      detail::negation<std::is_same<ValueType, std::nullptr_t>>,
+                      detail::negation<std::is_same<ValueType, std::string_view>>,
+                      detail::negation<std::is_same<ValueType, value_t>>,
+                      detail::negation<detail::is_basic_json<std::decay_t<ValueType>>>,
+                      detail::negation<std::is_same<std::decay_t<ValueType>, detail::json_ref<json>>>,
+                      detail::negation<std::is_same<
+                          ValueType, std::initializer_list<typename string_t::value_type>>>,
+                      detail::is_detected_lazy<detail::get_template_function, const json&,
+                                               ValueType>>::value,
                   int> = 0>
     operator ValueType() const {
         return get<ValueType>();
     }
 
+    // ==================== Flatten / Unflatten / Patch / Diff ====================
+
+    json flatten() const;
+    json unflatten() const;
+    void patch_inplace(const json& json_patch);
+    json patch(const json& json_patch) const;
+    static json diff(const json& source, const json& target, const std::string& path = "");
+    void merge_patch(const json& apply_patch);
+
 private:
-    template <typename Tuple, std::size_t... Is>
-    void construct_tuple(const Tuple& t, std::index_sequence<Is...>) {
-        (m_value.array->emplace_back(std::get<Is>(t)), ...);
-    }
-
-    json get_impl(json* /*unused*/) const { return *this; }
-
-    object_t get_impl(object_t* /*unused*/) const {
-        if (is_object()) {
-            return *m_value.object;
-        }
-        throw type_error::create(302, std::string("type must be object, but is ") + type_name());
-    }
-
-    array_t get_impl(array_t* /*unused*/) const {
-        if (is_array()) {
-            return *m_value.array;
-        }
-        throw type_error::create(302, std::string("type must be array, but is ") + type_name());
-    }
-
-    string_t get_impl(string_t* /*unused*/) const {
-        if (is_string()) {
-            return *m_value.string;
-        }
-        throw type_error::create(302, std::string("type must be string, but is ") + type_name());
-    }
-
-    std::string_view get_impl(std::string_view* /*unused*/) const {
-        if (is_string()) {
-            return std::string_view(*m_value.string);
-        }
-        throw type_error::create(302, std::string("type must be string, but is ") + type_name());
-    }
-
-    boolean_t get_impl(boolean_t* /*unused*/) const {
-        if (is_boolean()) {
-            return m_value.boolean;
-        }
-        throw type_error::create(302, std::string("type must be boolean, but is ") + type_name());
-    }
-
-    template <typename ArithmeticType,
-              std::enable_if_t<std::is_arithmetic<ArithmeticType>::value &&
-                                   !std::is_same<ArithmeticType, boolean_t>::value,
-                               int> = 0>
-    ArithmeticType get_impl(ArithmeticType* /*unused*/) const {
-        switch (m_type) {
-            case value_t::number_unsigned:
-                return static_cast<ArithmeticType>(m_value.number_unsigned);
-            case value_t::number_integer:
-                return static_cast<ArithmeticType>(m_value.number_integer);
-            case value_t::number_float:
-                return static_cast<ArithmeticType>(m_value.number_float);
-            default:
-                throw type_error::create(
-                    302, std::string("type must be number, but is ") + type_name());
-        }
-    }
-
-    template <typename EnumType,
-              std::enable_if_t<std::is_enum<EnumType>::value, int> = 0>
-    EnumType get_impl(EnumType* /*unused*/) const {
-        using underlying_t = typename std::underlying_type<EnumType>::type;
-        return static_cast<EnumType>(get<underlying_t>());
-    }
-
-    template <typename MapType,
-              std::enable_if_t<detail::is_map_like<MapType>::value &&
-                                   !std::is_same<MapType, object_t>::value,
-                               int> = 0>
-    MapType get_impl(MapType* /*unused*/) const {
-        if (!is_object()) {
-            throw type_error::create(
-                302, std::string("type must be object, but is ") + type_name());
-        }
-        MapType res;
-        for (const auto& kv : *m_value.object) {
-            res.emplace(typename MapType::key_type(kv.first),
-                        kv.second.template get<typename MapType::mapped_type>());
-        }
-        return res;
-    }
-
-    template <typename T, std::size_t N>
-    std::array<T, N> get_impl(std::array<T, N>* /*unused*/) const {
-        if (!is_array()) {
-            throw type_error::create(302, std::string("type must be array, but is ") + type_name());
-        }
-        std::array<T, N> res{};
-        for (std::size_t i = 0; i < N; ++i) {
-            res[i] = at(i).template get<T>();
-        }
-        return res;
-    }
-
-    template <typename T1, typename T2>
-    std::pair<T1, T2> get_impl(std::pair<T1, T2>* /*unused*/) const {
-        if (!is_array()) {
-            throw type_error::create(302, std::string("type must be array, but is ") + type_name());
-        }
-        return std::make_pair(at(0).template get<T1>(), at(1).template get<T2>());
-    }
-
-    template <typename... Args>
-    std::tuple<Args...> get_impl(std::tuple<Args...>* /*unused*/) const {
-        if (!is_array()) {
-            throw type_error::create(302, std::string("type must be array, but is ") + type_name());
-        }
-        return get_tuple_impl<std::tuple<Args...>>(std::index_sequence_for<Args...>{});
-    }
-
-    template <typename Tuple, std::size_t... Is>
-    Tuple get_tuple_impl(std::index_sequence<Is...>) const {
-        return std::make_tuple(at(Is).template get<std::tuple_element_t<Is, Tuple>>()...);
-    }
-
-    template <typename SeqType,
-              std::enable_if_t<detail::is_sequence_like<SeqType>::value &&
-                                   !std::is_same<SeqType, array_t>::value &&
-                                   !detail::is_std_array<SeqType>::value,
-                               int> = 0>
-    SeqType get_impl(SeqType* /*unused*/) const {
-        if (!is_array()) {
-            throw type_error::create(302, std::string("type must be array, but is ") + type_name());
-        }
-        SeqType res;
-        for (const auto& elem : *m_value.array) {
-            insert_into_sequence(res, elem.template get<typename SeqType::value_type>(), 0);
-        }
-        return res;
-    }
-
-    template <typename C, typename V>
-    static auto insert_into_sequence(C& c, V&& v, int) -> decltype(c.push_back(std::forward<V>(v)), void()) {
-        c.push_back(std::forward<V>(v));
-    }
-
-    template <typename C, typename V>
-    static auto insert_into_sequence(C& c, V&& v, long) -> decltype(c.insert(std::forward<V>(v)), void()) {
-        c.insert(std::forward<V>(v));
-    }
-
     value_t m_type = value_t::null;
     json_value m_value{};
 };
 
 static_assert(sizeof(json) == 16, "jsonkit::json must be 16 bytes");
+
+// Out-of-line json member functions that depend on adl_serializer
+
+inline json::string_t json::value(const typename object_t::key_type& key,
+                                  const char* default_value) const {
+    return value(key, string_t(default_value));
+}
+
+inline json::string_t json::value(const json_pointer& ptr, const char* default_value) const {
+    return value(ptr, string_t(default_value));
+}
+
+inline json json::flatten() const {
+    json result(value_t::object);
+    json_pointer::flatten("", *this, result);
+    return result;
+}
+
+inline json json::unflatten() const {
+    return json_pointer::unflatten(*this);
+}
+
+inline void json::patch_inplace(const json& json_patch) {
+    json& result = *this;
+
+    enum class patch_operations { add, remove, replace, move, copy, test, invalid };
+
+    const auto get_op = [](const std::string& op) {
+        if (op == "add") {
+            return patch_operations::add;
+        }
+        if (op == "remove") {
+            return patch_operations::remove;
+        }
+        if (op == "replace") {
+            return patch_operations::replace;
+        }
+        if (op == "move") {
+            return patch_operations::move;
+        }
+        if (op == "copy") {
+            return patch_operations::copy;
+        }
+        if (op == "test") {
+            return patch_operations::test;
+        }
+        return patch_operations::invalid;
+    };
+
+    const auto operation_add = [&result](json_pointer& ptr, json val) {
+        if (ptr.empty()) {
+            result = std::move(val);
+            return;
+        }
+
+        auto last_path = ptr.back();
+        ptr.pop_back();
+
+        json& parent = result.at(ptr);
+
+        switch (parent.m_type) {
+            case value_t::null:
+            case value_t::object: {
+                parent[last_path] = std::move(val);
+                break;
+            }
+
+            case value_t::array: {
+                if (last_path == "-") {
+                    parent.push_back(std::move(val));
+                } else {
+                    const auto idx = json_pointer::array_index(last_path);
+                    if (idx > parent.size()) {
+                        throw out_of_range::create(
+                            401, "array index " + std::to_string(idx) + " is out of range");
+                    }
+                    parent.insert(parent.begin() + static_cast<difference_type>(idx),
+                                  std::move(val));
+                }
+                break;
+            }
+
+            default:
+                assert(false);
+        }
+    };
+
+    const auto operation_remove = [&result](json_pointer& ptr) {
+        if (ptr.empty()) {
+            throw out_of_range::create(405, "JSON pointer has no parent");
+        }
+
+        auto last_path = ptr.back();
+        ptr.pop_back();
+
+        json& parent = result.at(ptr);
+
+        if (parent.is_object()) {
+            auto it = parent.find(last_path);
+            if (it != parent.end()) {
+                parent.erase(it);
+            } else {
+                throw out_of_range::create(403, "key '" + last_path + "' not found");
+            }
+        } else if (parent.is_array()) {
+            parent.erase(json_pointer::array_index(last_path));
+        }
+    };
+
+    if (!json_patch.is_array()) {
+        throw parse_error::create(104, 0, "JSON patch must be an array of objects");
+    }
+
+    for (const auto& val : json_patch) {
+        if (!val.is_object()) {
+            throw parse_error::create(104, 0, "JSON patch must be an array of objects");
+        }
+
+        const auto get_member = [&val](const std::string& op, const std::string& member,
+                                       bool string_type) -> const json& {
+            auto it = val.m_value.object->find(member);
+            const std::string error_msg =
+                (op == "op") ? "operation" : ("operation '" + op + "'");
+            if (it == val.m_value.object->end()) {
+                throw parse_error::create(
+                    105, 0, error_msg + " must have member '" + member + "'");
+            }
+            if (string_type && !it->second.is_string()) {
+                throw parse_error::create(
+                    105, 0, error_msg + " must have string member '" + member + "'");
+            }
+            return it->second;
+        };
+
+        const std::string op = *get_member("op", "op", true).m_value.string;
+        const std::string path = *get_member(op, "path", true).m_value.string;
+        json_pointer ptr(path);
+
+        switch (get_op(op)) {
+            case patch_operations::add: {
+                operation_add(ptr, get_member("add", "value", false));
+                break;
+            }
+
+            case patch_operations::remove: {
+                operation_remove(ptr);
+                break;
+            }
+
+            case patch_operations::replace: {
+                result.at(ptr) = get_member("replace", "value", false);
+                break;
+            }
+
+            case patch_operations::move: {
+                const std::string from_path = *get_member("move", "from", true).m_value.string;
+                json_pointer from_ptr(from_path);
+
+                json v = result.at(from_ptr);
+
+                operation_remove(from_ptr);
+                operation_add(ptr, std::move(v));
+                break;
+            }
+
+            case patch_operations::copy: {
+                const std::string from_path = *get_member("copy", "from", true).m_value.string;
+                const json_pointer from_ptr(from_path);
+
+                json v = result.at(from_ptr);
+                operation_add(ptr, std::move(v));
+                break;
+            }
+
+            case patch_operations::test: {
+                bool success = false;
+                try {
+                    success = (result.at(ptr) == get_member("test", "value", false));
+                } catch (out_of_range&) {
+                }
+
+                if (!success) {
+                    throw other_error::create(501, "unsuccessful: " + val.dump());
+                }
+
+                break;
+            }
+
+            case patch_operations::invalid: {
+                throw parse_error::create(105, 0, "operation value '" + op + "' is invalid");
+            }
+        }
+    }
+}
+
+inline json json::patch(const json& json_patch) const {
+    json result = *this;
+    result.patch_inplace(json_patch);
+    return result;
+}
+
+inline json json::diff(const json& source, const json& target, const std::string& path) {
+    json result(value_t::array);
+
+    if (source == target) {
+        return result;
+    }
+
+    if (source.type() != target.type()) {
+        result.push_back({{"op", "replace"}, {"path", path}, {"value", target}});
+        return result;
+    }
+
+    switch (source.type()) {
+        case value_t::array: {
+            std::size_t i = 0;
+            while (i < source.size() && i < target.size()) {
+                json temp_diff = diff(source[i], target[i], path + "/" + std::to_string(i));
+                result.insert(result.end(), temp_diff.begin(), temp_diff.end());
+                ++i;
+            }
+
+            // Remove remaining elements in reverse order to avoid invalidating earlier indices
+            const auto end_index = static_cast<difference_type>(result.size());
+            while (i < source.size()) {
+                result.insert(
+                    result.begin() + end_index,
+                    object({{"op", "remove"},
+                            {"path", path + "/" + std::to_string(i)}}));
+                ++i;
+            }
+
+            // Add other remaining elements
+            while (i < target.size()) {
+                result.push_back({{"op", "add"},
+                                  {"path", path + "/-"},
+                                  {"value", target[i]}});
+                ++i;
+            }
+
+            break;
+        }
+
+        case value_t::object: {
+            for (auto it = source.cbegin(); it != source.cend(); ++it) {
+                const auto path_key = path + "/" + detail::escape(it.key());
+
+                if (target.find(it.key()) != target.end()) {
+                    json temp_diff = diff(it.value(), target[it.key()], path_key);
+                    result.insert(result.end(), temp_diff.begin(), temp_diff.end());
+                } else {
+                    result.push_back(object({{"op", "remove"}, {"path", path_key}}));
+                }
+            }
+
+            for (auto it = target.cbegin(); it != target.cend(); ++it) {
+                if (source.find(it.key()) == source.end()) {
+                    const auto path_key = path + "/" + detail::escape(it.key());
+                    result.push_back(
+                        {{"op", "add"}, {"path", path_key}, {"value", it.value()}});
+                }
+            }
+
+            break;
+        }
+
+        default: {
+            result.push_back({{"op", "replace"}, {"path", path}, {"value", target}});
+            break;
+        }
+    }
+
+    return result;
+}
+
+inline void json::merge_patch(const json& apply_patch) {
+    if (apply_patch.is_object()) {
+        if (!is_object()) {
+            *this = object();
+        }
+        for (auto it = apply_patch.begin(); it != apply_patch.end(); ++it) {
+            if (it.value().is_null()) {
+                erase(it.key());
+            } else {
+                operator[](it.key()).merge_patch(it.value());
+            }
+        }
+    } else {
+        *this = apply_patch;
+    }
+}
 
 inline namespace literals {
 inline namespace json_literals {
@@ -2995,10 +4682,173 @@ inline json operator""_json(const char* s, std::size_t n) {
     return json::parse(std::string_view(s, n));
 }
 
+inline json::json_pointer operator""_json_pointer(const char* s, std::size_t n) {
+    return json::json_pointer(std::string(s, n));
+}
+
 } // namespace json_literals
 } // namespace literals
 
 } // namespace jsonkit
+
+// ==================== User-Type Macros ====================
+
+#define JSONKIT_JSON_EXPAND(x) x
+#define JSONKIT_JSON_GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, _21, _22, _23, _24, _25, _26, _27, _28, _29, _30, _31, _32, _33, _34, _35, _36, _37, _38, _39, _40, _41, _42, _43, _44, _45, _46, _47, _48, _49, _50, _51, _52, _53, _54, _55, _56, _57, _58, _59, _60, _61, _62, _63, _64, NAME, ...) NAME
+#define JSONKIT_JSON_PASTE(...) JSONKIT_JSON_EXPAND(JSONKIT_JSON_GET_MACRO(__VA_ARGS__, \
+    JSONKIT_JSON_PASTE64, JSONKIT_JSON_PASTE63, JSONKIT_JSON_PASTE62, JSONKIT_JSON_PASTE61, \
+    JSONKIT_JSON_PASTE60, JSONKIT_JSON_PASTE59, JSONKIT_JSON_PASTE58, JSONKIT_JSON_PASTE57, \
+    JSONKIT_JSON_PASTE56, JSONKIT_JSON_PASTE55, JSONKIT_JSON_PASTE54, JSONKIT_JSON_PASTE53, \
+    JSONKIT_JSON_PASTE52, JSONKIT_JSON_PASTE51, JSONKIT_JSON_PASTE50, JSONKIT_JSON_PASTE49, \
+    JSONKIT_JSON_PASTE48, JSONKIT_JSON_PASTE47, JSONKIT_JSON_PASTE46, JSONKIT_JSON_PASTE45, \
+    JSONKIT_JSON_PASTE44, JSONKIT_JSON_PASTE43, JSONKIT_JSON_PASTE42, JSONKIT_JSON_PASTE41, \
+    JSONKIT_JSON_PASTE40, JSONKIT_JSON_PASTE39, JSONKIT_JSON_PASTE38, JSONKIT_JSON_PASTE37, \
+    JSONKIT_JSON_PASTE36, JSONKIT_JSON_PASTE35, JSONKIT_JSON_PASTE34, JSONKIT_JSON_PASTE33, \
+    JSONKIT_JSON_PASTE32, JSONKIT_JSON_PASTE31, JSONKIT_JSON_PASTE30, JSONKIT_JSON_PASTE29, \
+    JSONKIT_JSON_PASTE28, JSONKIT_JSON_PASTE27, JSONKIT_JSON_PASTE26, JSONKIT_JSON_PASTE25, \
+    JSONKIT_JSON_PASTE24, JSONKIT_JSON_PASTE23, JSONKIT_JSON_PASTE22, JSONKIT_JSON_PASTE21, \
+    JSONKIT_JSON_PASTE20, JSONKIT_JSON_PASTE19, JSONKIT_JSON_PASTE18, JSONKIT_JSON_PASTE17, \
+    JSONKIT_JSON_PASTE16, JSONKIT_JSON_PASTE15, JSONKIT_JSON_PASTE14, JSONKIT_JSON_PASTE13, \
+    JSONKIT_JSON_PASTE12, JSONKIT_JSON_PASTE11, JSONKIT_JSON_PASTE10, JSONKIT_JSON_PASTE9, \
+    JSONKIT_JSON_PASTE8, JSONKIT_JSON_PASTE7, JSONKIT_JSON_PASTE6, JSONKIT_JSON_PASTE5, \
+    JSONKIT_JSON_PASTE4, JSONKIT_JSON_PASTE3, JSONKIT_JSON_PASTE2, JSONKIT_JSON_PASTE1)(__VA_ARGS__))
+#define JSONKIT_JSON_PASTE2(func, v1) func(v1)
+#define JSONKIT_JSON_PASTE3(func, v1, v2) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE2(func, v2)
+#define JSONKIT_JSON_PASTE4(func, v1, v2, v3) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE3(func, v2, v3)
+#define JSONKIT_JSON_PASTE5(func, v1, v2, v3, v4) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE4(func, v2, v3, v4)
+#define JSONKIT_JSON_PASTE6(func, v1, v2, v3, v4, v5) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE5(func, v2, v3, v4, v5)
+#define JSONKIT_JSON_PASTE7(func, v1, v2, v3, v4, v5, v6) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE6(func, v2, v3, v4, v5, v6)
+#define JSONKIT_JSON_PASTE8(func, v1, v2, v3, v4, v5, v6, v7) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE7(func, v2, v3, v4, v5, v6, v7)
+#define JSONKIT_JSON_PASTE9(func, v1, v2, v3, v4, v5, v6, v7, v8) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE8(func, v2, v3, v4, v5, v6, v7, v8)
+#define JSONKIT_JSON_PASTE10(func, v1, v2, v3, v4, v5, v6, v7, v8, v9) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE9(func, v2, v3, v4, v5, v6, v7, v8, v9)
+#define JSONKIT_JSON_PASTE11(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE10(func, v2, v3, v4, v5, v6, v7, v8, v9, v10)
+#define JSONKIT_JSON_PASTE12(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE11(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11)
+#define JSONKIT_JSON_PASTE13(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE12(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12)
+#define JSONKIT_JSON_PASTE14(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE13(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13)
+#define JSONKIT_JSON_PASTE15(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE14(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14)
+#define JSONKIT_JSON_PASTE16(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE15(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15)
+#define JSONKIT_JSON_PASTE17(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE16(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16)
+#define JSONKIT_JSON_PASTE18(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE17(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17)
+#define JSONKIT_JSON_PASTE19(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE18(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18)
+#define JSONKIT_JSON_PASTE20(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE19(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19)
+#define JSONKIT_JSON_PASTE21(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE20(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20)
+#define JSONKIT_JSON_PASTE22(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE21(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21)
+#define JSONKIT_JSON_PASTE23(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE22(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22)
+#define JSONKIT_JSON_PASTE24(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE23(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23)
+#define JSONKIT_JSON_PASTE25(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE24(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24)
+#define JSONKIT_JSON_PASTE26(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE25(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25)
+#define JSONKIT_JSON_PASTE27(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE26(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26)
+#define JSONKIT_JSON_PASTE28(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE27(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27)
+#define JSONKIT_JSON_PASTE29(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE28(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28)
+#define JSONKIT_JSON_PASTE30(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE29(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29)
+#define JSONKIT_JSON_PASTE31(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE30(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30)
+#define JSONKIT_JSON_PASTE32(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE31(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31)
+#define JSONKIT_JSON_PASTE33(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE32(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32)
+#define JSONKIT_JSON_PASTE34(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE33(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33)
+#define JSONKIT_JSON_PASTE35(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE34(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34)
+#define JSONKIT_JSON_PASTE36(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE35(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35)
+#define JSONKIT_JSON_PASTE37(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE36(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36)
+#define JSONKIT_JSON_PASTE38(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE37(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37)
+#define JSONKIT_JSON_PASTE39(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE38(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38)
+#define JSONKIT_JSON_PASTE40(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE39(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39)
+#define JSONKIT_JSON_PASTE41(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE40(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40)
+#define JSONKIT_JSON_PASTE42(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE41(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41)
+#define JSONKIT_JSON_PASTE43(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE42(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42)
+#define JSONKIT_JSON_PASTE44(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE43(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43)
+#define JSONKIT_JSON_PASTE45(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE44(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44)
+#define JSONKIT_JSON_PASTE46(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE45(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45)
+#define JSONKIT_JSON_PASTE47(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE46(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46)
+#define JSONKIT_JSON_PASTE48(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE47(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47)
+#define JSONKIT_JSON_PASTE49(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE48(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48)
+#define JSONKIT_JSON_PASTE50(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE49(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49)
+#define JSONKIT_JSON_PASTE51(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE50(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50)
+#define JSONKIT_JSON_PASTE52(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE51(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51)
+#define JSONKIT_JSON_PASTE53(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE52(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52)
+#define JSONKIT_JSON_PASTE54(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE53(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53)
+#define JSONKIT_JSON_PASTE55(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE54(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54)
+#define JSONKIT_JSON_PASTE56(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE55(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55)
+#define JSONKIT_JSON_PASTE57(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE56(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56)
+#define JSONKIT_JSON_PASTE58(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE57(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57)
+#define JSONKIT_JSON_PASTE59(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE58(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58)
+#define JSONKIT_JSON_PASTE60(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE59(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59)
+#define JSONKIT_JSON_PASTE61(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE60(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60)
+#define JSONKIT_JSON_PASTE62(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE61(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61)
+#define JSONKIT_JSON_PASTE63(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61, v62) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE62(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61, v62)
+#define JSONKIT_JSON_PASTE64(func, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61, v62, v63) JSONKIT_JSON_PASTE2(func, v1) JSONKIT_JSON_PASTE63(func, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31, v32, v33, v34, v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46, v47, v48, v49, v50, v51, v52, v53, v54, v55, v56, v57, v58, v59, v60, v61, v62, v63)
+
+#define JSONKIT_JSON_TO(v1) jsonkit_json_j[#v1] = jsonkit_json_t.v1;
+#define JSONKIT_JSON_FROM(v1) jsonkit_json_j.at(#v1).get_to(jsonkit_json_t.v1);
+#define JSONKIT_JSON_FROM_WITH_DEFAULT(v1) \
+    jsonkit_json_t.v1 = jsonkit_json_j.value(#v1, jsonkit_json_default_obj.v1);
+
+#define JSONKIT_DEFINE_TYPE_INTRUSIVE(Type, ...) \
+    friend void to_json(::jsonkit::json& jsonkit_json_j, const Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_TO, __VA_ARGS__)) \
+    } \
+    friend void from_json(const ::jsonkit::json& jsonkit_json_j, Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_FROM, __VA_ARGS__)) \
+    }
+
+#define JSONKIT_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(Type, ...) \
+    friend void to_json(::jsonkit::json& jsonkit_json_j, const Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_TO, __VA_ARGS__)) \
+    } \
+    friend void from_json(const ::jsonkit::json& jsonkit_json_j, Type& jsonkit_json_t) { \
+        const Type jsonkit_json_default_obj{}; \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_FROM_WITH_DEFAULT, __VA_ARGS__)) \
+    }
+
+#define JSONKIT_DEFINE_TYPE_INTRUSIVE_ONLY_SERIALIZE(Type, ...) \
+    friend void to_json(::jsonkit::json& jsonkit_json_j, const Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_TO, __VA_ARGS__)) \
+    }
+
+#define JSONKIT_DEFINE_TYPE_NON_INTRUSIVE(Type, ...) \
+    inline void to_json(::jsonkit::json& jsonkit_json_j, const Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_TO, __VA_ARGS__)) \
+    } \
+    inline void from_json(const ::jsonkit::json& jsonkit_json_j, Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_FROM, __VA_ARGS__)) \
+    }
+
+#define JSONKIT_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Type, ...) \
+    inline void to_json(::jsonkit::json& jsonkit_json_j, const Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_TO, __VA_ARGS__)) \
+    } \
+    inline void from_json(const ::jsonkit::json& jsonkit_json_j, Type& jsonkit_json_t) { \
+        const Type jsonkit_json_default_obj{}; \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_FROM_WITH_DEFAULT, __VA_ARGS__)) \
+    }
+
+#define JSONKIT_DEFINE_TYPE_NON_INTRUSIVE_ONLY_SERIALIZE(Type, ...) \
+    inline void to_json(::jsonkit::json& jsonkit_json_j, const Type& jsonkit_json_t) { \
+        JSONKIT_JSON_EXPAND(JSONKIT_JSON_PASTE(JSONKIT_JSON_TO, __VA_ARGS__)) \
+    }
+
+#define JSONKIT_JSON_SERIALIZE_ENUM(ENUM_TYPE, ...) \
+    template <typename BasicJsonType> \
+    inline void to_json(BasicJsonType& j, const ENUM_TYPE& e) { \
+        static_assert(std::is_enum<ENUM_TYPE>::value, #ENUM_TYPE " must be an enum!"); \
+        static const std::pair<ENUM_TYPE, BasicJsonType> m[] = __VA_ARGS__; \
+        auto it = std::find_if(std::begin(m), std::end(m), \
+                               [e](const std::pair<ENUM_TYPE, BasicJsonType>& ej_pair) -> bool { \
+                                   return ej_pair.first == e; \
+                               }); \
+        j = ((it != std::end(m)) ? it : std::begin(m))->second; \
+    } \
+    template <typename BasicJsonType> \
+    inline void from_json(const BasicJsonType& j, ENUM_TYPE& e) { \
+        static_assert(std::is_enum<ENUM_TYPE>::value, #ENUM_TYPE " must be an enum!"); \
+        static const std::pair<ENUM_TYPE, BasicJsonType> m[] = __VA_ARGS__; \
+        auto it = std::find_if(std::begin(m), std::end(m), \
+                               [&j](const std::pair<ENUM_TYPE, BasicJsonType>& ej_pair) -> bool { \
+                                   return ej_pair.second == j; \
+                               }); \
+        e = ((it != std::end(m)) ? it : std::begin(m))->first; \
+    }
+
+#define JSONKIT_SERIALIZE_ENUM(ENUM_TYPE, ...) \
+    JSONKIT_JSON_SERIALIZE_ENUM(ENUM_TYPE, __VA_ARGS__)
 
 namespace std {
 

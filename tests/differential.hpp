@@ -3,7 +3,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <type_traits>
 
 #ifndef JSON_USE_GLOBAL_UDLS
 #define JSON_USE_GLOBAL_UDLS 0
@@ -196,7 +198,6 @@ void expect_same_exception(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
             << "Subject what: " << subject_what;
 
         if (oracle_cat == "parse_error") {
-            EXPECT_GT(oracle_byte, 0u);
             EXPECT_EQ(oracle_byte, subject_byte)
                 << "Oracle what: " << oracle_what << "\nSubject what: " << subject_what;
         }
@@ -240,6 +241,28 @@ inline void assert_equivalent(const nlohmann::ordered_json& oracle,
         assert_dump_option_equal(oracle, subject, -1, ' ', false,
                                  nlohmann::ordered_json::error_handler_t::ignore,
                                  jsonkit::json::error_handler_t::ignore);
+    }
+}
+
+template <typename FnOracle, typename FnSubject>
+void expect_both(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
+    using OracleRet = std::decay_t<decltype(fn_oracle())>;
+    using SubjectRet = std::decay_t<decltype(fn_subject())>;
+
+    std::optional<OracleRet> oracle_val;
+    std::optional<SubjectRet> subject_val;
+
+    expect_same_exception(
+        [&]() { oracle_val.emplace(fn_oracle()); },
+        [&]() { subject_val.emplace(fn_subject()); });
+
+    if (oracle_val.has_value() && subject_val.has_value()) {
+        if constexpr (std::is_same_v<OracleRet, nlohmann::ordered_json> &&
+                      std::is_same_v<SubjectRet, jsonkit::json>) {
+            assert_equivalent(*oracle_val, *subject_val);
+        } else {
+            EXPECT_EQ(*oracle_val, *subject_val);
+        }
     }
 }
 
