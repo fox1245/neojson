@@ -20,8 +20,8 @@
 #include <utility>
 #include <vector>
 
-using jsonkit::test::assert_equivalent;
-using jsonkit::test::expect_same_exception;
+using neojson::test::assert_equivalent;
+using neojson::test::expect_same_exception;
 
 namespace {
 
@@ -30,23 +30,23 @@ enum class SampleColor : int { Red = -1, Green = 0, Blue = 7 };
 // ==================== 1. Exceptions & 2. Value Layout ====================
 
 TEST(Slice1, LayoutAndAliases) {
-    static_assert(sizeof(jsonkit::json) == 16, "jsonkit::json must be 16 bytes");
-    static_assert(std::is_same<jsonkit::json, jsonkit::ordered_json>::value,
+    static_assert(sizeof(neojson::json) == 16, "neojson::json must be 16 bytes");
+    static_assert(std::is_same<neojson::json, neojson::ordered_json>::value,
                   "ordered_json must alias json");
-    static_assert(std::is_same<jsonkit::json::boolean_t, bool>::value, "");
-    static_assert(std::is_same<jsonkit::json::number_integer_t, std::int64_t>::value, "");
-    static_assert(std::is_same<jsonkit::json::number_unsigned_t, std::uint64_t>::value, "");
-    static_assert(std::is_same<jsonkit::json::number_float_t, double>::value, "");
-    static_assert(std::is_same<jsonkit::json::string_t, std::string>::value, "");
+    static_assert(std::is_same<neojson::json::boolean_t, bool>::value, "");
+    static_assert(std::is_same<neojson::json::number_integer_t, std::int64_t>::value, "");
+    static_assert(std::is_same<neojson::json::number_unsigned_t, std::uint64_t>::value, "");
+    static_assert(std::is_same<neojson::json::number_float_t, double>::value, "");
+    static_assert(std::is_same<neojson::json::string_t, std::string>::value, "");
 
-    static_assert(std::is_base_of<std::exception, jsonkit::json::exception>::value, "");
-    static_assert(std::is_base_of<jsonkit::json::exception, jsonkit::json::parse_error>::value, "");
+    static_assert(std::is_base_of<std::exception, neojson::json::exception>::value, "");
+    static_assert(std::is_base_of<neojson::json::exception, neojson::json::parse_error>::value, "");
     static_assert(
-        std::is_base_of<jsonkit::json::exception, jsonkit::json::invalid_iterator>::value, "");
-    static_assert(std::is_base_of<jsonkit::json::exception, jsonkit::json::type_error>::value, "");
+        std::is_base_of<neojson::json::exception, neojson::json::invalid_iterator>::value, "");
+    static_assert(std::is_base_of<neojson::json::exception, neojson::json::type_error>::value, "");
     static_assert(
-        std::is_base_of<jsonkit::json::exception, jsonkit::json::out_of_range>::value, "");
-    static_assert(std::is_base_of<jsonkit::json::exception, jsonkit::json::other_error>::value, "");
+        std::is_base_of<neojson::json::exception, neojson::json::out_of_range>::value, "");
+    static_assert(std::is_base_of<neojson::json::exception, neojson::json::other_error>::value, "");
 }
 
 // ==================== 3. Construction & 4. Type Queries / Capacity ====================
@@ -54,45 +54,45 @@ TEST(Slice1, LayoutAndAliases) {
 TEST(Slice1, ConstructionScalarsAndTypes) {
     {
         nlohmann::ordered_json o;
-        jsonkit::json s;
+        neojson::json s;
         assert_equivalent(o, s);
-        EXPECT_EQ(static_cast<jsonkit::json::value_t>(s), jsonkit::json::value_t::null);
+        EXPECT_EQ(static_cast<neojson::json::value_t>(s), neojson::json::value_t::null);
     }
     {
         nlohmann::ordered_json o(nullptr);
-        jsonkit::json s(nullptr);
+        neojson::json s(nullptr);
         assert_equivalent(o, s);
     }
     for (bool b : {false, true}) {
-        assert_equivalent(nlohmann::ordered_json(b), jsonkit::json(b));
+        assert_equivalent(nlohmann::ordered_json(b), neojson::json(b));
     }
 
     // Signed integer types
     assert_equivalent(nlohmann::ordered_json(static_cast<signed char>(-128)),
-                      jsonkit::json(static_cast<signed char>(-128)));
+                      neojson::json(static_cast<signed char>(-128)));
     assert_equivalent(nlohmann::ordered_json(static_cast<short>(-32768)),
-                      jsonkit::json(static_cast<short>(-32768)));
-    assert_equivalent(nlohmann::ordered_json(-1), jsonkit::json(-1));
-    assert_equivalent(nlohmann::ordered_json(0), jsonkit::json(0));
-    assert_equivalent(nlohmann::ordered_json(42), jsonkit::json(42));
+                      neojson::json(static_cast<short>(-32768)));
+    assert_equivalent(nlohmann::ordered_json(-1), neojson::json(-1));
+    assert_equivalent(nlohmann::ordered_json(0), neojson::json(0));
+    assert_equivalent(nlohmann::ordered_json(42), neojson::json(42));
     assert_equivalent(nlohmann::ordered_json(std::numeric_limits<long>::min()),
-                      jsonkit::json(std::numeric_limits<long>::min()));
+                      neojson::json(std::numeric_limits<long>::min()));
     assert_equivalent(nlohmann::ordered_json(std::numeric_limits<long long>::min()),
-                      jsonkit::json(std::numeric_limits<long long>::min()));
+                      neojson::json(std::numeric_limits<long long>::min()));
     assert_equivalent(nlohmann::ordered_json(std::numeric_limits<std::int64_t>::max()),
-                      jsonkit::json(std::numeric_limits<std::int64_t>::max()));
+                      neojson::json(std::numeric_limits<std::int64_t>::max()));
 
     // Unsigned integer types
     assert_equivalent(nlohmann::ordered_json(static_cast<unsigned char>(255u)),
-                      jsonkit::json(static_cast<unsigned char>(255u)));
+                      neojson::json(static_cast<unsigned char>(255u)));
     assert_equivalent(nlohmann::ordered_json(static_cast<unsigned short>(65535u)),
-                      jsonkit::json(static_cast<unsigned short>(65535u)));
-    assert_equivalent(nlohmann::ordered_json(0u), jsonkit::json(0u));
-    assert_equivalent(nlohmann::ordered_json(42u), jsonkit::json(42u));
+                      neojson::json(static_cast<unsigned short>(65535u)));
+    assert_equivalent(nlohmann::ordered_json(0u), neojson::json(0u));
+    assert_equivalent(nlohmann::ordered_json(42u), neojson::json(42u));
     assert_equivalent(nlohmann::ordered_json(std::numeric_limits<unsigned long>::max()),
-                      jsonkit::json(std::numeric_limits<unsigned long>::max()));
+                      neojson::json(std::numeric_limits<unsigned long>::max()));
     assert_equivalent(nlohmann::ordered_json(std::numeric_limits<std::uint64_t>::max()),
-                      jsonkit::json(std::numeric_limits<std::uint64_t>::max()));
+                      neojson::json(std::numeric_limits<std::uint64_t>::max()));
 
     // Floating point types
     for (double d : {0.0, -0.0, 1.0, -1.0, 3.141592653589793, 1e-4, 1e-5, 1e15, 1e16,
@@ -102,148 +102,148 @@ TEST(Slice1, ConstructionScalarsAndTypes) {
                      std::numeric_limits<double>::infinity(),
                      -std::numeric_limits<double>::infinity(),
                      std::numeric_limits<double>::quiet_NaN()}) {
-        assert_equivalent(nlohmann::ordered_json(d), jsonkit::json(d));
+        assert_equivalent(nlohmann::ordered_json(d), neojson::json(d));
     }
-    assert_equivalent(nlohmann::ordered_json(1.5f), jsonkit::json(1.5f));
+    assert_equivalent(nlohmann::ordered_json(1.5f), neojson::json(1.5f));
 
     // Enums
-    assert_equivalent(nlohmann::ordered_json(SampleColor::Red), jsonkit::json(SampleColor::Red));
-    assert_equivalent(nlohmann::ordered_json(SampleColor::Blue), jsonkit::json(SampleColor::Blue));
+    assert_equivalent(nlohmann::ordered_json(SampleColor::Red), neojson::json(SampleColor::Red));
+    assert_equivalent(nlohmann::ordered_json(SampleColor::Blue), neojson::json(SampleColor::Blue));
 
     // Strings
-    assert_equivalent(nlohmann::ordered_json("hello"), jsonkit::json("hello"));
+    assert_equivalent(nlohmann::ordered_json("hello"), neojson::json("hello"));
     assert_equivalent(nlohmann::ordered_json(std::string("world")),
-                      jsonkit::json(std::string("world")));
+                      neojson::json(std::string("world")));
     assert_equivalent(nlohmann::ordered_json(std::string_view("sv_test")),
-                      jsonkit::json(std::string_view("sv_test")));
+                      neojson::json(std::string_view("sv_test")));
     std::string with_nul("a\0b", 3);
-    assert_equivalent(nlohmann::ordered_json(with_nul), jsonkit::json(with_nul));
+    assert_equivalent(nlohmann::ordered_json(with_nul), neojson::json(with_nul));
 
     // value_t constructors
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::null),
-                      jsonkit::json(jsonkit::json::value_t::null));
+                      neojson::json(neojson::json::value_t::null));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::object),
-                      jsonkit::json(jsonkit::json::value_t::object));
+                      neojson::json(neojson::json::value_t::object));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::array),
-                      jsonkit::json(jsonkit::json::value_t::array));
+                      neojson::json(neojson::json::value_t::array));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::string),
-                      jsonkit::json(jsonkit::json::value_t::string));
+                      neojson::json(neojson::json::value_t::string));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::boolean),
-                      jsonkit::json(jsonkit::json::value_t::boolean));
+                      neojson::json(neojson::json::value_t::boolean));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::number_integer),
-                      jsonkit::json(jsonkit::json::value_t::number_integer));
+                      neojson::json(neojson::json::value_t::number_integer));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::number_unsigned),
-                      jsonkit::json(jsonkit::json::value_t::number_unsigned));
+                      neojson::json(neojson::json::value_t::number_unsigned));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::number_float),
-                      jsonkit::json(jsonkit::json::value_t::number_float));
+                      neojson::json(neojson::json::value_t::number_float));
     assert_equivalent(nlohmann::ordered_json(nlohmann::ordered_json::value_t::discarded),
-                      jsonkit::json(jsonkit::json::value_t::discarded));
+                      neojson::json(neojson::json::value_t::discarded));
 }
 
 TEST(Slice1, ConstructionContainersAndInitializerLists) {
     std::vector<int> vec = {1, 2, 3, 4};
-    assert_equivalent(nlohmann::ordered_json(vec), jsonkit::json(vec));
+    assert_equivalent(nlohmann::ordered_json(vec), neojson::json(vec));
 
     std::deque<std::string> deq = {"a", "b"};
-    assert_equivalent(nlohmann::ordered_json(deq), jsonkit::json(deq));
+    assert_equivalent(nlohmann::ordered_json(deq), neojson::json(deq));
 
     std::list<double> lst = {1.5, 2.5};
-    assert_equivalent(nlohmann::ordered_json(lst), jsonkit::json(lst));
+    assert_equivalent(nlohmann::ordered_json(lst), neojson::json(lst));
 
     std::set<int> st = {3, 1, 2};
-    assert_equivalent(nlohmann::ordered_json(st), jsonkit::json(st));
+    assert_equivalent(nlohmann::ordered_json(st), neojson::json(st));
 
     std::map<std::string, int> mp = {{"z", 1}, {"a", 2}};
-    assert_equivalent(nlohmann::ordered_json(mp), jsonkit::json(mp));
+    assert_equivalent(nlohmann::ordered_json(mp), neojson::json(mp));
 
     std::array<int, 3> std_arr = {{10, 20, 30}};
-    assert_equivalent(nlohmann::ordered_json(std_arr), jsonkit::json(std_arr));
+    assert_equivalent(nlohmann::ordered_json(std_arr), neojson::json(std_arr));
 
     int c_arr[3] = {7, 8, 9};
-    assert_equivalent(nlohmann::ordered_json(c_arr), jsonkit::json(c_arr));
+    assert_equivalent(nlohmann::ordered_json(c_arr), neojson::json(c_arr));
 
     std::pair<std::string, int> pr{"key", 99};
-    assert_equivalent(nlohmann::ordered_json(pr), jsonkit::json(pr));
+    assert_equivalent(nlohmann::ordered_json(pr), neojson::json(pr));
 
     std::tuple<int, std::string, bool> tup{1, "two", true};
-    assert_equivalent(nlohmann::ordered_json(tup), jsonkit::json(tup));
+    assert_equivalent(nlohmann::ordered_json(tup), neojson::json(tup));
 
     // Initializer list deduction
-    assert_equivalent(nlohmann::ordered_json({}), jsonkit::json({}));
-    assert_equivalent(nlohmann::ordered_json({1, 2, 3}), jsonkit::json({1, 2, 3}));
+    assert_equivalent(nlohmann::ordered_json({}), neojson::json({}));
+    assert_equivalent(nlohmann::ordered_json({1, 2, 3}), neojson::json({1, 2, 3}));
     assert_equivalent(nlohmann::ordered_json({{"z", 1}, {"a", 2}, {"m", {true, "x"}}}),
-                      jsonkit::json({{"z", 1}, {"a", 2}, {"m", {true, "x"}}}));
+                      neojson::json({{"z", 1}, {"a", 2}, {"m", {true, "x"}}}));
     // Duplicate keys in initializer list keep first value (nlohmann::ordered_json behaviour)
     assert_equivalent(nlohmann::ordered_json({{"a", 1}, {"b", 2}, {"a", 3}}),
-                      jsonkit::json({{"a", 1}, {"b", 2}, {"a", 3}}));
+                      neojson::json({{"a", 1}, {"b", 2}, {"a", 3}}));
     // Array because second element has 3 items
     assert_equivalent(nlohmann::ordered_json({{"a", 1}, {"b", 2, 3}}),
-                      jsonkit::json({{"a", 1}, {"b", 2, 3}}));
+                      neojson::json({{"a", 1}, {"b", 2, 3}}));
     // Array because first item of pair is not string
     assert_equivalent(nlohmann::ordered_json({{1, 2}, {3, 4}}),
-                      jsonkit::json({{1, 2}, {3, 4}}));
+                      neojson::json({{1, 2}, {3, 4}}));
 
     // Static factories object() and array()
-    assert_equivalent(nlohmann::ordered_json::object(), jsonkit::json::object());
+    assert_equivalent(nlohmann::ordered_json::object(), neojson::json::object());
     assert_equivalent(nlohmann::ordered_json::object({{"k", 1}, {"b", 2}}),
-                      jsonkit::json::object({{"k", 1}, {"b", 2}}));
-    assert_equivalent(nlohmann::ordered_json::array(), jsonkit::json::array());
+                      neojson::json::object({{"k", 1}, {"b", 2}}));
+    assert_equivalent(nlohmann::ordered_json::array(), neojson::json::array());
     assert_equivalent(nlohmann::ordered_json::array({{"k", 1}, {"b", 2}}),
-                      jsonkit::json::array({{"k", 1}, {"b", 2}}));
+                      neojson::json::array({{"k", 1}, {"b", 2}}));
 
     // Error 301 when json::object() given non-key-value initializer list
     expect_same_exception(
         [] { return nlohmann::ordered_json::object({1, 2}); },
-        [] { return jsonkit::json::object({1, 2}); });
+        [] { return neojson::json::object({1, 2}); });
 
     // Count constructor json(cnt, val)
-    assert_equivalent(nlohmann::ordered_json(4, "repeat"), jsonkit::json(4, "repeat"));
-    assert_equivalent(nlohmann::ordered_json(0, 123), jsonkit::json(0, 123));
+    assert_equivalent(nlohmann::ordered_json(4, "repeat"), neojson::json(4, "repeat"));
+    assert_equivalent(nlohmann::ordered_json(0, 123), neojson::json(0, 123));
 
     // Copy and Move semantics
     nlohmann::ordered_json o_orig = {{"k", {1, 2, 3}}};
-    jsonkit::json s_orig = {{"k", {1, 2, 3}}};
+    neojson::json s_orig = {{"k", {1, 2, 3}}};
     nlohmann::ordered_json o_copy(o_orig);
-    jsonkit::json s_copy(s_orig);
+    neojson::json s_copy(s_orig);
     assert_equivalent(o_copy, s_copy);
     assert_equivalent(o_orig, s_orig);
 
     nlohmann::ordered_json o_moved(std::move(o_orig));
-    jsonkit::json s_moved(std::move(s_orig));
+    neojson::json s_moved(std::move(s_orig));
     assert_equivalent(o_moved, s_moved);
     assert_equivalent(o_orig, s_orig);
     EXPECT_TRUE(s_orig.is_null());
 
     // Iterator-range constructor
     assert_equivalent(nlohmann::ordered_json(o_moved.begin(), o_moved.end()),
-                      jsonkit::json(s_moved.begin(), s_moved.end()));
+                      neojson::json(s_moved.begin(), s_moved.end()));
     assert_equivalent(nlohmann::ordered_json(o_moved["k"].begin() + 1, o_moved["k"].end()),
-                      jsonkit::json(s_moved["k"].begin() + 1, s_moved["k"].end()));
+                      neojson::json(s_moved["k"].begin() + 1, s_moved["k"].end()));
 
     nlohmann::ordered_json o_scalar = 42;
-    jsonkit::json s_scalar = 42;
+    neojson::json s_scalar = 42;
     assert_equivalent(nlohmann::ordered_json(o_scalar.begin(), o_scalar.end()),
-                      jsonkit::json(s_scalar.begin(), s_scalar.end()));
+                      neojson::json(s_scalar.begin(), s_scalar.end()));
 
     // Iterator range constructor errors (201, 204, 206)
     expect_same_exception(
         [&] { return nlohmann::ordered_json(o_moved.begin(), o_copy.end()); },
-        [&] { return jsonkit::json(s_moved.begin(), s_copy.end()); });
+        [&] { return neojson::json(s_moved.begin(), s_copy.end()); });
     expect_same_exception(
         [&] { return nlohmann::ordered_json(o_scalar.begin(), o_scalar.begin()); },
-        [&] { return jsonkit::json(s_scalar.begin(), s_scalar.begin()); });
+        [&] { return neojson::json(s_scalar.begin(), s_scalar.begin()); });
     nlohmann::ordered_json o_null;
-    jsonkit::json s_null;
+    neojson::json s_null;
     expect_same_exception(
         [&] { return nlohmann::ordered_json(o_null.begin(), o_null.end()); },
-        [&] { return jsonkit::json(s_null.begin(), s_null.end()); });
+        [&] { return neojson::json(s_null.begin(), s_null.end()); });
 }
 
 // ==================== 5. Element Access & Lookup ====================
 
 TEST(Slice1, ElementAccessAndLookup) {
     nlohmann::ordered_json o = {{"first", 10}, {"second", {1, 2, 3}}};
-    jsonkit::json s = {{"first", 10}, {"second", {1, 2, 3}}};
+    neojson::json s = {{"first", 10}, {"second", {1, 2, 3}}};
 
     assert_equivalent(o.at("first"), s.at("first"));
     assert_equivalent(o.at(std::string("second")).at(1), s.at(std::string("second")).at(1));
@@ -267,7 +267,7 @@ TEST(Slice1, ElementAccessAndLookup) {
 
     // null promotion via operator[]
     nlohmann::ordered_json o_arr_prom;
-    jsonkit::json s_arr_prom;
+    neojson::json s_arr_prom;
     expect_same_exception(
         [&] { return std::as_const(o_arr_prom)[0]; },
         [&] { return std::as_const(s_arr_prom)[0]; });
@@ -280,7 +280,7 @@ TEST(Slice1, ElementAccessAndLookup) {
     assert_equivalent(o_arr_prom, s_arr_prom);
 
     nlohmann::ordered_json o_obj_prom;
-    jsonkit::json s_obj_prom;
+    neojson::json s_obj_prom;
     o_obj_prom["hello"] = 123;
     s_obj_prom["hello"] = 123;
     assert_equivalent(o_obj_prom, s_obj_prom);
@@ -303,7 +303,7 @@ TEST(Slice1, ElementAccessAndLookup) {
     assert_equivalent(o["second"].front(), s["second"].front());
     assert_equivalent(o["second"].back(), s["second"].back());
     nlohmann::ordered_json o_null;
-    jsonkit::json s_null;
+    neojson::json s_null;
     expect_same_exception([&] { return o_null.front(); }, [&] { return s_null.front(); });
     expect_same_exception([&] { return o_null.back(); }, [&] { return s_null.back(); });
 
@@ -324,7 +324,7 @@ TEST(Slice1, ElementAccessAndLookup) {
 
 TEST(Slice1, IteratorsAndItems) {
     nlohmann::ordered_json o_obj = {{"c", 1}, {"a", 2}, {"b", 3}};
-    jsonkit::json s_obj = {{"c", 1}, {"a", 2}, {"b", 3}};
+    neojson::json s_obj = {{"c", 1}, {"a", 2}, {"b", 3}};
 
     // Forward and reverse object iteration
     {
@@ -361,7 +361,7 @@ TEST(Slice1, IteratorsAndItems) {
 
     // Array items() uses stringified index as key
     nlohmann::ordered_json o_arr = {"x", "y", "z"};
-    jsonkit::json s_arr = {"x", "y", "z"};
+    neojson::json s_arr = {"x", "y", "z"};
     {
         auto it_o = o_arr.items().begin();
         auto it_s = s_arr.items().begin();
@@ -373,13 +373,13 @@ TEST(Slice1, IteratorsAndItems) {
 
     // Scalar 1-element iteration & null 0-element iteration
     nlohmann::ordered_json o_num = 77;
-    jsonkit::json s_num = 77;
+    neojson::json s_num = 77;
     EXPECT_EQ(std::distance(o_num.begin(), o_num.end()),
               std::distance(s_num.begin(), s_num.end()));
     assert_equivalent(*o_num.begin(), *s_num.begin());
 
     nlohmann::ordered_json o_null;
-    jsonkit::json s_null;
+    neojson::json s_null;
     EXPECT_EQ(o_null.begin(), o_null.end());
     EXPECT_EQ(s_null.begin(), s_null.end());
 
@@ -403,7 +403,7 @@ TEST(Slice1, IteratorsAndItems) {
 
 TEST(Slice1, ModifiersAndSelfAssignment) {
     // clear() on every type
-    for (auto [o, s] : std::vector<std::pair<nlohmann::ordered_json, jsonkit::json>>{
+    for (auto [o, s] : std::vector<std::pair<nlohmann::ordered_json, neojson::json>>{
              {nullptr, nullptr},
              {true, true},
              {-42, -42},
@@ -419,7 +419,7 @@ TEST(Slice1, ModifiersAndSelfAssignment) {
 
     // push_back, operator+=, emplace_back, emplace
     nlohmann::ordered_json o_arr;
-    jsonkit::json s_arr;
+    neojson::json s_arr;
     o_arr.push_back(1);
     s_arr.push_back(1);
     o_arr += "two";
@@ -429,9 +429,9 @@ TEST(Slice1, ModifiersAndSelfAssignment) {
     assert_equivalent(o_arr, s_arr);
 
     nlohmann::ordered_json o_obj;
-    jsonkit::json s_obj;
+    neojson::json s_obj;
     o_obj.push_back(nlohmann::ordered_json::object_t::value_type{"k1", 10});
-    s_obj.push_back(jsonkit::json::object_t::value_type{"k1", 10});
+    s_obj.push_back(neojson::json::object_t::value_type{"k1", 10});
     o_obj += {"k2", 20};
     s_obj += {"k2", 20};
     expect_same_exception(
@@ -454,23 +454,23 @@ TEST(Slice1, ModifiersAndSelfAssignment) {
     o_arr.insert(o_arr.begin(), {7, 8});
     s_arr.insert(s_arr.begin(), {7, 8});
     nlohmann::ordered_json o_extra = {"a", "b"};
-    jsonkit::json s_extra = {"a", "b"};
+    neojson::json s_extra = {"a", "b"};
     o_arr.insert(o_arr.begin() + 2, o_extra.begin(), o_extra.end());
     s_arr.insert(s_arr.begin() + 2, s_extra.begin(), s_extra.end());
     assert_equivalent(o_arr, s_arr);
 
     // insert into object from iterator range
     nlohmann::ordered_json o_obj2 = {{"k2", 200}, {"k4", 400}};
-    jsonkit::json s_obj2 = {{"k2", 200}, {"k4", 400}};
+    neojson::json s_obj2 = {{"k2", 200}, {"k4", 400}};
     o_obj.insert(o_obj2.begin(), o_obj2.end());
     s_obj.insert(s_obj2.begin(), s_obj2.end());
     assert_equivalent(o_obj, s_obj);
 
     // update (merge_objects = false and true)
     nlohmann::ordered_json o_u1 = {{"a", {{"x", 1}, {"y", 2}}}, {"b", 10}};
-    jsonkit::json s_u1 = {{"a", {{"x", 1}, {"y", 2}}}, {"b", 10}};
+    neojson::json s_u1 = {{"a", {{"x", 1}, {"y", 2}}}, {"b", 10}};
     nlohmann::ordered_json o_u2 = {{"a", {{"y", 20}, {"z", 30}}}, {"c", 30}};
-    jsonkit::json s_u2 = {{"a", {{"y", 20}, {"z", 30}}}, {"c", 30}};
+    neojson::json s_u2 = {{"a", {{"y", 20}, {"z", 30}}}, {"c", 30}};
     o_u1.update(o_u2, true);
     s_u1.update(s_u2, true);
     assert_equivalent(o_u1, s_u1);
@@ -506,7 +506,7 @@ TEST(Slice1, ModifiersAndSelfAssignment) {
 
 TEST(Slice1, Comparisons) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
-    std::vector<std::pair<nlohmann::ordered_json, jsonkit::json>> vals = {
+    std::vector<std::pair<nlohmann::ordered_json, neojson::json>> vals = {
         {nullptr, nullptr},
         {false, false},
         {true, true},
@@ -527,14 +527,14 @@ TEST(Slice1, Comparisons) {
         {"", ""},
         {"a", "a"},
         {"b", "b"},
-        {nlohmann::ordered_json::array(), jsonkit::json::array()},
+        {nlohmann::ordered_json::array(), neojson::json::array()},
         {{1, 2}, {1, 2}},
         {{1, 3}, {1, 3}},
-        {nlohmann::ordered_json::object(), jsonkit::json::object()},
+        {nlohmann::ordered_json::object(), neojson::json::object()},
         {{{"a", 1}, {"b", 2}}, {{"a", 1}, {"b", 2}}},
         {{{"b", 2}, {"a", 1}}, {{"b", 2}, {"a", 1}}},
         {nlohmann::ordered_json(nlohmann::ordered_json::value_t::discarded),
-         jsonkit::json(jsonkit::json::value_t::discarded)},
+         neojson::json(neojson::json::value_t::discarded)},
     };
 
     for (std::size_t i = 0; i < vals.size(); ++i) {
@@ -551,13 +551,13 @@ TEST(Slice1, Comparisons) {
     }
 
     // Scalar comparison overloads
-    jsonkit::json s_num = 42;
+    neojson::json s_num = 42;
     EXPECT_TRUE(s_num == 42);
     EXPECT_TRUE(42 == s_num);
     EXPECT_TRUE(s_num == 42.0);
     EXPECT_TRUE(s_num < 43);
     EXPECT_TRUE(41 < s_num);
-    jsonkit::json s_str = "abc";
+    neojson::json s_str = "abc";
     EXPECT_TRUE(s_str == "abc");
     EXPECT_TRUE("abc" == s_str);
 }
@@ -609,19 +609,19 @@ TEST(Slice1, ParseValidCorpus) {
 
     for (const auto& doc : valid_corpus) {
         SCOPED_TRACE(doc);
-        EXPECT_EQ(nlohmann::ordered_json::accept(doc), jsonkit::json::accept(doc));
+        EXPECT_EQ(nlohmann::ordered_json::accept(doc), neojson::json::accept(doc));
         auto o = nlohmann::ordered_json::parse(doc);
-        auto s = jsonkit::json::parse(doc);
+        auto s = neojson::json::parse(doc);
         assert_equivalent(o, s);
 
         // Also test std::istream parse & accept
         std::istringstream iss_o(doc);
         std::istringstream iss_s(doc);
-        assert_equivalent(nlohmann::ordered_json::parse(iss_o), jsonkit::json::parse(iss_s));
+        assert_equivalent(nlohmann::ordered_json::parse(iss_o), neojson::json::parse(iss_s));
 
         // Iterator-range parse
         assert_equivalent(nlohmann::ordered_json::parse(doc.begin(), doc.end()),
-                          jsonkit::json::parse(doc.begin(), doc.end()));
+                          neojson::json::parse(doc.begin(), doc.end()));
     }
 
     // Deep nesting (256 and 257 levels)
@@ -629,8 +629,8 @@ TEST(Slice1, ParseValidCorpus) {
         std::string deep(depth, '[');
         deep += "42";
         deep.append(depth, ']');
-        EXPECT_EQ(nlohmann::ordered_json::accept(deep), jsonkit::json::accept(deep));
-        assert_equivalent(nlohmann::ordered_json::parse(deep), jsonkit::json::parse(deep));
+        EXPECT_EQ(nlohmann::ordered_json::accept(deep), neojson::json::accept(deep));
+        assert_equivalent(nlohmann::ordered_json::parse(deep), neojson::json::parse(deep));
     }
 
     // Comments with ignore_comments = true and false
@@ -640,16 +640,16 @@ TEST(Slice1, ParseValidCorpus) {
         comment */ "b": [2, /* inline */ 3]
     })";
     EXPECT_FALSE(nlohmann::ordered_json::accept(with_comments, false));
-    EXPECT_FALSE(jsonkit::json::accept(with_comments, false));
+    EXPECT_FALSE(neojson::json::accept(with_comments, false));
     EXPECT_TRUE(nlohmann::ordered_json::accept(with_comments, true));
-    EXPECT_TRUE(jsonkit::json::accept(with_comments, true));
+    EXPECT_TRUE(neojson::json::accept(with_comments, true));
     expect_same_exception(
         [&] { return nlohmann::ordered_json::parse(with_comments, nullptr, true, false); },
-        [&] { return jsonkit::json::parse(with_comments, nullptr, true, false); });
+        [&] { return neojson::json::parse(with_comments, nullptr, true, false); });
     assert_equivalent(nlohmann::ordered_json::parse(with_comments, nullptr, true, true),
-                      jsonkit::json::parse(with_comments, nullptr, true, true));
+                      neojson::json::parse(with_comments, nullptr, true, true));
     assert_equivalent(nlohmann::ordered_json::parse(with_comments, nullptr, false, false),
-                      jsonkit::json::parse(with_comments, nullptr, false, false));
+                      neojson::json::parse(with_comments, nullptr, false, false));
 }
 
 TEST(Slice1, ParseInvalidCorpus) {
@@ -702,29 +702,29 @@ TEST(Slice1, ParseInvalidCorpus) {
     for (const auto& doc : invalid_corpus) {
         SCOPED_TRACE(doc);
         EXPECT_FALSE(nlohmann::ordered_json::accept(doc));
-        EXPECT_FALSE(jsonkit::json::accept(doc));
+        EXPECT_FALSE(neojson::json::accept(doc));
         expect_same_exception(
             [&] { return nlohmann::ordered_json::parse(doc); },
-            [&] { return jsonkit::json::parse(doc); });
+            [&] { return neojson::json::parse(doc); });
         assert_equivalent(nlohmann::ordered_json::parse(doc, nullptr, false),
-                          jsonkit::json::parse(doc, nullptr, false));
+                          neojson::json::parse(doc, nullptr, false));
     }
 
     // Embedded NUL outside and inside strings
     std::string trailing_nul("123\0", 4);
-    EXPECT_EQ(nlohmann::ordered_json::accept(trailing_nul), jsonkit::json::accept(trailing_nul));
+    EXPECT_EQ(nlohmann::ordered_json::accept(trailing_nul), neojson::json::accept(trailing_nul));
     assert_equivalent(nlohmann::ordered_json::parse(trailing_nul),
-                      jsonkit::json::parse(trailing_nul));
+                      neojson::json::parse(trailing_nul));
     std::string only_nul("\0", 1);
     EXPECT_FALSE(nlohmann::ordered_json::accept(only_nul));
-    EXPECT_FALSE(jsonkit::json::accept(only_nul));
+    EXPECT_FALSE(neojson::json::accept(only_nul));
     expect_same_exception(
         [&] { return nlohmann::ordered_json::parse(only_nul); },
-        [&] { return jsonkit::json::parse(only_nul); });
+        [&] { return neojson::json::parse(only_nul); });
     std::string raw_nul_in_str("\"a\0b\"", 5);
     expect_same_exception(
         [&] { return nlohmann::ordered_json::parse(raw_nul_in_str); },
-        [&] { return jsonkit::json::parse(raw_nul_in_str); });
+        [&] { return neojson::json::parse(raw_nul_in_str); });
 }
 
 TEST(Slice1, DumpInvalidUtf8AndStreamFormatting) {
@@ -744,13 +744,13 @@ TEST(Slice1, DumpInvalidUtf8AndStreamFormatting) {
 
     for (const auto& s : bad_utf8_strings) {
         nlohmann::ordered_json o = s;
-        jsonkit::json j = s;
+        neojson::json j = s;
         assert_equivalent(o, j);
     }
 
     // Stream operator<< with width and fill
     nlohmann::ordered_json o = {{"a", {1, 2}}, {"b", "text"}};
-    jsonkit::json j = {{"a", {1, 2}}, {"b", "text"}};
+    neojson::json j = {{"a", {1, 2}}, {"b", "text"}};
     std::ostringstream oss_o;
     std::ostringstream oss_j;
     oss_o << std::setw(2) << std::setfill('.') << o;
@@ -761,7 +761,7 @@ TEST(Slice1, DumpInvalidUtf8AndStreamFormatting) {
 // ==================== 11. Conversions & Literals ====================
 
 TEST(Slice1, ConversionsAndLiterals) {
-    using jsonkit::literals::operator""_json;
+    using neojson::literals::operator""_json;
     auto j = R"({"b":true,"i":-42,"u":42,"f":3.5,"s":"hello","a":[1,2,3],"o":{"k":9}})"_json;
     auto o = nlohmann::ordered_json::parse(
         R"({"b":true,"i":-42,"u":42,"f":3.5,"s":"hello","a":[1,2,3],"o":{"k":9}})");
@@ -785,12 +785,12 @@ TEST(Slice1, ConversionsAndLiterals) {
     EXPECT_EQ(ump["k"], 9);
 
     // get_ptr and get_ref
-    EXPECT_NE(j["s"].get_ptr<jsonkit::json::string_t*>(), nullptr);
-    EXPECT_EQ(j["s"].get_ptr<jsonkit::json::boolean_t*>(), nullptr);
-    EXPECT_EQ(j["s"].get_ref<const jsonkit::json::string_t&>(), "hello");
+    EXPECT_NE(j["s"].get_ptr<neojson::json::string_t*>(), nullptr);
+    EXPECT_EQ(j["s"].get_ptr<neojson::json::boolean_t*>(), nullptr);
+    EXPECT_EQ(j["s"].get_ref<const neojson::json::string_t&>(), "hello");
     expect_same_exception(
         [&] { return o["s"].get_ref<const nlohmann::ordered_json::boolean_t&>(); },
-        [&] { return j["s"].get_ref<const jsonkit::json::boolean_t&>(); });
+        [&] { return j["s"].get_ref<const neojson::json::boolean_t&>(); });
 
     // type_error.302 on invalid conversions
     expect_same_exception([&] { return o["s"].get<int>(); }, [&] { return j["s"].get<int>(); });
@@ -809,15 +809,15 @@ TEST(Slice1, ConversionsAndLiterals) {
 // ==================== Reference Stability ====================
 
 TEST(Slice1, ReferenceStability) {
-    jsonkit::json a = {{"k", 1}, {"nested", {{"inner", "val"}}}};
-    jsonkit::json& r = a["k"];
-    jsonkit::json b = a;
+    neojson::json a = {{"k", 1}, {"nested", {{"inner", "val"}}}};
+    neojson::json& r = a["k"];
+    neojson::json b = a;
     r = 99;
     EXPECT_EQ(a["k"], 99);
     EXPECT_EQ(b["k"], 1);
 
     // Reference into child subtree survives copy of parent and mutations of other keys
-    jsonkit::json& inner_ref = a["nested"]["inner"];
+    neojson::json& inner_ref = a["nested"]["inner"];
     a["k"] = 12345;
     EXPECT_EQ(inner_ref, "val");
     inner_ref = "updated";
@@ -833,15 +833,15 @@ TEST(Slice1, RandomOperationSequences) {
         std::mt19937 rng(seed);
 
         nlohmann::ordered_json o_root = nlohmann::ordered_json::object();
-        jsonkit::json s_root = jsonkit::json::object();
+        neojson::json s_root = neojson::json::object();
         nlohmann::ordered_json o_aux = nlohmann::ordered_json::array();
-        jsonkit::json s_aux = jsonkit::json::array();
+        neojson::json s_aux = neojson::json::array();
 
         static const std::array<const char*, 8> kKeys = {
             {"a", "b", "c", "d", "e", "f", "g", "h"}};
 
         auto make_leaf = [&](std::uint32_t code)
-            -> std::pair<nlohmann::ordered_json, jsonkit::json> {
+            -> std::pair<nlohmann::ordered_json, neojson::json> {
             switch (code % 8) {
                 case 0:
                     return {nullptr, nullptr};
@@ -880,7 +880,7 @@ TEST(Slice1, RandomOperationSequences) {
                 case 0: { // operator[](key) = leaf on object
                     if (!o_root.is_object() && !o_root.is_null()) {
                         o_root = nlohmann::ordered_json::object();
-                        s_root = jsonkit::json::object();
+                        s_root = neojson::json::object();
                     }
                     auto [ov, sv] = make_leaf(rng());
                     expect_same_exception([&] { o_root[key] = std::move(ov); },
@@ -901,7 +901,7 @@ TEST(Slice1, RandomOperationSequences) {
                 case 3: { // push_back on aux array
                     if (!o_aux.is_array() && !o_aux.is_null()) {
                         o_aux = nlohmann::ordered_json::array();
-                        s_aux = jsonkit::json::array();
+                        s_aux = neojson::json::array();
                     }
                     auto [ov, sv] = make_leaf(rng());
                     expect_same_exception([&] { o_aux.push_back(std::move(ov)); },
@@ -938,7 +938,7 @@ TEST(Slice1, RandomOperationSequences) {
                     const char* k2 = kKeys[rng() % kKeys.size()];
                     auto [ov, sv] = make_leaf(rng());
                     nlohmann::ordered_json o_patch = {{key, ov}, {k2, 123}};
-                    jsonkit::json s_patch = {{key, sv}, {k2, 123}};
+                    neojson::json s_patch = {{key, sv}, {k2, 123}};
                     const bool merge = (rng() & 1u) != 0;
                     expect_same_exception([&] { o_root.update(o_patch, merge); },
                                           [&] { s_root.update(s_patch, merge); });
@@ -958,13 +958,13 @@ TEST(Slice1, RandomOperationSequences) {
                     if (!s_dumped.empty()) {
                         expect_same_exception(
                             [&] { o_root = nlohmann::ordered_json::parse(o_dumped); },
-                            [&] { s_root = jsonkit::json::parse(s_dumped); });
+                            [&] { s_root = neojson::json::parse(s_dumped); });
                     }
                     break;
                 }
                 case 10: { // copy & move cycle
                     nlohmann::ordered_json o_tmp = o_root;
-                    jsonkit::json s_tmp = s_root;
+                    neojson::json s_tmp = s_root;
                     o_root = std::move(o_tmp);
                     s_root = std::move(s_tmp);
                     assert_equivalent(o_tmp, s_tmp);
@@ -993,24 +993,24 @@ TEST(Slice1, EdgeCaseContracts) {
     // 1. Dereferencing end()/rend() and calling key() at end()/rend() throw invalid_iterator.214.
     {
         nlohmann::ordered_json o_null;
-        jsonkit::json s_null;
+        neojson::json s_null;
         expect_same_exception([&] { (void)*o_null.end(); }, [&] { (void)*s_null.end(); });
 
         nlohmann::ordered_json o_num = 42;
-        jsonkit::json s_num = 42;
+        neojson::json s_num = 42;
         expect_same_exception([&] { (void)*o_num.end(); }, [&] { (void)*s_num.end(); });
 
         nlohmann::ordered_json o_disc(nlohmann::ordered_json::value_t::discarded);
-        jsonkit::json s_disc(jsonkit::json::value_t::discarded);
+        neojson::json s_disc(neojson::json::value_t::discarded);
         expect_same_exception([&] { (void)*o_disc.end(); }, [&] { (void)*s_disc.end(); });
 
-        jsonkit::json s_obj = {{"a", 1}, {"b", 2}};
-        const jsonkit::json& cs_obj = s_obj;
+        neojson::json s_obj = {{"a", 1}, {"b", 2}};
+        const neojson::json& cs_obj = s_obj;
         auto expect_214 = [](auto&& fn) {
             bool threw = false;
             try {
                 fn();
-            } catch (const jsonkit::json::invalid_iterator& e) {
+            } catch (const neojson::json::invalid_iterator& e) {
                 threw = true;
                 EXPECT_EQ(e.id, 214);
                 EXPECT_EQ(std::string_view(e.what()).substr(0, 36),
@@ -1026,7 +1026,7 @@ TEST(Slice1, EdgeCaseContracts) {
         expect_214([&] { (void)*cs_obj.end(); });
         expect_214([&] { (void)*s_obj.rend(); });
 
-        jsonkit::json s_arr = {10, 20};
+        neojson::json s_arr = {10, 20};
         expect_214([&] { (void)*s_arr.end(); });
         expect_214([&] { (void)*s_arr.cend(); });
     }
@@ -1034,10 +1034,10 @@ TEST(Slice1, EdgeCaseContracts) {
     // 2. Default-constructed iterators: equality and relational operators on iterator and
     //    const_iterator.
     {
-        jsonkit::json::iterator it1{};
-        jsonkit::json::iterator it2{};
-        jsonkit::json::const_iterator cit1{};
-        jsonkit::json::const_iterator cit2{};
+        neojson::json::iterator it1{};
+        neojson::json::iterator it2{};
+        neojson::json::const_iterator cit1{};
+        neojson::json::const_iterator cit2{};
 
         EXPECT_TRUE(it1 == it2);
         EXPECT_FALSE(it1 != it2);
@@ -1063,13 +1063,13 @@ TEST(Slice1, EdgeCaseContracts) {
     //    iterators of two different values (210), inverted range (204), and valid range insert.
     {
         nlohmann::ordered_json o_a = {1, 2, 3};
-        jsonkit::json s_a = {1, 2, 3};
+        neojson::json s_a = {1, 2, 3};
         nlohmann::ordered_json o_b = {4, 5};
-        jsonkit::json s_b = {4, 5};
+        neojson::json s_b = {4, 5};
         nlohmann::ordered_json o_c = {6, 7};
-        jsonkit::json s_c = {6, 7};
+        neojson::json s_c = {6, 7};
         nlohmann::ordered_json o_obj = {{"k", 1}};
-        jsonkit::json s_obj = {{"k", 1}};
+        neojson::json s_obj = {{"k", 1}};
 
         // Non-array target -> type_error.309
         expect_same_exception([&] { o_obj.insert(o_a.begin(), o_b.begin(), o_b.end()); },
@@ -1089,21 +1089,21 @@ TEST(Slice1, EdgeCaseContracts) {
 
         // Inverted range -> invalid_iterator.204
         nlohmann::ordered_json o_prim = 99;
-        jsonkit::json s_prim = 99;
+        neojson::json s_prim = 99;
         expect_same_exception(
             [&] { (void)nlohmann::ordered_json(o_prim.end(), o_prim.begin()); },
-            [&] { (void)jsonkit::json(s_prim.end(), s_prim.begin()); });
+            [&] { (void)neojson::json(s_prim.end(), s_prim.begin()); });
         expect_same_exception([&] { (void)o_prim.erase(o_prim.end(), o_prim.begin()); },
                               [&] { (void)s_prim.erase(s_prim.end(), s_prim.begin()); });
         // Inverted range on array insert -> invalid_iterator.204.
-        // Asserted on jsonkit alone because nlohmann::basic_json::insert(pos, first, last)
+        // Asserted on neojson alone because nlohmann::basic_json::insert(pos, first, last)
         // forwards [first.m_it.array_iterator, last.m_it.array_iterator) unchecked to
         // std::vector::insert, which is undefined behaviour when last < first.
         {
             bool threw_204 = false;
             try {
                 s_a.insert(s_a.begin(), s_b.end(), s_b.begin());
-            } catch (const jsonkit::json::invalid_iterator& e) {
+            } catch (const neojson::json::invalid_iterator& e) {
                 threw_204 = true;
                 EXPECT_EQ(e.id, 204);
             }
@@ -1119,15 +1119,15 @@ TEST(Slice1, EdgeCaseContracts) {
     // 4. update(first, last) validation order and null target promotion.
     {
         nlohmann::ordered_json o_target = {{"k", 1}};
-        jsonkit::json s_target = {{"k", 1}};
+        neojson::json s_target = {{"k", 1}};
         nlohmann::ordered_json o_o1 = {{"a", 2}};
-        jsonkit::json s_o1 = {{"a", 2}};
+        neojson::json s_o1 = {{"a", 2}};
         nlohmann::ordered_json o_o2 = {{"b", 3}};
-        jsonkit::json s_o2 = {{"b", 3}};
+        neojson::json s_o2 = {{"b", 3}};
         nlohmann::ordered_json o_arr = {1, 2};
-        jsonkit::json s_arr = {1, 2};
+        neojson::json s_arr = {1, 2};
         nlohmann::ordered_json o_arr2 = {3, 4};
-        jsonkit::json s_arr2 = {3, 4};
+        neojson::json s_arr2 = {3, 4};
 
         // Two different objects -> invalid_iterator.210
         expect_same_exception([&] { o_target.update(o_o1.begin(), o_o2.end()); },
@@ -1146,21 +1146,21 @@ TEST(Slice1, EdgeCaseContracts) {
 
         // Array target with two different objects: target-type (312) precedes iterator match (210)
         nlohmann::ordered_json o_arr_target = {10};
-        jsonkit::json s_arr_target = {10};
+        neojson::json s_arr_target = {10};
         expect_same_exception([&] { o_arr_target.update(o_o1.begin(), o_o2.end()); },
                               [&] { s_arr_target.update(s_o1.begin(), s_o2.end()); });
         assert_equivalent(o_arr_target, s_arr_target);
 
         // Null target with non-object range: promotes null to {} before throwing type_error.312
         nlohmann::ordered_json o_null_target;
-        jsonkit::json s_null_target;
+        neojson::json s_null_target;
         expect_same_exception([&] { o_null_target.update(o_arr.begin(), o_arr.end()); },
                               [&] { s_null_target.update(s_arr.begin(), s_arr.end()); });
         assert_equivalent(o_null_target, s_null_target);
 
         // Null target with two different arrays: promotes null to {} before throwing 210
         nlohmann::ordered_json o_null_target2;
-        jsonkit::json s_null_target2;
+        neojson::json s_null_target2;
         expect_same_exception([&] { o_null_target2.update(o_arr.begin(), o_arr2.end()); },
                               [&] { s_null_target2.update(s_arr.begin(), s_arr2.end()); });
         assert_equivalent(o_null_target2, s_null_target2);
@@ -1170,22 +1170,22 @@ TEST(Slice1, EdgeCaseContracts) {
     //    null, 0, 0.0, -0.0, "a", [], {} in both key orders, including discarded against itself.
     {
         const double nan = std::numeric_limits<double>::quiet_NaN();
-        std::vector<std::pair<nlohmann::ordered_json, jsonkit::json>> vals = {
+        std::vector<std::pair<nlohmann::ordered_json, neojson::json>> vals = {
             {nlohmann::ordered_json(nlohmann::ordered_json::value_t::discarded),
-             jsonkit::json(jsonkit::json::value_t::discarded)},
-            {nlohmann::ordered_json(nan), jsonkit::json(nan)},
-            {nlohmann::ordered_json(nullptr), jsonkit::json(nullptr)},
-            {nlohmann::ordered_json(0), jsonkit::json(0)},
-            {nlohmann::ordered_json(0u), jsonkit::json(0u)},
-            {nlohmann::ordered_json(0.0), jsonkit::json(0.0)},
-            {nlohmann::ordered_json(-0.0), jsonkit::json(-0.0)},
-            {nlohmann::ordered_json("a"), jsonkit::json("a")},
-            {nlohmann::ordered_json::array(), jsonkit::json::array()},
-            {nlohmann::ordered_json::object(), jsonkit::json::object()},
+             neojson::json(neojson::json::value_t::discarded)},
+            {nlohmann::ordered_json(nan), neojson::json(nan)},
+            {nlohmann::ordered_json(nullptr), neojson::json(nullptr)},
+            {nlohmann::ordered_json(0), neojson::json(0)},
+            {nlohmann::ordered_json(0u), neojson::json(0u)},
+            {nlohmann::ordered_json(0.0), neojson::json(0.0)},
+            {nlohmann::ordered_json(-0.0), neojson::json(-0.0)},
+            {nlohmann::ordered_json("a"), neojson::json("a")},
+            {nlohmann::ordered_json::array(), neojson::json::array()},
+            {nlohmann::ordered_json::object(), neojson::json::object()},
             {nlohmann::ordered_json({{"a", 1}, {"b", 2}}),
-             jsonkit::json({{"a", 1}, {"b", 2}})},
+             neojson::json({{"a", 1}, {"b", 2}})},
             {nlohmann::ordered_json({{"b", 2}, {"a", 1}}),
-             jsonkit::json({{"b", 2}, {"a", 1}})},
+             neojson::json({{"b", 2}, {"a", 1}})},
         };
 
         for (std::size_t i = 0; i < vals.size(); ++i) {
@@ -1208,7 +1208,7 @@ TEST(Slice1, EdgeCaseContracts) {
     // 6. json(value_t::discarded): size(), empty(), begin() == end(), and iteration count.
     {
         nlohmann::ordered_json o_disc(nlohmann::ordered_json::value_t::discarded);
-        jsonkit::json s_disc(jsonkit::json::value_t::discarded);
+        neojson::json s_disc(neojson::json::value_t::discarded);
 
         EXPECT_EQ(o_disc.size(), s_disc.size());
         EXPECT_EQ(o_disc.empty(), s_disc.empty());
@@ -1265,14 +1265,14 @@ TEST(Slice1, EdgeCaseContracts) {
                          "\" ignore_comments=" + (ignore_comments ? "true" : "false"));
 
             const bool o_acc = nlohmann::ordered_json::accept(candidate, ignore_comments);
-            const bool s_acc = jsonkit::json::accept(candidate, ignore_comments);
+            const bool s_acc = neojson::json::accept(candidate, ignore_comments);
             EXPECT_EQ(o_acc, s_acc);
 
             // allow_exceptions = false
             const auto o_noexc =
                 nlohmann::ordered_json::parse(candidate, nullptr, false, ignore_comments);
             const auto s_noexc =
-                jsonkit::json::parse(candidate, nullptr, false, ignore_comments);
+                neojson::json::parse(candidate, nullptr, false, ignore_comments);
             assert_equivalent(o_noexc, s_noexc);
 
             // allow_exceptions = true
@@ -1308,22 +1308,22 @@ TEST(Slice1, EdgeCaseContracts) {
             std::size_t s_byte = std::numeric_limits<std::size_t>::max() - 1;
             std::string s_cat;
             std::string s_what;
-            jsonkit::json s_val;
+            neojson::json s_val;
             try {
-                s_val = jsonkit::json::parse(candidate, nullptr, true, ignore_comments);
-            } catch (const jsonkit::json::parse_error& e) {
+                s_val = neojson::json::parse(candidate, nullptr, true, ignore_comments);
+            } catch (const neojson::json::parse_error& e) {
                 s_threw = true;
                 s_id = e.id;
                 s_byte = e.byte;
                 s_cat = "parse_error";
                 s_what = e.what();
-            } catch (const jsonkit::json::out_of_range& e) {
+            } catch (const neojson::json::out_of_range& e) {
                 s_threw = true;
                 s_id = e.id;
                 s_byte = 0;
                 s_cat = "out_of_range";
                 s_what = e.what();
-            } catch (const jsonkit::json::exception& e) {
+            } catch (const neojson::json::exception& e) {
                 s_threw = true;
                 s_id = e.id;
                 s_cat = "exception";

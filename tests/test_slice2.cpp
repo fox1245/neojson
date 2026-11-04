@@ -16,15 +16,15 @@
 #include <valarray>
 #include <vector>
 
-using jsonkit::test::assert_equivalent;
-using jsonkit::test::expect_both;
-using jsonkit::test::expect_same_exception;
+using neojson::test::assert_equivalent;
+using neojson::test::expect_both;
+using neojson::test::expect_same_exception;
 
 namespace {
 
-using jk = jsonkit::json;
+using jk = neojson::json;
 using oj = nlohmann::ordered_json;
-using jkp = jsonkit::json_pointer;
+using jkp = neojson::json_pointer;
 using ojp = nlohmann::json_pointer<std::string>;
 
 // ==================== User Types for ADL and Macro Tests ====================
@@ -71,7 +71,7 @@ struct NonDefault {
 
 } // namespace
 
-namespace jsonkit {
+namespace neojson {
 template <>
 struct adl_serializer<user_adl::NonDefault> {
     static user_adl::NonDefault from_json(const json& j) {
@@ -81,7 +81,7 @@ struct adl_serializer<user_adl::NonDefault> {
         j = json{{"id", v.id}, {"label", v.label}};
     }
 };
-} // namespace jsonkit
+} // namespace neojson
 
 namespace nlohmann {
 template <>
@@ -106,7 +106,7 @@ struct IntrusivePerson {
         return a.name == b.name && a.age == b.age && a.scores == b.scores;
     }
 
-    JSONKIT_DEFINE_TYPE_INTRUSIVE(IntrusivePerson, name, age, scores)
+    NEOJSON_DEFINE_TYPE_INTRUSIVE(IntrusivePerson, name, age, scores)
 };
 
 struct IntrusiveDefaultConfig {
@@ -118,7 +118,7 @@ struct IntrusiveDefaultConfig {
         return a.host == b.host && a.port == b.port && a.tls == b.tls;
     }
 
-    JSONKIT_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(IntrusiveDefaultConfig, host, port, tls)
+    NEOJSON_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(IntrusiveDefaultConfig, host, port, tls)
 };
 
 struct NonIntrusiveItem {
@@ -131,7 +131,7 @@ struct NonIntrusiveItem {
     }
 };
 
-JSONKIT_DEFINE_TYPE_NON_INTRUSIVE(NonIntrusiveItem, title, price, in_stock)
+NEOJSON_DEFINE_TYPE_NON_INTRUSIVE(NonIntrusiveItem, title, price, in_stock)
 
 struct NonIntrusiveDefaultOpts {
     int retries = 3;
@@ -143,7 +143,7 @@ struct NonIntrusiveDefaultOpts {
     }
 };
 
-JSONKIT_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(NonIntrusiveDefaultOpts, retries, mode, tags)
+NEOJSON_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(NonIntrusiveDefaultOpts, retries, mode, tags)
 
 enum class TaskState {
     Invalid = -1,
@@ -153,7 +153,7 @@ enum class TaskState {
     Unmapped = 99
 };
 
-JSONKIT_JSON_SERIALIZE_ENUM(TaskState, {
+NEOJSON_JSON_SERIALIZE_ENUM(TaskState, {
     {TaskState::Invalid, nullptr},
     {TaskState::Pending, "pending"},
     {TaskState::Running, "running"},
@@ -303,22 +303,22 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MacroNonIntrusiveDirect, k, n)
 
 } // namespace ns_nlohmann_std
 
-namespace ns_jsonkit_std {
+namespace ns_neojson_std {
 
 struct MacroDirect {
     std::string a = "hello";
     int b = 42;
     std::vector<int> c{10, 20};
-    JSONKIT_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(MacroDirect, a, b, c)
+    NEOJSON_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(MacroDirect, a, b, c)
 };
 
 struct MacroNonIntrusiveDirect {
     std::string k = "v";
     int n = 7;
 };
-JSONKIT_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MacroNonIntrusiveDirect, k, n)
+NEOJSON_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MacroNonIntrusiveDirect, k, n)
 
-} // namespace ns_jsonkit_std
+} // namespace ns_neojson_std
 
 namespace {
 
@@ -381,7 +381,7 @@ TEST(Slice2Pointer, ParsingAndEscapes) {
 }
 
 TEST(Slice2Pointer, OperationsAndComparisons) {
-    using namespace jsonkit::literals;
+    using namespace neojson::literals;
 
     jkp jp = "/a/b~1c/0"_json_pointer;
     ojp op("/a/b~1c/0");
@@ -836,15 +836,15 @@ TEST(Slice2Conversions, AdlAndCustomSerializer) {
 }
 
 TEST(Slice2Conversions, MacrosAndEnums) {
-    // Compare NLOHMANN_DEFINE_TYPE_* on nlohmann::json directly with JSONKIT_DEFINE_TYPE_*
+    // Compare NLOHMANN_DEFINE_TYPE_* on nlohmann::json directly with NEOJSON_DEFINE_TYPE_*
     {
-        ns_jsonkit_std::MacroDirect jm{"custom", 100, {7, 8, 9}};
+        ns_neojson_std::MacroDirect jm{"custom", 100, {7, 8, 9}};
         ns_nlohmann_std::MacroDirect nm{"custom", 100, {7, 8, 9}};
         jk jj(jm);
         nlohmann::json nj(nm);
         EXPECT_EQ(jk::parse(nj.dump()), jj);
 
-        ns_jsonkit_std::MacroNonIntrusiveDirect jni{"key", 55};
+        ns_neojson_std::MacroNonIntrusiveDirect jni{"key", 55};
         ns_nlohmann_std::MacroNonIntrusiveDirect nni{"key", 55};
         EXPECT_EQ(jk(jni).dump(), nlohmann::json(nni).dump());
     }
@@ -956,7 +956,7 @@ TEST(Slice2Conversions, MacrosAndEnums) {
         }
     }
 
-    // Enum serialization (JSONKIT_JSON_SERIALIZE_ENUM and default integer enums)
+    // Enum serialization (NEOJSON_JSON_SERIALIZE_ENUM and default integer enums)
     {
         const std::pair<ns_jk::TaskState, ns_oj::TaskState> states[] = {
             {ns_jk::TaskState::Invalid, ns_oj::TaskState::Invalid},

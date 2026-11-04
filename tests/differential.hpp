@@ -1,5 +1,5 @@
-#ifndef JSONKIT_TESTS_DIFFERENTIAL_HPP_
-#define JSONKIT_TESTS_DIFFERENTIAL_HPP_
+#ifndef NEOJSON_TESTS_DIFFERENTIAL_HPP_
+#define NEOJSON_TESTS_DIFFERENTIAL_HPP_
 
 #include <cmath>
 #include <cstdint>
@@ -14,12 +14,12 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
-#include "jsonkit/json.hpp"
+#include "neojson/json.hpp"
 
-namespace jsonkit::test {
+namespace neojson::test {
 
 inline void assert_tree_equal(const nlohmann::ordered_json& oracle,
-                              const jsonkit::json& subject) {
+                              const neojson::json& subject) {
     ASSERT_EQ(static_cast<std::uint8_t>(oracle.type()),
               static_cast<std::uint8_t>(subject.type()));
     EXPECT_STREQ(oracle.type_name(), subject.type_name());
@@ -45,24 +45,24 @@ inline void assert_tree_equal(const nlohmann::ordered_json& oracle,
     }
 
     switch (subject.type()) {
-        case jsonkit::json::value_t::null:
-        case jsonkit::json::value_t::discarded:
-        case jsonkit::json::value_t::binary:
+        case neojson::json::value_t::null:
+        case neojson::json::value_t::discarded:
+        case neojson::json::value_t::binary:
             break;
 
-        case jsonkit::json::value_t::boolean:
+        case neojson::json::value_t::boolean:
             EXPECT_EQ(oracle.get<bool>(), subject.get<bool>());
             break;
 
-        case jsonkit::json::value_t::number_integer:
+        case neojson::json::value_t::number_integer:
             EXPECT_EQ(oracle.get<std::int64_t>(), subject.get<std::int64_t>());
             break;
 
-        case jsonkit::json::value_t::number_unsigned:
+        case neojson::json::value_t::number_unsigned:
             EXPECT_EQ(oracle.get<std::uint64_t>(), subject.get<std::uint64_t>());
             break;
 
-        case jsonkit::json::value_t::number_float: {
+        case neojson::json::value_t::number_float: {
             const double od = oracle.get<double>();
             const double sd = subject.get<double>();
             if (std::isnan(od)) {
@@ -74,11 +74,11 @@ inline void assert_tree_equal(const nlohmann::ordered_json& oracle,
             break;
         }
 
-        case jsonkit::json::value_t::string:
+        case neojson::json::value_t::string:
             EXPECT_EQ(oracle.get<std::string>(), subject.get<std::string>());
             break;
 
-        case jsonkit::json::value_t::array: {
+        case neojson::json::value_t::array: {
             ASSERT_EQ(oracle.size(), subject.size());
             for (std::size_t i = 0; i < oracle.size(); ++i) {
                 assert_tree_equal(oracle[i], subject[i]);
@@ -86,7 +86,7 @@ inline void assert_tree_equal(const nlohmann::ordered_json& oracle,
             break;
         }
 
-        case jsonkit::json::value_t::object: {
+        case neojson::json::value_t::object: {
             ASSERT_EQ(oracle.size(), subject.size());
             auto it_o = oracle.begin();
             auto it_s = subject.begin();
@@ -150,33 +150,33 @@ void expect_same_exception(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
 
     try {
         (void)fn_subject();
-    } catch (const jsonkit::json::parse_error& e) {
+    } catch (const neojson::json::parse_error& e) {
         subject_threw = true;
         subject_id = e.id;
         subject_byte = e.byte;
         subject_cat = "parse_error";
         subject_what = e.what();
-    } catch (const jsonkit::json::invalid_iterator& e) {
+    } catch (const neojson::json::invalid_iterator& e) {
         subject_threw = true;
         subject_id = e.id;
         subject_cat = "invalid_iterator";
         subject_what = e.what();
-    } catch (const jsonkit::json::type_error& e) {
+    } catch (const neojson::json::type_error& e) {
         subject_threw = true;
         subject_id = e.id;
         subject_cat = "type_error";
         subject_what = e.what();
-    } catch (const jsonkit::json::out_of_range& e) {
+    } catch (const neojson::json::out_of_range& e) {
         subject_threw = true;
         subject_id = e.id;
         subject_cat = "out_of_range";
         subject_what = e.what();
-    } catch (const jsonkit::json::other_error& e) {
+    } catch (const neojson::json::other_error& e) {
         subject_threw = true;
         subject_id = e.id;
         subject_cat = "other_error";
         subject_what = e.what();
-    } catch (const jsonkit::json::exception& e) {
+    } catch (const neojson::json::exception& e) {
         subject_threw = true;
         subject_id = e.id;
         subject_cat = "exception";
@@ -206,10 +206,10 @@ void expect_same_exception(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
 }
 
 inline void assert_dump_option_equal(const nlohmann::ordered_json& oracle,
-                                     const jsonkit::json& subject, int indent,
+                                     const neojson::json& subject, int indent,
                                      char indent_char, bool ensure_ascii,
                                      nlohmann::ordered_json::error_handler_t eh_o,
-                                     jsonkit::json::error_handler_t eh_s) {
+                                     neojson::json::error_handler_t eh_s) {
     std::string out_o;
     std::string out_s;
     expect_same_exception(
@@ -219,28 +219,28 @@ inline void assert_dump_option_equal(const nlohmann::ordered_json& oracle,
 }
 
 inline void assert_equivalent(const nlohmann::ordered_json& oracle,
-                              const jsonkit::json& subject) {
+                              const neojson::json& subject) {
     assert_tree_equal(oracle, subject);
 
     if (!oracle.is_discarded()) {
         assert_dump_option_equal(oracle, subject, -1, ' ', false,
                                  nlohmann::ordered_json::error_handler_t::strict,
-                                 jsonkit::json::error_handler_t::strict);
+                                 neojson::json::error_handler_t::strict);
         assert_dump_option_equal(oracle, subject, 2, ' ', false,
                                  nlohmann::ordered_json::error_handler_t::strict,
-                                 jsonkit::json::error_handler_t::strict);
+                                 neojson::json::error_handler_t::strict);
         assert_dump_option_equal(oracle, subject, 4, '\t', true,
                                  nlohmann::ordered_json::error_handler_t::strict,
-                                 jsonkit::json::error_handler_t::strict);
+                                 neojson::json::error_handler_t::strict);
         assert_dump_option_equal(oracle, subject, -1, ' ', false,
                                  nlohmann::ordered_json::error_handler_t::replace,
-                                 jsonkit::json::error_handler_t::replace);
+                                 neojson::json::error_handler_t::replace);
         assert_dump_option_equal(oracle, subject, -1, ' ', true,
                                  nlohmann::ordered_json::error_handler_t::replace,
-                                 jsonkit::json::error_handler_t::replace);
+                                 neojson::json::error_handler_t::replace);
         assert_dump_option_equal(oracle, subject, -1, ' ', false,
                                  nlohmann::ordered_json::error_handler_t::ignore,
-                                 jsonkit::json::error_handler_t::ignore);
+                                 neojson::json::error_handler_t::ignore);
     }
 }
 
@@ -258,7 +258,7 @@ void expect_both(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
 
     if (oracle_val.has_value() && subject_val.has_value()) {
         if constexpr (std::is_same_v<OracleRet, nlohmann::ordered_json> &&
-                      std::is_same_v<SubjectRet, jsonkit::json>) {
+                      std::is_same_v<SubjectRet, neojson::json>) {
             assert_equivalent(*oracle_val, *subject_val);
         } else {
             EXPECT_EQ(*oracle_val, *subject_val);
@@ -266,6 +266,6 @@ void expect_both(FnOracle&& fn_oracle, FnSubject&& fn_subject) {
     }
 }
 
-} // namespace jsonkit::test
+} // namespace neojson::test
 
-#endif // JSONKIT_TESTS_DIFFERENTIAL_HPP_
+#endif // NEOJSON_TESTS_DIFFERENTIAL_HPP_

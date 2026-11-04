@@ -1,8 +1,8 @@
-#include "jsonkit/json.hpp"
+#include "neojson/json.hpp"
 
 #include "yyjson.h"
 
-namespace jsonkit {
+namespace neojson {
 namespace detail {
 namespace dtoa_impl {
 
@@ -2119,4 +2119,4 @@ bool json::accept(std::istream& i, const bool ignore_comments) {
     return accept(std::string_view(buf), ignore_comments);
 }
 
-} // namespace jsonkit
+} // namespace neojson

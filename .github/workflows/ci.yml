@@ -36,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure (Debug, sanitizers)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DJSONKIT_SANITIZE=ON
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=ON
       - name: Build
         run: cmake --build build --parallel
       - name: Test
