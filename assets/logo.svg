@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t">
+  <title id="t">neojson</title>
+  <rect x="2" y="2" width="252" height="252" rx="54" fill="#0f172a" stroke="#334155" stroke-width="4"/>
+  <g fill="none" stroke="#e2e8f0" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M100 60C76 60 76 60 76 84V106C76 120 68 128 54 128C68 128 76 136 76 150V172C76 196 76 196 100 196"/>
+    <path d="M156 60C180 60 180 60 180 84V106C180 120 188 128 202 128C188 128 180 136 180 150V172C180 196 180 196 156 196"/>
+  </g>
+  <polygon points="138,84 106,136 126,136 116,174 152,120 132,120" fill="#fb923c"/>
+</svg>
