@@ -89,9 +89,6 @@ std::string exercise() {
     out += std::to_string(number2.value()) + ";";
     std::optional<std::string> text(clvalue["b"]);
     out += text.value() + ";";
-    std::optional<std::vector<int>> list;
-    list = clvalue["c"];
-    out += std::to_string(list.value().at(0)) + ";";
     return out;
 }
 
