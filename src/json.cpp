@@ -741,6 +741,63 @@ void dump_value(std::string& out, const json& val, const bool pretty_print,
     }
 }
 
+// The members of a parsed object after repeated keys are resolved: one entry per distinct key, in the order of the
+// key's first occurrence, each with the value of the key's last occurrence. This is what inserting the members one
+// by one through operator[] gives (and what nlohmann::ordered_json does).
+struct object_member {
+    yyjson_val* key;
+    yyjson_val* value;
+};
+
+// Resolves the repeated keys of the parsed object `val` (`len` members) by sorting the keys, with the position as a
+// tie-break, so the cost is len*log(len) key comparisons whatever the keys are (a hash table could degrade to a
+// scan on keys that collide).
+std::vector<object_member> resolve_members_sorted(yyjson_val* val, const std::size_t len) {
+    std::vector<yyjson_val*> keys;
+    keys.reserve(len);
+    {
+        yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+        yyjson_val* key = nullptr;
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            keys.push_back(key);
+        }
+    }
+
+    auto key_view = [&keys](const std::size_t i) {
+        return std::string_view(unsafe_yyjson_get_str(keys[i]), unsafe_yyjson_get_len(keys[i]));
+    };
+
+    std::vector<std::size_t> order(len);
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(), [&key_view](const std::size_t a, const std::size_t b) {
+        const int c = key_view(a).compare(key_view(b));
+        return c != 0 ? c < 0 : a < b;
+    });
+
+    // For the first occurrence of each key, the position of its last occurrence; kNone for every other position.
+    constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> last_of(len, kNone);
+    std::size_t distinct = 0;
+    for (std::size_t run = 0; run < len;) {
+        std::size_t end = run + 1;
+        while (end < len && key_view(order[end]) == key_view(order[run])) {
+            ++end;
+        }
+        last_of[order[run]] = order[end - 1];
+        ++distinct;
+        run = end;
+    }
+
+    std::vector<object_member> members;
+    members.reserve(distinct);
+    for (std::size_t i = 0; i < len; ++i) {
+        if (last_of[i] != kNone) {
+            members.push_back({keys[i], yyjson_obj_iter_get_val(keys[last_of[i]])});
+        }
+    }
+    return members;
+}
+
 // A scalar as a node, or an empty array or object for a container (whose elements the caller adds).
 json make_node(yyjson_val* val) {
     switch (yyjson_get_tag(val)) {
@@ -781,11 +838,14 @@ json make_node(yyjson_val* val) {
 // call stack does not grow with the nesting of the document.
 json materialize_yyjson(yyjson_val* root) {
     // An array or object being filled. `next` is the next element (arrays) or the next key (objects) in the parsed
-    // document; `left` counts the elements or members still to add.
+    // document; `left` counts the elements or members still to add. An object with more than kObjectIndexThreshold
+    // members has its repeated keys resolved up front, and `members` then lists what remains to add.
     struct frame {
         json* node;
         yyjson_val* next;
         std::size_t left;
+        std::unique_ptr<std::vector<object_member>> members;
+        std::size_t member_index;
     };
 
     json result = make_node(root);
@@ -799,10 +859,16 @@ json materialize_yyjson(yyjson_val* root) {
         }
         if (yyjson_is_arr(val)) {
             node.get_ptr<json::array_t*>()->reserve(len);
-            open.push_back({&node, unsafe_yyjson_get_first(val), len});
+            open.push_back({&node, unsafe_yyjson_get_first(val), len, nullptr, 0});
+        } else if (len > kObjectIndexThreshold) {
+            auto members = std::make_unique<std::vector<object_member>>(
+                resolve_members_sorted(val, len));
+            node.get_ptr<json::object_t*>()->reserve(members->size());
+            const std::size_t count = members->size();
+            open.push_back({&node, nullptr, count, std::move(members), 0});
         } else {
             node.get_ptr<json::object_t*>()->reserve(len);
-            open.push_back({&node, unsafe_yyjson_get_first(val), len});
+            open.push_back({&node, unsafe_yyjson_get_first(val), len, nullptr, 0});
         }
     };
 
@@ -823,12 +889,21 @@ json materialize_yyjson(yyjson_val* root) {
             child_val = top.next;
             top.next = unsafe_yyjson_get_next(child_val);
             child = &top.node->get_ptr<json::array_t*>()->emplace_back(make_node(child_val));
+        } else if (top.members != nullptr) {
+            const object_member& m = (*top.members)[top.member_index++];
+            child_val = m.value;
+            const std::string_view k(unsafe_yyjson_get_str(m.key), unsafe_yyjson_get_len(m.key));
+            child = &top.node->get_ptr<json::object_t*>()
+                         ->emplace_back(std::piecewise_construct, std::forward_as_tuple(k),
+                                        std::forward_as_tuple(make_node(child_val)))
+                         .second;
         } else {
             yyjson_val* key = top.next;
             child_val = yyjson_obj_iter_get_val(key);
             top.next = unsafe_yyjson_get_next(child_val);
             const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
-            // A repeated key keeps its position and takes the new value.
+            // A repeated key keeps its position and takes the new value. ordered_map::operator[] scans the members
+            // already added, which is cheap for the few members of this object.
             child = &(*top.node->get_ptr<json::object_t*>())[k];
             *child = make_node(child_val);
         }

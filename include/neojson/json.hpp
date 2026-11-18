@@ -52,8 +52,9 @@ class json_pointer;
 
 namespace detail {
 
-// Tuning constant: object size above which a lookup index may be built.
-// To be set from the benchmark.
+// Member count above which a parsed object is built by sorting its keys instead of scanning the members
+// inserted so far (see materialize_yyjson in json.cpp). Objects up to this size keep the scan, which is faster for
+// a handful of members. To be set from the benchmark.
 inline constexpr std::size_t kObjectIndexThreshold = 64;
 
 // Error id of the parse_error thrown when a document is nested deeper than the limit of its parse call. It lies
