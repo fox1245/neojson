@@ -679,61 +679,11 @@ public:
     }
 
     reference operator*() const {
-        if (m_object == nullptr) {
-            throw invalid_iterator::create(214, "cannot get value");
-        }
-        switch (m_object->m_type) {
-            case value_t::object: {
-                if (idx_ < 0 ||
-                    static_cast<std::size_t>(idx_) >= m_object->m_value.object->size()) {
-                    throw invalid_iterator::create(214, "cannot get value");
-                }
-                return (*m_object->m_value.object)[static_cast<std::size_t>(idx_)].second;
-            }
-            case value_t::array: {
-                if (idx_ < 0 ||
-                    static_cast<std::size_t>(idx_) >= m_object->m_value.array->size()) {
-                    throw invalid_iterator::create(214, "cannot get value");
-                }
-                return (*m_object->m_value.array)[static_cast<std::size_t>(idx_)];
-            }
-            case value_t::null:
-                throw invalid_iterator::create(214, "cannot get value");
-            default:
-                if (idx_ == 0) {
-                    return *m_object;
-                }
-                throw invalid_iterator::create(214, "cannot get value");
-        }
+        return element_at(m_object, idx_);
     }
 
     pointer operator->() const {
-        if (m_object == nullptr) {
-            throw invalid_iterator::create(214, "cannot get value");
-        }
-        switch (m_object->m_type) {
-            case value_t::object: {
-                if (idx_ < 0 ||
-                    static_cast<std::size_t>(idx_) >= m_object->m_value.object->size()) {
-                    throw invalid_iterator::create(214, "cannot get value");
-                }
-                return &((*m_object->m_value.object)[static_cast<std::size_t>(idx_)].second);
-            }
-            case value_t::array: {
-                if (idx_ < 0 ||
-                    static_cast<std::size_t>(idx_) >= m_object->m_value.array->size()) {
-                    throw invalid_iterator::create(214, "cannot get value");
-                }
-                return &((*m_object->m_value.array)[static_cast<std::size_t>(idx_)]);
-            }
-            case value_t::null:
-                throw invalid_iterator::create(214, "cannot get value");
-            default:
-                if (idx_ == 0) {
-                    return m_object;
-                }
-                throw invalid_iterator::create(214, "cannot get value");
-        }
+        return std::addressof(element_at(m_object, idx_));
     }
 
     iter_impl operator++(int) {
@@ -877,20 +827,56 @@ public:
     }
 
     const typename BasicJsonType::object_t::key_type& key() const {
-        if (m_object == nullptr || m_object->m_type != value_t::object) {
-            throw invalid_iterator::create(207, "cannot use key() for non-object iterators");
-        }
-        if (idx_ < 0 || static_cast<std::size_t>(idx_) >= m_object->m_value.object->size()) {
-            throw invalid_iterator::create(214, "cannot get value");
-        }
-        return (*m_object->m_value.object)[static_cast<std::size_t>(idx_)].first;
+        return key_at(m_object, idx_);
     }
 
     reference value() const {
-        return operator*();
+        return element_at(m_object, idx_);
     }
 
 private:
+    // The checked accessors take the container and the index by value, not the iterator. Written as member functions
+    // that the optimiser did not inline, they received the address of the loop's iterator, which then lived both in a
+    // register and in memory; MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
+    // `for (auto it = j.begin(); it != j.end(); ++it)` each value() after the first returned the previous element
+    // while key() returned the right one. Passed by value, the iterator need not be in memory at all.
+    static reference element_at(pointer object, difference_type idx) {
+        if (object == nullptr) {
+            throw invalid_iterator::create(214, "cannot get value");
+        }
+        switch (object->m_type) {
+            case value_t::object: {
+                if (idx < 0 || static_cast<std::size_t>(idx) >= object->m_value.object->size()) {
+                    throw invalid_iterator::create(214, "cannot get value");
+                }
+                return (*object->m_value.object)[static_cast<std::size_t>(idx)].second;
+            }
+            case value_t::array: {
+                if (idx < 0 || static_cast<std::size_t>(idx) >= object->m_value.array->size()) {
+                    throw invalid_iterator::create(214, "cannot get value");
+                }
+                return (*object->m_value.array)[static_cast<std::size_t>(idx)];
+            }
+            case value_t::null:
+                throw invalid_iterator::create(214, "cannot get value");
+            default:
+                if (idx == 0) {
+                    return *object;
+                }
+                throw invalid_iterator::create(214, "cannot get value");
+        }
+    }
+
+    static const typename BasicJsonType::object_t::key_type& key_at(pointer object, difference_type idx) {
+        if (object == nullptr || object->m_type != value_t::object) {
+            throw invalid_iterator::create(207, "cannot use key() for non-object iterators");
+        }
+        if (idx < 0 || static_cast<std::size_t>(idx) >= object->m_value.object->size()) {
+            throw invalid_iterator::create(214, "cannot get value");
+        }
+        return (*object->m_value.object)[static_cast<std::size_t>(idx)].first;
+    }
+
     pointer m_object = nullptr;
     difference_type idx_ = 0;
 };
