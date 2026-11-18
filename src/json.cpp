@@ -2424,14 +2424,15 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
 
     // The document is valid but nested deeper than the limit: scan it again for the position of the first level
     // past the limit and report it like a syntax error.
+    // Without exceptions the scan would only produce an error that nobody reads, so it is not run.
     auto fail_nesting = [&]() -> json {
-        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
-        (void)diag.diagnose(allow_exceptions);
-        if (allow_exceptions) {
-            throw parse_error::create(detail::kNestingLimitErrorId, 0,
-                                      detail::nesting_limit_message(options.max_depth));
+        if (!allow_exceptions) {
+            return json(value_t::discarded);
         }
-        return json(value_t::discarded);
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
+        (void)diag.diagnose(true);
+        throw parse_error::create(detail::kNestingLimitErrorId, 0,
+                                  detail::nesting_limit_message(options.max_depth));
     };
 
     auto finish_doc = [&](yyjson_doc* doc) -> json {
@@ -2489,13 +2490,12 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
     yyjson_doc* doc =
         yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
     if (doc == nullptr) {
-        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
-        (void)diag.diagnose(allow_exceptions);
-        if (allow_exceptions) {
-            throw other_error::create(
-                599, "internal error: diagnostic scanner and yyjson disagreed");
+        if (!allow_exceptions) {
+            return json(value_t::discarded);
         }
-        return json(value_t::discarded);
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
+        (void)diag.diagnose(true);
+        throw other_error::create(599, "internal error: diagnostic scanner and yyjson disagreed");
     }
 
     struct DocGuard {
