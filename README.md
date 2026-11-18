@@ -14,9 +14,10 @@
 
 ---
 
-An implementation of the `nlohmann::ordered_json` API on top of yyjson's parser: `json`, an owned node tree with
-nlohmann's semantics, and `document`, an immutable yyjson document for parse, read and forward. Differential tests
-against nlohmann/json are the specification. Work in progress.
+An implementation of the `nlohmann::ordered_json` API on top of yyjson's parser. The library has one value type,
+`neojson::json`: an owned node tree with nlohmann's semantics (objects keep the order of insertion, integers are
+signed or unsigned, and so on) that `json::parse` fills from yyjson's parse of the text. Differential tests against
+nlohmann/json are the specification. Work in progress.
 
 License: MIT. yyjson (vendor/yyjson) is MIT licensed.
 

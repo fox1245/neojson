@@ -354,10 +354,6 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
         return buf + (static_cast<std::size_t>(n) + 2);
     }
 
-    if (0 < k && k < 0) {
-        // unreachable
-    }
-
     if (0 < n && n <= max_exp) {
         assert(k < 0);
         std::memmove(buf + (static_cast<std::size_t>(n) + 1), buf + n,
@@ -2549,8 +2545,6 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
     yyjson_doc* doc =
         yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
     if (doc == nullptr) {
-        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
-        (void)diag.diagnose(false);
         return false;
     }
     const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
