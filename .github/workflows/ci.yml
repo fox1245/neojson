@@ -35,8 +35,10 @@ jobs:
       CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The sanitizers slow the large-input parse tests down several hundred times (on arm64 most), so these jobs
+      # check their results and leave their time bounds to the Release jobs below.
       - name: Configure (Debug, sanitizers)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=ON
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=ON -DNEOJSON_TEST_TIME_BOUNDS=OFF
       - name: Build
         run: cmake --build build --parallel
       - name: Test

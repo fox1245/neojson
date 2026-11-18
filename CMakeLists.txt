@@ -3,6 +3,9 @@ project(neojson VERSION 0.0.1 LANGUAGES C CXX)
 
 option(NEOJSON_BUILD_TESTS "Build the tests (differential tests need nlohmann/json, fetched at configure time)" ON)
 option(NEOJSON_SANITIZE "Build everything with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(NEOJSON_TEST_TIME_BOUNDS
+    "Give the large-input parse tests a short CTest timeout, so that a cost that grows with the square of the input fails them (turn OFF for sanitizer builds, which run them several hundred times slower and should check results only)"
+    ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,4 +57,15 @@ if(NEOJSON_BUILD_TESTS)
     target_link_libraries(neojson_tests PRIVATE Threads::Threads)
     include(GoogleTest)
     gtest_discover_tests(neojson_tests DISCOVERY_TIMEOUT 120)
+
+    # Parse tests of very large inputs (tests/time_bounds): a parse whose cost is not proportional to the input fails
+    # them by running into the timeout.
+    file(GLOB NEOJSON_TIME_BOUND_TEST_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/tests/time_bounds/*.cpp)
+    add_executable(neojson_bounds_tests ${NEOJSON_TIME_BOUND_TEST_SOURCES})
+    target_link_libraries(neojson_bounds_tests PRIVATE neojson::neojson GTest::gtest_main)
+    if(NEOJSON_TEST_TIME_BOUNDS)
+        gtest_discover_tests(neojson_bounds_tests DISCOVERY_TIMEOUT 120 PROPERTIES TIMEOUT 30)
+    else()
+        gtest_discover_tests(neojson_bounds_tests DISCOVERY_TIMEOUT 120)
+    endif()
 endif()
