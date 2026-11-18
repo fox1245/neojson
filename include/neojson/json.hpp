@@ -56,6 +56,10 @@ namespace detail {
 // To be set from the benchmark.
 inline constexpr std::size_t kObjectIndexThreshold = 64;
 
+// Error id of the parse_error thrown when a document is nested deeper than the limit of its parse call. It lies
+// outside the ids that nlohmann/json uses for parse errors.
+inline constexpr int kNestingLimitErrorId = 120;
+
 // Tuning constant: initial byte capacity reserved by json::dump().
 // To be set from the benchmark.
 inline constexpr std::size_t kDumpInitialBufferCapacity = 256;
@@ -2530,6 +2534,24 @@ private:
     std::vector<string_t> reference_tokens;
 };
 
+/// Limits applied to one call of json::parse or json::accept.
+struct parse_options {
+    /// Default value of max_depth. Parsing keeps its own stack of open arrays and objects, so a deep document costs
+    /// it no call stack; the recursive walks of a finished tree (copy, dump, destruction, comparison) do. The most
+    /// stack one level takes in an unoptimised build, measured on a 512 KiB thread, in bytes per level:
+    ///   copy 701 (Clang 19), 586 (GCC 13), 1398 (GCC 13 with AddressSanitizer);
+    ///   destruction 343, 309, 408; dump 327, 147, 147.
+    /// A quarter of that stack (128 KiB) would allow only 93 to 220 levels, fewer than the 1025 levels that the
+    /// tests of this library parse. The default is 1100: copying such a tree takes 0.8 MB of stack in an unoptimised
+    /// Clang build and 1.5 MB with AddressSanitizer, and a small fraction of that when optimised. A thread with a
+    /// smaller stack than that should pass a smaller max_depth.
+    static constexpr std::size_t default_max_depth = 1100;
+
+    /// A document whose arrays and objects are nested more than max_depth levels deep is a parse error (the
+    /// outermost array or object is level 1; a document that is a single value has no levels).
+    std::size_t max_depth = default_max_depth;
+};
+
 class json {
 private:
     template <typename BasicJsonType>
@@ -2578,6 +2600,7 @@ public:
     using initializer_list_t = std::initializer_list<detail::json_ref<json>>;
     using parse_event_t = detail::parse_event_t;
     using parser_callback_t = detail::parser_callback_t<json>;
+    using parse_options = ::neojson::parse_options;
 
 private:
     union json_value {
@@ -4112,58 +4135,72 @@ public:
 
     // ==================== Parse & Accept ====================
 
+    // Every parse and accept call takes a trailing parse_options. Its default allows nesting up to
+    // parse_options::default_max_depth levels; a document nested deeper is a parse_error (id 120) when exceptions
+    // are allowed, a discarded value when not, and rejected by accept. The stream operator uses the default.
     static json parse(std::string_view s, parser_callback_t cb = nullptr,
-                      bool allow_exceptions = true, bool ignore_comments = false);
+                      bool allow_exceptions = true, bool ignore_comments = false,
+                      const parse_options& options = {});
 
-    static json parse(std::string_view s, bool allow_exceptions, bool ignore_comments = false) {
-        return parse(s, nullptr, allow_exceptions, ignore_comments);
+    static json parse(std::string_view s, bool allow_exceptions, bool ignore_comments = false,
+                      const parse_options& options = {}) {
+        return parse(s, nullptr, allow_exceptions, ignore_comments, options);
     }
 
     static json parse(std::istream& i, parser_callback_t cb = nullptr,
-                      bool allow_exceptions = true, bool ignore_comments = false);
+                      bool allow_exceptions = true, bool ignore_comments = false,
+                      const parse_options& options = {});
 
     static json parse(std::istream&& i, parser_callback_t cb = nullptr,
-                      bool allow_exceptions = true, bool ignore_comments = false) {
-        return parse(i, cb, allow_exceptions, ignore_comments);
+                      bool allow_exceptions = true, bool ignore_comments = false,
+                      const parse_options& options = {}) {
+        return parse(i, cb, allow_exceptions, ignore_comments, options);
     }
 
-    static json parse(std::istream& i, bool allow_exceptions, bool ignore_comments = false) {
-        return parse(i, nullptr, allow_exceptions, ignore_comments);
+    static json parse(std::istream& i, bool allow_exceptions, bool ignore_comments = false,
+                      const parse_options& options = {}) {
+        return parse(i, nullptr, allow_exceptions, ignore_comments, options);
     }
 
-    static json parse(std::istream&& i, bool allow_exceptions, bool ignore_comments = false) {
-        return parse(i, nullptr, allow_exceptions, ignore_comments);
+    static json parse(std::istream&& i, bool allow_exceptions, bool ignore_comments = false,
+                      const parse_options& options = {}) {
+        return parse(i, nullptr, allow_exceptions, ignore_comments, options);
     }
 
     template <typename IteratorType,
               std::enable_if_t<detail::is_InputIt<IteratorType>::value, int> = 0>
     static json parse(IteratorType first, IteratorType last, parser_callback_t cb = nullptr,
-                      bool allow_exceptions = true, bool ignore_comments = false) {
+                      bool allow_exceptions = true, bool ignore_comments = false,
+                      const parse_options& options = {}) {
         std::string buf(first, last);
-        return parse(std::string_view(buf), cb, allow_exceptions, ignore_comments);
+        return parse(std::string_view(buf), cb, allow_exceptions, ignore_comments, options);
     }
 
     template <typename IteratorType,
               std::enable_if_t<detail::is_InputIt<IteratorType>::value, int> = 0>
     static json parse(IteratorType first, IteratorType last, bool allow_exceptions,
-                      bool ignore_comments = false) {
+                      bool ignore_comments = false, const parse_options& options = {}) {
         std::string buf(first, last);
-        return parse(std::string_view(buf), nullptr, allow_exceptions, ignore_comments);
+        return parse(std::string_view(buf), nullptr, allow_exceptions, ignore_comments, options);
     }
 
-    static bool accept(std::string_view s, bool ignore_comments = false);
+    static bool accept(std::string_view s, bool ignore_comments = false,
+                       const parse_options& options = {});
 
-    static bool accept(std::istream& i, bool ignore_comments = false);
+    static bool accept(std::istream& i, bool ignore_comments = false,
+                       const parse_options& options = {});
 
-    static bool accept(std::istream&& i, bool ignore_comments = false) {
-        return accept(i, ignore_comments);
+    static bool accept(std::istream&& i, bool ignore_comments = false,
+                       const parse_options& options = {}) {
+        return accept(i, ignore_comments, options);
     }
 
     template <typename IteratorType,
               std::enable_if_t<detail::is_InputIt<IteratorType>::value, int> = 0>
-    static bool accept(IteratorType first, IteratorType last, bool ignore_comments = false) {
+    static bool accept(IteratorType first, IteratorType last, bool ignore_comments = false,
+                       const parse_options& options = {}) {
         std::string buf(first, last);
-        return accept(std::string_view(buf), ignore_comments);
+        return accept(std::string_view(buf), ignore_comments, options);
     }
 
     friend std::istream& operator>>(std::istream& i, json& j) {

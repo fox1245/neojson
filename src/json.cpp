@@ -741,7 +741,8 @@ void dump_value(std::string& out, const json& val, const bool pretty_print,
     }
 }
 
-json materialize_yyjson(yyjson_val* val) {
+// A scalar as a node, or an empty array or object for a container (whose elements the caller adds).
+json make_node(yyjson_val* val) {
     switch (yyjson_get_tag(val)) {
         case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
             return json(nullptr);
@@ -765,37 +766,127 @@ json materialize_yyjson(yyjson_val* val) {
         case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
             return json(json::string_t(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val)));
 
-        case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
-            json res = json::value_t::array;
-            auto* arr = res.get_ptr<json::array_t*>();
-            const std::size_t len = unsafe_yyjson_get_len(val);
-            arr->reserve(len);
-            yyjson_arr_iter iter = yyjson_arr_iter_with(val);
-            yyjson_val* elem = nullptr;
-            while ((elem = yyjson_arr_iter_next(&iter)) != nullptr) {
-                arr->push_back(materialize_yyjson(elem));
-            }
-            return res;
-        }
+        case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
+            return json(json::value_t::array);
 
-        case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
-            json res = json::value_t::object;
-            auto* obj = res.get_ptr<json::object_t*>();
-            const std::size_t len = unsafe_yyjson_get_len(val);
-            obj->reserve(len);
-            yyjson_obj_iter iter = yyjson_obj_iter_with(val);
-            yyjson_val* key = nullptr;
-            while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
-                yyjson_val* v = yyjson_obj_iter_get_val(key);
-                std::string_view k_sv(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
-                (*obj)[k_sv] = materialize_yyjson(v);
-            }
-            return res;
-        }
+        case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE:
+            return json(json::value_t::object);
 
         default:
             return json(nullptr);
     }
+}
+
+// Builds the node tree of a parsed document. It keeps its own stack of the arrays and objects being filled, so the
+// call stack does not grow with the nesting of the document.
+json materialize_yyjson(yyjson_val* root) {
+    // An array or object being filled. `next` is the next element (arrays) or the next key (objects) in the parsed
+    // document; `left` counts the elements or members still to add.
+    struct frame {
+        json* node;
+        yyjson_val* next;
+        std::size_t left;
+    };
+
+    json result = make_node(root);
+    std::vector<frame> open;
+
+    // Starts filling `node`, which was made from the container `val`.
+    auto open_container = [&open](json& node, yyjson_val* val) {
+        const std::size_t len = unsafe_yyjson_get_len(val);
+        if (len == 0) {
+            return;
+        }
+        if (yyjson_is_arr(val)) {
+            node.get_ptr<json::array_t*>()->reserve(len);
+            open.push_back({&node, unsafe_yyjson_get_first(val), len});
+        } else {
+            node.get_ptr<json::object_t*>()->reserve(len);
+            open.push_back({&node, unsafe_yyjson_get_first(val), len});
+        }
+    };
+
+    if (yyjson_is_ctn(root)) {
+        open_container(result, root);
+    }
+    while (!open.empty()) {
+        frame& top = open.back();
+        if (top.left == 0) {
+            open.pop_back();
+            continue;
+        }
+        --top.left;
+
+        json* child = nullptr;
+        yyjson_val* child_val = nullptr;
+        if (top.node->is_array()) {
+            child_val = top.next;
+            top.next = unsafe_yyjson_get_next(child_val);
+            child = &top.node->get_ptr<json::array_t*>()->emplace_back(make_node(child_val));
+        } else {
+            yyjson_val* key = top.next;
+            child_val = yyjson_obj_iter_get_val(key);
+            top.next = unsafe_yyjson_get_next(child_val);
+            const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+            // A repeated key keeps its position and takes the new value.
+            child = &(*top.node->get_ptr<json::object_t*>())[k];
+            *child = make_node(child_val);
+        }
+        // `top` may be invalid from here on: opening the child grows the stack.
+        if (yyjson_is_ctn(child_val)) {
+            open_container(*child, child_val);
+        }
+    }
+    return result;
+}
+
+// Whether the arrays and objects of the parsed document nest at most `max_depth` levels deep. The outermost array
+// or object is level 1, an empty array or object counts as a level, a single value has no level. Iterative: the
+// stack holds one entry per open array or object and never grows past max_depth entries.
+bool within_depth(yyjson_doc* doc, yyjson_val* root, const std::size_t max_depth) {
+    if (!yyjson_is_ctn(root)) {
+        return true;
+    }
+    // Every level is a value of the document, so a document with no more values than max_depth cannot exceed it.
+    if (yyjson_doc_get_val_count(doc) <= max_depth) {
+        return true;
+    }
+
+    struct frame {
+        yyjson_val* next;
+        std::size_t left;
+    };
+    std::vector<frame> open;
+
+    auto enter = [&open, max_depth](yyjson_val* ctn) {
+        if (open.size() >= max_depth) {
+            return false;
+        }
+        const std::size_t len = unsafe_yyjson_get_len(ctn);
+        const std::size_t children = yyjson_is_obj(ctn) ? 2 * len : len;
+        if (children != 0) {
+            open.push_back({unsafe_yyjson_get_first(ctn), children});
+        }
+        return true;
+    };
+
+    if (!enter(root)) {
+        return false;
+    }
+    while (!open.empty()) {
+        frame& top = open.back();
+        if (top.left == 0) {
+            open.pop_back();
+            continue;
+        }
+        yyjson_val* v = top.next;
+        top.next = unsafe_yyjson_get_next(v);
+        --top.left;
+        if (yyjson_is_ctn(v) && !enter(v)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 class dom_callback_builder {
@@ -805,67 +896,97 @@ public:
         keep_stack.push_back(true);
     }
 
-    void parse_tree(yyjson_val* val) {
-        switch (yyjson_get_tag(val)) {
-            case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
-                handle_value(nullptr);
-                break;
+    // Feeds the parsed document to the builder in document order. It keeps its own stack of the open arrays and
+    // objects, so the call stack does not grow with the nesting of the document.
+    void parse_tree(yyjson_val* root) {
+        // An open array or object: `next` is its next element (arrays) or next key (objects), `left` counts what is
+        // still to be fed.
+        struct frame {
+            bool is_array;
+            yyjson_val* next;
+            std::size_t left;
+        };
+        std::vector<frame> open;
 
-            case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
-                handle_value(true);
-                break;
+        auto visit = [this, &open](yyjson_val* val) {
+            switch (yyjson_get_tag(val)) {
+                case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+                    handle_value(nullptr);
+                    break;
 
-            case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
-                handle_value(false);
-                break;
+                case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+                    handle_value(true);
+                    break;
 
-            case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
-                handle_value(static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
-                break;
+                case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+                    handle_value(false);
+                    break;
 
-            case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
-                handle_value(static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
-                break;
+                case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+                    handle_value(static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
+                    break;
 
-            case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
-                handle_value(static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
-                break;
+                case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+                    handle_value(static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
+                    break;
 
-            case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
-            case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
-                json::string_t s(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
-                handle_value(s);
-                break;
-            }
+                case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+                    handle_value(static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
+                    break;
 
-            case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
-                start_array(unsafe_yyjson_get_len(val));
-                yyjson_arr_iter iter = yyjson_arr_iter_with(val);
-                yyjson_val* elem = nullptr;
-                while ((elem = yyjson_arr_iter_next(&iter)) != nullptr) {
-                    parse_tree(elem);
+                case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+                case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
+                    json::string_t s(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
+                    handle_value(s);
+                    break;
                 }
-                end_array();
-                break;
-            }
 
-            case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
-                start_object(unsafe_yyjson_get_len(val));
-                yyjson_obj_iter iter = yyjson_obj_iter_with(val);
-                yyjson_val* k = nullptr;
-                while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
-                    yyjson_val* v = yyjson_obj_iter_get_val(k);
-                    json::string_t key_str(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
-                    key(key_str);
-                    parse_tree(v);
+                case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
+                    const std::size_t len = unsafe_yyjson_get_len(val);
+                    start_array(len);
+                    open.push_back({true, unsafe_yyjson_get_first(val), len});
+                    break;
                 }
-                end_object();
-                break;
-            }
 
-            default:
-                handle_value(nullptr);
-                break;
+                case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
+                    const std::size_t len = unsafe_yyjson_get_len(val);
+                    start_object(len);
+                    open.push_back({false, unsafe_yyjson_get_first(val), len});
+                    break;
+                }
+
+                default:
+                    handle_value(nullptr);
+                    break;
+            }
+        };
+
+        visit(root);
+        while (!open.empty()) {
+            frame& top = open.back();
+            if (top.left == 0) {
+                const bool is_array = top.is_array;
+                open.pop_back();
+                if (is_array) {
+                    end_array();
+                } else {
+                    end_object();
+                }
+                continue;
+            }
+            --top.left;
+            if (top.is_array) {
+                yyjson_val* elem = top.next;
+                top.next = unsafe_yyjson_get_next(elem);
+                visit(elem);
+            } else {
+                yyjson_val* k = top.next;
+                yyjson_val* v = yyjson_obj_iter_get_val(k);
+                top.next = unsafe_yyjson_get_next(v);
+                json::string_t key_str(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                key(key_str);
+                visit(v);
+            }
         }
     }
 
@@ -1771,10 +1892,17 @@ private:
     json::number_float_t value_float_ = 0.0;
 };
 
+std::string nesting_limit_message(const std::size_t max_depth) {
+    return "nesting limit exceeded; arrays and objects may be nested at most " +
+           std::to_string(max_depth) + " levels deep";
+}
+
 class diagnostic_parser {
 public:
-    diagnostic_parser(std::string_view input, bool ignore_comments)
-        : lexer_(input, ignore_comments) {
+    // Besides syntax errors, the scanner reports the first array or object that is nested deeper than `max_depth`
+    // levels (see within_depth), at the position of its opening bracket.
+    diagnostic_parser(std::string_view input, bool ignore_comments, std::size_t max_depth)
+        : lexer_(input, ignore_comments), max_depth_(max_depth) {
         get_token();
     }
 
@@ -1809,6 +1937,16 @@ private:
         return false;
     }
 
+    bool fail_nesting_limit(bool allow_exceptions) {
+        if (allow_exceptions) {
+            const auto pos = lexer_.get_position();
+            throw json::parse_error::create(kNestingLimitErrorId, pos.chars_read_total,
+                                            pos.lines_read + 1, pos.chars_read_current_line,
+                                            nesting_limit_message(max_depth_));
+        }
+        return false;
+    }
+
     bool sax_parse_internal(bool allow_exceptions) {
         std::vector<bool> states;
         bool skip_to_state_evaluation = false;
@@ -1817,6 +1955,10 @@ private:
             if (!skip_to_state_evaluation) {
                 switch (last_token_) {
                     case diag_token_type::begin_object: {
+                        // `states` holds the open non-empty containers; this one is level states.size() + 1.
+                        if (states.size() >= max_depth_) {
+                            return fail_nesting_limit(allow_exceptions);
+                        }
                         if (get_token() == diag_token_type::end_object) {
                             break;
                         }
@@ -1837,6 +1979,9 @@ private:
                     }
 
                     case diag_token_type::begin_array: {
+                        if (states.size() >= max_depth_) {
+                            return fail_nesting_limit(allow_exceptions);
+                        }
                         if (get_token() == diag_token_type::end_array) {
                             break;
                         }
@@ -1963,6 +2108,7 @@ private:
     }
 
     diagnostic_lexer lexer_;
+    std::size_t max_depth_;
     diag_token_type last_token_ = diag_token_type::uninitialized;
 };
 
@@ -1993,14 +2139,29 @@ std::ostream& operator<<(std::ostream& o, const json& j) {
 }
 
 json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exceptions,
-                 const bool ignore_comments) {
+                 const bool ignore_comments, const parse_options& options) {
     yyjson_read_flag flg = YYJSON_READ_ALLOW_BOM;
     if (ignore_comments) {
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    auto finish_doc = [&cb](yyjson_doc* doc) -> json {
+    // The document is valid but nested deeper than the limit: scan it again for the position of the first level
+    // past the limit and report it like a syntax error.
+    auto fail_nesting = [&]() -> json {
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
+        (void)diag.diagnose(allow_exceptions);
+        if (allow_exceptions) {
+            throw parse_error::create(detail::kNestingLimitErrorId, 0,
+                                      detail::nesting_limit_message(options.max_depth));
+        }
+        return json(value_t::discarded);
+    };
+
+    auto finish_doc = [&](yyjson_doc* doc) -> json {
         yyjson_val* root = yyjson_doc_get_root(doc);
+        if (!detail::within_depth(doc, root, options.max_depth)) {
+            return fail_nesting();
+        }
         if (cb) {
             json result;
             detail::dom_callback_builder builder(result, cb);
@@ -2014,7 +2175,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
     };
 
     if (s.find('\0') != std::string_view::npos) {
-        detail::diagnostic_parser diag(s, ignore_comments);
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         if (!diag.diagnose(allow_exceptions)) {
             if (allow_exceptions) {
                 throw other_error::create(
@@ -2051,7 +2212,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
     yyjson_doc* doc =
         yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
     if (doc == nullptr) {
-        detail::diagnostic_parser diag(s, ignore_comments);
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         (void)diag.diagnose(allow_exceptions);
         if (allow_exceptions) {
             throw other_error::create(
@@ -2069,19 +2230,19 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
 }
 
 json json::parse(std::istream& i, parser_callback_t cb, const bool allow_exceptions,
-                 const bool ignore_comments) {
+                 const bool ignore_comments, const parse_options& options) {
     std::string buf((std::istreambuf_iterator<char>(i)), std::istreambuf_iterator<char>());
-    return parse(std::string_view(buf), cb, allow_exceptions, ignore_comments);
+    return parse(std::string_view(buf), cb, allow_exceptions, ignore_comments, options);
 }
 
-bool json::accept(std::string_view s, const bool ignore_comments) {
+bool json::accept(std::string_view s, const bool ignore_comments, const parse_options& options) {
     yyjson_read_flag flg = YYJSON_READ_ALLOW_BOM;
     if (ignore_comments) {
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
     if (s.find('\0') != std::string_view::npos) {
-        detail::diagnostic_parser diag(s, ignore_comments);
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         if (!diag.diagnose(false)) {
             return false;
         }
@@ -2099,24 +2260,26 @@ bool json::accept(std::string_view s, const bool ignore_comments) {
         if (doc == nullptr) {
             return false;
         }
+        const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
         yyjson_doc_free(doc);
-        return true;
+        return ok;
     }
 
     yyjson_doc* doc =
         yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
     if (doc == nullptr) {
-        detail::diagnostic_parser diag(s, ignore_comments);
+        detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         (void)diag.diagnose(false);
         return false;
     }
+    const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
     yyjson_doc_free(doc);
-    return true;
+    return ok;
 }
 
-bool json::accept(std::istream& i, const bool ignore_comments) {
+bool json::accept(std::istream& i, const bool ignore_comments, const parse_options& options) {
     std::string buf((std::istreambuf_iterator<char>(i)), std::istreambuf_iterator<char>());
-    return accept(std::string_view(buf), ignore_comments);
+    return accept(std::string_view(buf), ignore_comments, options);
 }
 
 } // namespace neojson

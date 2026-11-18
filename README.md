@@ -19,3 +19,7 @@ nlohmann's semantics, and `document`, an immutable yyjson document for parse, re
 against nlohmann/json are the specification. Work in progress.
 
 License: MIT. yyjson (vendor/yyjson) is MIT licensed.
+
+## Limits
+
+`json::parse` and `json::accept` accept arrays and objects nested up to 1100 levels deep (`json::parse_options::default_max_depth`). A document nested deeper is a `parse_error` (id 120, "nesting limit exceeded"), a discarded value when exceptions are off, and `false` from `accept`. Pass a `json::parse_options` as the last argument to change the limit for one call: `json::parse(text, nullptr, true, false, json::parse_options{256})` or `json::accept(text, false, json::parse_options{256})`. Parsing needs no deep call stack; copying, dumping and destroying a very deep tree do, so a thread with a small stack should use a smaller limit.
