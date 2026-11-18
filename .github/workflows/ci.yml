@@ -27,18 +27,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64-gcc, runner: ubuntu-24.04, cc: gcc, cxx: g++ }
-          - { name: linux-x64-clang, runner: ubuntu-24.04, cc: clang, cxx: clang++ }
-          - { name: linux-arm64-gcc, runner: ubuntu-24.04-arm, cc: gcc, cxx: g++ }
+          - { name: linux-x64-gcc, runner: ubuntu-24.04, cc: gcc, cxx: g++, sanitize: 'ON' }
+          - { name: linux-x64-clang, runner: ubuntu-24.04, cc: clang, cxx: clang++, sanitize: 'ON' }
+          # The sanitizers run the tests that build very deep or very large trees several hundred times slower on
+          # arm64 (minutes per test), so the arm64 job builds without them; both x64 jobs run them.
+          - { name: linux-arm64-gcc, runner: ubuntu-24.04-arm, cc: gcc, cxx: g++, sanitize: 'OFF' }
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The sanitizers slow the large-input parse tests down several hundred times (on arm64 most), so these jobs
-      # check their results and leave their time bounds to the Release jobs below.
-      - name: Configure (Debug, sanitizers)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=ON -DNEOJSON_TEST_TIME_BOUNDS=OFF
+      # The sanitizers slow the large-input parse tests down many times, so these jobs check their results and leave
+      # their time bounds to the Release jobs below.
+      - name: Configure (Debug, sanitizers ${{ matrix.sanitize }})
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=${{ matrix.sanitize }} -DNEOJSON_TEST_TIME_BOUNDS=OFF
+      - name: Show the compiler and the flags the build uses
+        run: grep -E 'CMAKE_CXX_COMPILER:|NEOJSON_SANITIZE:' build/CMakeCache.txt
       - name: Build
         run: cmake --build build --parallel
       - name: Test
