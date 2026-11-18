@@ -749,11 +749,15 @@ struct object_member {
     yyjson_val* value;
 };
 
-// Resolves the repeated keys of the parsed object `val` (`len` members) by sorting the keys, with the position as a
-// tie-break, so the cost is len*log(len) key comparisons whatever the keys are (a hash table could degrade to a
-// scan on keys that collide).
-std::vector<object_member> resolve_members_sorted(yyjson_val* val, const std::size_t len) {
-    std::vector<yyjson_val*> keys;
+std::string_view member_key_view(yyjson_val* key) {
+    return std::string_view(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+}
+
+// Lists the keys of the parsed object `val` (`len` members) in document order in `keys`, and the positions 0..len-1
+// ordered by key, with the position as a tie-break, in `order`. The cost is len*log(len) key comparisons whatever
+// the keys are (a hash table could degrade to a scan on keys that collide).
+void sort_member_keys(yyjson_val* val, const std::size_t len, std::vector<yyjson_val*>& keys,
+                      std::vector<std::size_t>& order) {
     keys.reserve(len);
     {
         yyjson_obj_iter iter = yyjson_obj_iter_with(val);
@@ -763,16 +767,21 @@ std::vector<object_member> resolve_members_sorted(yyjson_val* val, const std::si
         }
     }
 
-    auto key_view = [&keys](const std::size_t i) {
-        return std::string_view(unsafe_yyjson_get_str(keys[i]), unsafe_yyjson_get_len(keys[i]));
-    };
-
-    std::vector<std::size_t> order(len);
+    order.resize(len);
     std::iota(order.begin(), order.end(), std::size_t{0});
-    std::sort(order.begin(), order.end(), [&key_view](const std::size_t a, const std::size_t b) {
-        const int c = key_view(a).compare(key_view(b));
+    std::sort(order.begin(), order.end(), [&keys](const std::size_t a, const std::size_t b) {
+        const int c = member_key_view(keys[a]).compare(member_key_view(keys[b]));
         return c != 0 ? c < 0 : a < b;
     });
+}
+
+// Resolves the repeated keys of the parsed object `val` (`len` members) by sorting the keys.
+std::vector<object_member> resolve_members_sorted(yyjson_val* val, const std::size_t len) {
+    std::vector<yyjson_val*> keys;
+    std::vector<std::size_t> order;
+    sort_member_keys(val, len, keys, order);
+
+    auto key_view = [&keys](const std::size_t i) { return member_key_view(keys[i]); };
 
     // For the first occurrence of each key, the position of its last occurrence; kNone for every other position.
     constexpr std::size_t kNone = static_cast<std::size_t>(-1);
@@ -796,6 +805,26 @@ std::vector<object_member> resolve_members_sorted(yyjson_val* val, const std::si
         }
     }
     return members;
+}
+
+// For every member of the parsed object `val` (`len` members), the position of the first member with the same key.
+std::vector<std::size_t> first_occurrences_sorted(yyjson_val* val, const std::size_t len) {
+    std::vector<yyjson_val*> keys;
+    std::vector<std::size_t> order;
+    sort_member_keys(val, len, keys, order);
+
+    std::vector<std::size_t> first(len);
+    for (std::size_t run = 0; run < len;) {
+        std::size_t end = run + 1;
+        while (end < len && member_key_view(keys[order[end]]) == member_key_view(keys[order[run]])) {
+            ++end;
+        }
+        for (std::size_t i = run; i < end; ++i) {
+            first[order[i]] = order[run];
+        }
+        run = end;
+    }
+    return first;
 }
 
 // A scalar as a node, or an empty array or object for a container (whose elements the caller adds).
@@ -964,6 +993,17 @@ bool within_depth(yyjson_doc* doc, yyjson_val* root, const std::size_t max_depth
     return true;
 }
 
+// Builds the tree of a parse with a callback. It does what nlohmann's SAX parser for callbacks does, call for call:
+// a key inserts a member holding a discarded value (an existing member of that key takes the discarded value and keeps
+// its position); a value that is kept replaces it; a value that is dropped leaves it in the object; and whenever an
+// object ends, the first discarded child of its parent, if there is one, is removed.
+//
+// Doing that literally costs time in proportion to the size of the parent for every key and every object that ends.
+// Here, a key finds an existing member through the sorted keys of its object (for objects above kObjectIndexThreshold
+// members; smaller ones are scanned), and the children that may be discarded are listed in a heap, so the first
+// one is found without a scan. A removed child stays in place and is dropped when its parent ends, just before the
+// callback sees the parent, so positions do not move while the parent is being filled. Nothing else can observe the
+// parent before that.
 class dom_callback_builder {
 public:
     dom_callback_builder(json& r, const json::parser_callback_t& cb)
@@ -975,11 +1015,12 @@ public:
     // objects, so the call stack does not grow with the nesting of the document.
     void parse_tree(yyjson_val* root) {
         // An open array or object: `next` is its next element (arrays) or next key (objects), `left` counts what is
-        // still to be fed.
+        // still to be fed, `index` is the position in the document of the next member of an object.
         struct frame {
             bool is_array;
             yyjson_val* next;
             std::size_t left;
+            std::size_t index;
         };
         std::vector<frame> open;
 
@@ -1019,14 +1060,14 @@ public:
                 case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
                     const std::size_t len = unsafe_yyjson_get_len(val);
                     start_array(len);
-                    open.push_back({true, unsafe_yyjson_get_first(val), len});
+                    open.push_back({true, unsafe_yyjson_get_first(val), len, 0});
                     break;
                 }
 
                 case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
                     const std::size_t len = unsafe_yyjson_get_len(val);
-                    start_object(len);
-                    open.push_back({false, unsafe_yyjson_get_first(val), len});
+                    start_object(val, len);
+                    open.push_back({false, unsafe_yyjson_get_first(val), len, 0});
                     break;
                 }
 
@@ -1058,58 +1099,199 @@ public:
                 yyjson_val* k = top.next;
                 yyjson_val* v = yyjson_obj_iter_get_val(k);
                 top.next = unsafe_yyjson_get_next(v);
+                const std::size_t member = top.index++;
                 json::string_t key_str(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
-                key(key_str);
+                key(key_str, member);
                 visit(v);
             }
         }
     }
 
 private:
-    void start_object(std::size_t len) {
+    static constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+
+    // The repeated keys of one object above kObjectIndexThreshold members, resolved before the members arrive.
+    struct key_index {
+        // For each member of the document: the position in the document of the first member with the same key.
+        std::vector<std::size_t> first_of;
+        // For each first occurrence: the position in the object being built of the member with that key; kNone while
+        // there is none (the key was not stored yet, or its member was removed).
+        std::vector<std::size_t> slot_of;
+        // For each member of the object being built: the first occurrence of its key.
+        std::vector<std::size_t> first_of_slot;
+    };
+
+    // An array or object being built. `node` is null when the container is not stored (it, or a container around it,
+    // was dropped); then nothing else is used.
+    struct level {
+        json* node = nullptr;
+        // Position of the child that was added last or whose key was inserted last.
+        std::size_t last = kNone;
+        // Positions that may hold a discarded child, as a min-heap. A position can be listed more than once and can
+        // have stopped holding a discarded child; the child is looked at when the position is taken from the heap.
+        std::vector<std::size_t> pending;
+        // Positions of children that are removed but still in place.
+        std::vector<bool> removed;
+        std::size_t removed_count = 0;
+        std::unique_ptr<key_index> index;
+    };
+
+    static bool is_removed(const level& l, const std::size_t pos) {
+        return pos < l.removed.size() && l.removed[pos];
+    }
+
+    static std::size_t child_count(const level& l) {
+        return l.node->is_array() ? l.node->get_ptr<json::array_t*>()->size()
+                                  : l.node->get_ptr<json::object_t*>()->size();
+    }
+
+    static json& child_at(level& l, const std::size_t pos) {
+        return l.node->is_array() ? (*l.node->get_ptr<json::array_t*>())[pos]
+                                  : (*l.node->get_ptr<json::object_t*>())[pos].second;
+    }
+
+    static void list_pending(level& l, const std::size_t pos) {
+        l.pending.push_back(pos);
+        std::push_heap(l.pending.begin(), l.pending.end(), std::greater<std::size_t>());
+    }
+
+    // Lists the child at `l.last` if it is discarded now.
+    static void list_pending_if_discarded(level& l) {
+        if (l.last != kNone && l.last < child_count(l) && child_at(l, l.last).is_discarded()) {
+            list_pending(l, l.last);
+        }
+    }
+
+    // Removes the first discarded child of `l`, if there is one.
+    static void remove_first_discarded(level& l) {
+        while (!l.pending.empty()) {
+            std::pop_heap(l.pending.begin(), l.pending.end(), std::greater<std::size_t>());
+            const std::size_t pos = l.pending.back();
+            l.pending.pop_back();
+            if (pos >= child_count(l) || is_removed(l, pos) || !child_at(l, pos).is_discarded()) {
+                continue;
+            }
+            if (l.removed.size() <= pos) {
+                l.removed.resize(child_count(l), false);
+            }
+            l.removed[pos] = true;
+            ++l.removed_count;
+            if (l.index != nullptr) {
+                l.index->slot_of[l.index->first_of_slot[pos]] = kNone;
+            }
+            return;
+        }
+    }
+
+    // Drops the removed children of `l` from its container.
+    static void drop_removed(level& l) {
+        if (l.removed_count == 0) {
+            return;
+        }
+        if (l.node->is_array()) {
+            json::array_t& arr = *l.node->get_ptr<json::array_t*>();
+            json::array_t kept;
+            kept.reserve(arr.size() - l.removed_count);
+            for (std::size_t i = 0; i < arr.size(); ++i) {
+                if (!is_removed(l, i)) {
+                    kept.push_back(std::move(arr[i]));
+                }
+            }
+            arr = std::move(kept);
+        } else {
+            json::object_t& obj = *l.node->get_ptr<json::object_t*>();
+            json::object_t kept;
+            kept.reserve(obj.size() - l.removed_count);
+            for (std::size_t i = 0; i < obj.size(); ++i) {
+                if (!is_removed(l, i)) {
+                    kept.emplace_back(std::piecewise_construct, std::forward_as_tuple(obj[i].first),
+                                      std::forward_as_tuple(std::move(obj[i].second)));
+                }
+            }
+            obj = std::move(kept);
+        }
+        l.removed.clear();
+        l.removed_count = 0;
+    }
+
+    void start_object(yyjson_val* val, std::size_t len) {
         const bool keep = callback(static_cast<int>(ref_stack.size()),
                                    json::parse_event_t::object_start, discarded);
         keep_stack.push_back(keep);
 
-        auto val = handle_value(json::value_t::object, true);
-        ref_stack.push_back(val.second);
-        if (ref_stack.back() != nullptr) {
-            ref_stack.back()->get_ptr<json::object_t*>()->reserve(len);
+        auto stored = handle_value(json::value_t::object, true);
+        ref_stack.emplace_back();
+        level& l = ref_stack.back();
+        l.node = stored.second;
+        if (l.node != nullptr) {
+            l.node->get_ptr<json::object_t*>()->reserve(len);
+            if (len > kObjectIndexThreshold) {
+                l.index = std::make_unique<key_index>();
+                l.index->first_of = first_occurrences_sorted(val, len);
+                l.index->slot_of.assign(len, kNone);
+                l.index->first_of_slot.reserve(len);
+            }
         }
     }
 
-    void key(json::string_t& val) {
+    void key(json::string_t& val, const std::size_t member) {
         json k(val);
 
         const bool keep =
             callback(static_cast<int>(ref_stack.size()), json::parse_event_t::key, k);
         key_keep_stack.push_back(keep);
 
-        if (keep && ref_stack.back() != nullptr) {
-            object_element =
-                &(ref_stack.back()->get_ptr<json::object_t*>()->operator[](val) = discarded);
+        if (keep && ref_stack.back().node != nullptr) {
+            level& l = ref_stack.back();
+            json::object_t& obj = *l.node->get_ptr<json::object_t*>();
+            std::size_t pos = kNone;
+            if (l.index != nullptr) {
+                pos = l.index->slot_of[l.index->first_of[member]];
+            } else {
+                for (std::size_t i = 0; i < obj.size(); ++i) {
+                    if (!is_removed(l, i) && obj[i].first == val) {
+                        pos = i;
+                        break;
+                    }
+                }
+            }
+            if (pos == kNone) {
+                obj.emplace_back(std::piecewise_construct, std::forward_as_tuple(val),
+                                 std::forward_as_tuple(discarded));
+                pos = obj.size() - 1;
+                if (l.index != nullptr) {
+                    const std::size_t first = l.index->first_of[member];
+                    l.index->slot_of[first] = pos;
+                    l.index->first_of_slot.push_back(first);
+                }
+            } else {
+                obj[pos].second = discarded;
+            }
+            l.last = pos;
+            list_pending(l, pos);
+            object_element = &obj[pos].second;
         }
     }
 
     void end_object() {
-        if (ref_stack.back() != nullptr) {
-            if (!callback(static_cast<int>(ref_stack.size()) - 1,
-                          json::parse_event_t::object_end, *ref_stack.back())) {
-                *ref_stack.back() = discarded;
+        {
+            level& l = ref_stack.back();
+            if (l.node != nullptr) {
+                drop_removed(l);
+                if (!callback(static_cast<int>(ref_stack.size()) - 1,
+                              json::parse_event_t::object_end, *l.node)) {
+                    *l.node = discarded;
+                }
             }
         }
 
         ref_stack.pop_back();
         keep_stack.pop_back();
 
-        if (!ref_stack.empty() && ref_stack.back() != nullptr &&
-            ref_stack.back()->is_structured()) {
-            for (auto it = ref_stack.back()->begin(); it != ref_stack.back()->end(); ++it) {
-                if (it->is_discarded()) {
-                    ref_stack.back()->erase(it);
-                    break;
-                }
-            }
+        if (!ref_stack.empty() && ref_stack.back().node != nullptr &&
+            ref_stack.back().node->is_structured()) {
+            list_pending_if_discarded(ref_stack.back());
+            remove_first_discarded(ref_stack.back());
         }
     }
 
@@ -1118,30 +1300,45 @@ private:
                                    json::parse_event_t::array_start, discarded);
         keep_stack.push_back(keep);
 
-        auto val = handle_value(json::value_t::array, true);
-        ref_stack.push_back(val.second);
-        if (ref_stack.back() != nullptr) {
-            ref_stack.back()->get_ptr<json::array_t*>()->reserve(len);
+        auto stored = handle_value(json::value_t::array, true);
+        ref_stack.emplace_back();
+        ref_stack.back().node = stored.second;
+        if (stored.second != nullptr) {
+            stored.second->get_ptr<json::array_t*>()->reserve(len);
         }
     }
 
     void end_array() {
         bool keep = true;
 
-        if (ref_stack.back() != nullptr) {
-            keep = callback(static_cast<int>(ref_stack.size()) - 1,
-                            json::parse_event_t::array_end, *ref_stack.back());
-            if (!keep) {
-                *ref_stack.back() = discarded;
+        {
+            level& l = ref_stack.back();
+            if (l.node != nullptr) {
+                drop_removed(l);
+                keep = callback(static_cast<int>(ref_stack.size()) - 1,
+                                json::parse_event_t::array_end, *l.node);
+                if (!keep) {
+                    *l.node = discarded;
+                }
             }
         }
 
         ref_stack.pop_back();
         keep_stack.pop_back();
 
-        if (!keep && !ref_stack.empty() && ref_stack.back() != nullptr &&
-            ref_stack.back()->is_array()) {
-            ref_stack.back()->get_ptr<json::array_t*>()->pop_back();
+        if (!ref_stack.empty() && ref_stack.back().node != nullptr) {
+            level& parent = ref_stack.back();
+            if (!keep && parent.node->is_array()) {
+                json::array_t& arr = *parent.node->get_ptr<json::array_t*>();
+                arr.pop_back();
+                // The child that was taken out was not removed, so no removed position lies past the new end.
+                if (parent.removed.size() > arr.size()) {
+                    parent.removed.resize(arr.size());
+                }
+                parent.last = kNone;
+            } else {
+                list_pending_if_discarded(parent);
+            }
         }
     }
 
@@ -1166,13 +1363,19 @@ private:
             return {true, &root};
         }
 
-        if (ref_stack.back() == nullptr) {
+        level& l = ref_stack.back();
+        if (l.node == nullptr) {
             return {false, nullptr};
         }
 
-        if (ref_stack.back()->is_array()) {
-            ref_stack.back()->get_ptr<json::array_t*>()->emplace_back(std::move(value));
-            return {true, &(ref_stack.back()->get_ptr<json::array_t*>()->back())};
+        if (l.node->is_array()) {
+            json::array_t& arr = *l.node->get_ptr<json::array_t*>();
+            arr.emplace_back(std::move(value));
+            l.last = arr.size() - 1;
+            if (arr.back().is_discarded()) {
+                list_pending(l, l.last);
+            }
+            return {true, &arr.back()};
         }
 
         const bool store_element = key_keep_stack.back();
@@ -1183,11 +1386,14 @@ private:
         }
 
         *object_element = std::move(value);
+        if (object_element->is_discarded()) {
+            list_pending(l, l.last);
+        }
         return {true, object_element};
     }
 
     json& root;
-    std::vector<json*> ref_stack{};
+    std::vector<level> ref_stack{};
     std::vector<bool> keep_stack{};
     std::vector<bool> key_keep_stack{};
     json* object_element = nullptr;
