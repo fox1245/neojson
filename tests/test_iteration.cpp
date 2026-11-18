@@ -4,7 +4,10 @@
 // all hold different values, so that reading a neighbouring member shows.
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -136,4 +139,129 @@ TEST(Iteration, UpdateAndDiffReadEachMemberOfTheSource) {
     const json source = json::parse(R"({"a":1,"b":2,"c":3})");
     const json goal = json::parse(R"({"a":1,"b":20,"c":30,"d":40})");
     EXPECT_EQ(source.patch(json::diff(source, goal)), goal);
+}
+
+namespace {
+
+// An object of `n` members whose values all differ in value and in type, so that a value read from a neighbouring
+// member shows; the same text is built for each expectation.
+json distinct_members(std::size_t n) {
+    json j = json::object();
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        switch (i % 3) {
+            case 0:
+                j[key] = static_cast<std::int64_t>(i * 7 + 1);
+                break;
+            case 1:
+                j[key] = "v" + std::to_string(i);
+                break;
+            default:
+                j[key] = json::array({i, "x"});
+                break;
+        }
+    }
+    return j;
+}
+
+std::string expected_member(std::size_t i) {
+    const std::string key = "k" + std::to_string(i);
+    switch (i % 3) {
+        case 0:
+            return key + "=" + std::to_string(i * 7 + 1) + ";";
+        case 1:
+            return key + "=\"v" + std::to_string(i) + "\";";
+        default:
+            return key + "=[" + std::to_string(i) + ",\"x\"];";
+    }
+}
+
+} // namespace
+
+TEST(Iteration, ItemsOfAnObjectPairEveryKeyWithItsOwnValue) {
+    constexpr std::size_t n = 1000;
+    std::string want;
+    for (std::size_t i = 0; i < n; ++i) {
+        want += expected_member(i);
+    }
+
+    json j = distinct_members(n);
+    const json& cj = j;
+
+    // Range-for over a mutable and a constant object.
+    std::string got;
+    for (auto& member : j.items()) {
+        got += member.key() + "=" + member.value().dump() + ";";
+    }
+    EXPECT_EQ(got, want);
+    got.clear();
+    for (const auto& member : cj.items()) {
+        got += member.key() + "=" + member.value().dump() + ";";
+    }
+    EXPECT_EQ(got, want);
+
+    // Structured bindings.
+    got.clear();
+    for (auto&& [key, value] : cj.items()) {
+        got += key + "=" + value.dump() + ";";
+    }
+    EXPECT_EQ(got, want);
+
+    // An explicit loop that evaluates end() in every test, with pre- and post-increment, and key() before value() and
+    // after it.
+    got.clear();
+    for (auto it = cj.items().begin(); it != cj.items().end(); ++it) {
+        got += (*it).key() + "=" + (*it).value().dump() + ";";
+    }
+    EXPECT_EQ(got, want);
+    got.clear();
+    for (auto it = j.items().begin(); it != j.items().end(); it++) {
+        const std::string value = it.value().dump();
+        got += it.key() + "=" + value + ";";
+    }
+    EXPECT_EQ(got, want);
+
+    // Assigning through value() changes the member of the key that was read with it.
+    for (auto& member : j.items()) {
+        member.value() = member.key();
+    }
+    got.clear();
+    for (const auto& member : cj.items()) {
+        got += member.key() + "=" + member.value().dump() + ";";
+    }
+    std::string want_assigned;
+    for (std::size_t i = 0; i < n; ++i) {
+        want_assigned += "k" + std::to_string(i) + "=\"k" + std::to_string(i) + "\";";
+    }
+    EXPECT_EQ(got, want_assigned);
+}
+
+TEST(Iteration, ItemsOfAnArrayPairEveryIndexWithItsOwnElement) {
+    json j = json::array();
+    std::string want;
+    for (std::size_t i = 0; i < 500; ++i) {
+        j.push_back(i % 2 == 0 ? json(static_cast<std::int64_t>(i * 3)) : json("e" + std::to_string(i)));
+        want += std::to_string(i) + "=" + j[i].dump() + ";";
+    }
+    std::string got;
+    for (const auto& member : static_cast<const json&>(j).items()) {
+        got += member.key() + "=" + member.value().dump() + ";";
+    }
+    EXPECT_EQ(got, want);
+    got.clear();
+    for (auto it = j.items().begin(); it != j.items().end(); ++it) {
+        got += it.key() + "=" + it.value().dump() + ";";
+    }
+    EXPECT_EQ(got, want);
+}
+
+TEST(Iteration, ItemsOfAScalarYieldItsOnlyValueWithAnEmptyKey) {
+    const json j = 5;
+    std::size_t count = 0;
+    for (const auto& member : j.items()) {
+        EXPECT_EQ(member.key(), "");
+        EXPECT_EQ(member.value().dump(), "5");
+        ++count;
+    }
+    EXPECT_EQ(count, 1u);
 }

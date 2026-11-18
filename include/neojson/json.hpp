@@ -592,25 +592,36 @@ public:
         return anchor != o.anchor;
     }
 
+    // Like the iterator's own accessors, these hand the container and the positions to static functions by value
+    // instead of passing the address of this object (and of the iterator inside it): a loop over items() then needs
+    // no memory copy of the loop's iterator (see the comment at iter_impl::element_at).
     const string_type& key() const {
-        assert(anchor.m_object != nullptr);
-        switch (anchor.m_object->type()) {
-            case value_t::array: {
-                if (array_index != array_index_last) {
-                    array_index_str = std::to_string(array_index);
-                    array_index_last = array_index;
-                }
-                return array_index_str;
-            }
-            case value_t::object:
-                return anchor.key();
-            default:
-                return empty_str;
-        }
+        return key_at(anchor.m_object, anchor.idx_, array_index, array_index_last, array_index_str, empty_str);
     }
 
     typename IteratorType::reference value() const {
-        return anchor.value();
+        return IteratorType::element_at(anchor.m_object, anchor.idx_);
+    }
+
+private:
+    static const string_type& key_at(typename IteratorType::pointer object,
+                                     typename IteratorType::difference_type idx,
+                                     std::size_t index, std::size_t& index_last, string_type& index_str,
+                                     const string_type& empty) {
+        assert(object != nullptr);
+        switch (object->type()) {
+            case value_t::array: {
+                if (index != index_last) {
+                    index_str = std::to_string(index);
+                    index_last = index;
+                }
+                return index_str;
+            }
+            case value_t::object:
+                return IteratorType::key_at(object, idx);
+            default:
+                return empty;
+        }
     }
 };
 
@@ -4447,6 +4458,10 @@ public:
                       detail::negation<std::is_same<std::decay_t<ValueType>, detail::json_ref<json>>>,
                       detail::negation<std::is_same<
                           ValueType, std::initializer_list<typename string_t::value_type>>>,
+                      // A std::optional is not a target of the implicit conversion (get<std::optional<T>>() still
+                      // works): its own constructors from json would otherwise compete with this operator, and
+                      // `std::optional<json> x; x = j;` would be ambiguous.
+                      detail::negation<detail::is_std_optional<std::decay_t<ValueType>>>,
                       detail::is_detected_lazy<detail::get_template_function, const json&,
                                                ValueType>>::value,
                   int> = 0>
