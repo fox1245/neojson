@@ -57,6 +57,35 @@ namespace detail {
 // a handful of members. To be set from the benchmark.
 inline constexpr std::size_t kObjectIndexThreshold = 64;
 
+// Levels of arrays and objects that are destroyed by plain recursion before the destruction of a deeper tree moves
+// to a stack on the heap. The recursion costs, per level, about 280 to 420 bytes of stack in an unoptimised build
+// with or without AddressSanitizer (measured with GCC 13 and Clang 19: 245 to 421 bytes) and 36 to 85 bytes
+// optimised. The budget is a quarter of the 512 KiB that a small thread may have, 128 KiB, and the allowance for
+// frames that were not measured (MSVC's unoptimised build) is a factor of two: 128 KiB / (2 * 421 bytes) is 155,
+// rounded down to 128. Trees that deep are rare, so almost every tree is destroyed by the recursion alone, which
+// needs no allocation and no pass over the elements.
+inline constexpr std::size_t kMaxRecursiveDestroyDepth = 128;
+
+// The number of arrays and objects being destroyed on this thread, one inside the other. Each thread counts for
+// itself: a value is destroyed on the thread that destroys it, with that thread's stack.
+inline thread_local std::size_t t_destroy_depth = 0;
+// The number of arrays and objects that this thread destroyed past kMaxRecursiveDestroyDepth, that is, through the
+// stack on the heap. The tests read it to see which way a tree was destroyed.
+inline thread_local std::size_t t_destroy_heap_stack_uses = 0;
+
+// Counts one array or object being destroyed on this thread, for as long as the guard lives.
+struct destroy_depth_guard {
+    destroy_depth_guard() noexcept { ++t_destroy_depth; }
+    ~destroy_depth_guard() { --t_destroy_depth; }
+    destroy_depth_guard(const destroy_depth_guard&) = delete;
+    destroy_depth_guard& operator=(const destroy_depth_guard&) = delete;
+};
+
+// For the tests: how many arrays and objects are being destroyed on this thread, one inside the other (0 outside a
+// destructor), and how many arrays and objects this thread has destroyed through the stack on the heap.
+inline std::size_t destroy_depth() noexcept { return t_destroy_depth; }
+inline std::size_t destroy_heap_stack_uses() noexcept { return t_destroy_heap_stack_uses; }
+
 // Error id of the parse_error thrown when a document is nested deeper than the limit of its parse call. It lies
 // outside the ids that nlohmann/json uses for parse errors.
 inline constexpr int kNestingLimitErrorId = 120;
@@ -2672,9 +2701,9 @@ private:
 
         // Destroys the arrays and objects below the array or object `c` without a call per level: they are moved to
         // a stack that lives on the heap, and each is taken apart once it holds no container any more. What `c`
-        // holds afterwards is plain values (and nulls), whose destruction does not recurse. A container whose
-        // elements are all plain values skips this and costs one pass over them. If the heap stack cannot grow, the
-        // containers still on it and in `c` are destroyed by recursion, as they would be without this function.
+        // holds afterwards is plain values (and nulls), whose destruction does not recurse. If the heap stack cannot
+        // grow, the containers still on it and in `c` are destroyed by recursion, as they would be without this
+        // function.
         template <typename Container>
         static void release_containers(Container& c) noexcept {
             bool nested = false;
@@ -2703,21 +2732,33 @@ private:
             }
         }
 
+        // Destroys the array or object `c` points to. While fewer than kMaxRecursiveDestroyDepth of them are being
+        // destroyed on this thread, one inside the other, it deletes it, which destroys its elements by recursion.
+        // Below that depth nothing is allocated and the elements are not looked at twice. At that depth the
+        // containers below `c` are taken apart on the heap stack first, so that the recursion stops there.
+        template <typename Container>
+        static void destroy_container(Container*& c) noexcept {
+            if (c == nullptr) {
+                return;
+            }
+            if (detail::t_destroy_depth < detail::kMaxRecursiveDestroyDepth) {
+                const detail::destroy_depth_guard guard;
+                delete c;
+            } else {
+                ++detail::t_destroy_heap_stack_uses;
+                release_containers(*c);
+                delete c;
+            }
+            c = nullptr;
+        }
+
         void destroy(value_t t) noexcept {
             switch (t) {
                 case value_t::object:
-                    if (object != nullptr) {
-                        release_containers(*object);
-                    }
-                    delete object;
-                    object = nullptr;
+                    destroy_container(object);
                     break;
                 case value_t::array:
-                    if (array != nullptr) {
-                        release_containers(*array);
-                    }
-                    delete array;
-                    array = nullptr;
+                    destroy_container(array);
                     break;
                 case value_t::string:
                     delete string;
