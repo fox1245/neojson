@@ -2636,13 +2636,75 @@ private:
             }
         }
 
+        static bool is_container(const json& j) noexcept {
+            return j.m_type == value_t::array || j.m_type == value_t::object;
+        }
+
+        static json& element_of(json& j) noexcept {
+            return j;
+        }
+
+        static json& element_of(std::pair<const std::string, json>& member) noexcept {
+            return member.second;
+        }
+
+        // Moves the arrays and objects among the elements of `c` onto `stack`, leaving null in their place.
+        template <typename Container>
+        static void take_containers(Container& c, std::vector<json>& stack) {
+            for (auto& element : c) {
+                json& child = element_of(element);
+                if (is_container(child)) {
+                    stack.push_back(std::move(child));
+                }
+            }
+        }
+
+        // Destroys the arrays and objects below the array or object `c` without a call per level: they are moved to
+        // a stack that lives on the heap, and each is taken apart once it holds no container any more. What `c`
+        // holds afterwards is plain values (and nulls), whose destruction does not recurse. A container whose
+        // elements are all plain values skips this and costs one pass over them. If the heap stack cannot grow, the
+        // containers still on it and in `c` are destroyed by recursion, as they would be without this function.
+        template <typename Container>
+        static void release_containers(Container& c) noexcept {
+            bool nested = false;
+            for (auto& element : c) {
+                if (is_container(element_of(element))) {
+                    nested = true;
+                    break;
+                }
+            }
+            if (!nested) {
+                return;
+            }
+            try {
+                std::vector<json> stack;
+                take_containers(c, stack);
+                while (!stack.empty()) {
+                    json current(std::move(stack.back()));
+                    stack.pop_back();
+                    if (current.m_type == value_t::array) {
+                        take_containers(*current.m_value.array, stack);
+                    } else {
+                        take_containers(*current.m_value.object, stack);
+                    }
+                }
+            } catch (...) {
+            }
+        }
+
         void destroy(value_t t) noexcept {
             switch (t) {
                 case value_t::object:
+                    if (object != nullptr) {
+                        release_containers(*object);
+                    }
                     delete object;
                     object = nullptr;
                     break;
                 case value_t::array:
+                    if (array != nullptr) {
+                        release_containers(*array);
+                    }
                     delete array;
                     array = nullptr;
                     break;
