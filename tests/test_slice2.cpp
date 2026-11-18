@@ -1382,7 +1382,9 @@ TEST(Slice2DifferentialSequence, PointerPatchAndMergeOps) {
     std::mt19937_64 rng(0x51C2'CAFE'1234ULL);
 
     for (int trial = 0; trial < 60; ++trial) {
-        auto [j, o] = make_random_doc(rng);
+        auto root = make_random_doc(rng);
+        auto& j = root.first;
+        auto& o = root.second;
         assert_equivalent(o, j);
 
         static const char* const sample_ptrs[] = {
@@ -1403,7 +1405,9 @@ TEST(Slice2DifferentialSequence, PointerPatchAndMergeOps) {
                     break;
                 }
                 case 1: { // mutable operator[](json_pointer)
-                    auto [jv, ov] = make_random_doc(rng, 2);
+                    auto doc = make_random_doc(rng, 2);
+                    auto& jv = doc.first;
+                    auto& ov = doc.second;
                     expect_same_exception(
                         [&]() { o[op_ptr] = ov; },
                         [&]() { j[jp] = jv; });
@@ -1423,7 +1427,9 @@ TEST(Slice2DifferentialSequence, PointerPatchAndMergeOps) {
                     break;
                 }
                 case 4: { // diff + patch
-                    auto [jt, ot] = make_random_doc(rng, 1);
+                    auto doc = make_random_doc(rng, 1);
+                    auto& jt = doc.first;
+                    auto& ot = doc.second;
                     jk jd = jk::diff(j, jt);
                     oj od = oj::diff(o, ot);
                     assert_equivalent(od, jd);
@@ -1433,7 +1439,9 @@ TEST(Slice2DifferentialSequence, PointerPatchAndMergeOps) {
                     break;
                 }
                 case 5: { // merge_patch
-                    auto [jm, om] = make_random_doc(rng, 1);
+                    auto doc = make_random_doc(rng, 1);
+                    auto& jm = doc.first;
+                    auto& om = doc.second;
                     j.merge_patch(jm);
                     o.merge_patch(om);
                     assert_equivalent(o, j);

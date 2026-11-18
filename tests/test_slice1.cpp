@@ -882,7 +882,9 @@ TEST(Slice1, RandomOperationSequences) {
                         o_root = nlohmann::ordered_json::object();
                         s_root = neojson::json::object();
                     }
-                    auto [ov, sv] = make_leaf(rng());
+                    auto leaf = make_leaf(rng());
+                    auto& ov = leaf.first;
+                    auto& sv = leaf.second;
                     expect_same_exception([&] { o_root[key] = std::move(ov); },
                                           [&] { s_root[key] = std::move(sv); });
                     break;
@@ -893,7 +895,9 @@ TEST(Slice1, RandomOperationSequences) {
                     break;
                 }
                 case 2: { // emplace on object
-                    auto [ov, sv] = make_leaf(rng());
+                    auto leaf = make_leaf(rng());
+                    auto& ov = leaf.first;
+                    auto& sv = leaf.second;
                     expect_same_exception([&] { o_root.emplace(key, std::move(ov)); },
                                           [&] { s_root.emplace(key, std::move(sv)); });
                     break;
@@ -903,7 +907,9 @@ TEST(Slice1, RandomOperationSequences) {
                         o_aux = nlohmann::ordered_json::array();
                         s_aux = neojson::json::array();
                     }
-                    auto [ov, sv] = make_leaf(rng());
+                    auto leaf = make_leaf(rng());
+                    auto& ov = leaf.first;
+                    auto& sv = leaf.second;
                     expect_same_exception([&] { o_aux.push_back(std::move(ov)); },
                                           [&] { s_aux.push_back(std::move(sv)); });
                     break;
@@ -912,7 +918,9 @@ TEST(Slice1, RandomOperationSequences) {
                     if (o_aux.is_array()) {
                         const std::size_t idx =
                             o_aux.empty() ? 0 : (rng() % (o_aux.size() + 1));
-                        auto [ov, sv] = make_leaf(rng());
+                        auto leaf = make_leaf(rng());
+                        auto& ov = leaf.first;
+                        auto& sv = leaf.second;
                         expect_same_exception(
                             [&] { o_aux.insert(o_aux.begin() + static_cast<std::ptrdiff_t>(idx), ov); },
                             [&] { s_aux.insert(s_aux.begin() + static_cast<std::ptrdiff_t>(idx), sv); });
@@ -929,14 +937,18 @@ TEST(Slice1, RandomOperationSequences) {
                 }
                 case 6: { // operator[](idx) on aux array (up to small resize)
                     const std::size_t idx = rng() % 6;
-                    auto [ov, sv] = make_leaf(rng());
+                    auto leaf = make_leaf(rng());
+                    auto& ov = leaf.first;
+                    auto& sv = leaf.second;
                     expect_same_exception([&] { o_aux[idx] = std::move(ov); },
                                           [&] { s_aux[idx] = std::move(sv); });
                     break;
                 }
                 case 7: { // update root object with another small object
                     const char* k2 = kKeys[rng() % kKeys.size()];
-                    auto [ov, sv] = make_leaf(rng());
+                    auto leaf = make_leaf(rng());
+                    auto& ov = leaf.first;
+                    auto& sv = leaf.second;
                     nlohmann::ordered_json o_patch = {{key, ov}, {k2, 123}};
                     neojson::json s_patch = {{key, sv}, {k2, 123}};
                     const bool merge = (rng() & 1u) != 0;
