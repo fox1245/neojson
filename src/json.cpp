@@ -477,41 +477,87 @@ inline void throw_incomplete_utf8(std::uint8_t byte) {
     throw type_error::create(316, std::string("incomplete UTF-8 string; last byte: ") + hex);
 }
 
+// A byte that dump_escaped copies as it is when no multi-byte sequence is open: printable ASCII other than the quote
+// and the backslash (and DEL, which ensure_ascii escapes).
+inline bool is_verbatim_ascii(const std::uint8_t byte, const bool ensure_ascii) noexcept {
+    return byte >= 0x20u && byte < 0x7Fu + (ensure_ascii ? 0u : 1u) && byte != 0x22u && byte != 0x5Cu;
+}
+
+// The algorithm of nlohmann/json's serializer::dump_escaped, with the same output and the same errors. The bytes that
+// are copied as they are form spans of `s`, and each span is appended with one call: appending them one by one cost
+// more than the rest of dump on documents with many strings.
 inline void dump_escaped(std::string& out, const std::string& s, const bool ensure_ascii,
                          const error_handler_t error_handler) {
     std::uint32_t codepoint = 0;
     std::uint8_t state = UTF8_ACCEPT;
     std::size_t undumped_chars = 0;
 
+    // s[span_begin, span_end) is copied to out but not yet appended.
+    std::size_t span_begin = 0;
+    std::size_t span_end = 0;
+    const auto flush = [&] {
+        if (span_end > span_begin) {
+            out.append(s.data() + span_begin, span_end - span_begin);
+        }
+        span_begin = span_end;
+    };
+    const auto copy = [&](const std::size_t begin, const std::size_t end) {
+        if (begin != span_end) {
+            flush();
+            span_begin = begin;
+        }
+        span_end = end;
+    };
+
     for (std::size_t i = 0; i < s.size(); ++i) {
+        // With no sequence open (state is UTF8_ACCEPT, so undumped_chars is 0), a run of verbatim bytes needs no
+        // decoding: each would decode to itself and leave the state as it is.
+        if (state == UTF8_ACCEPT && is_verbatim_ascii(static_cast<std::uint8_t>(s[i]), ensure_ascii)) {
+            std::size_t end = i + 1;
+            while (end < s.size() && is_verbatim_ascii(static_cast<std::uint8_t>(s[end]), ensure_ascii)) {
+                ++end;
+            }
+            copy(i, end);
+            i = end - 1;
+            continue;
+        }
+
         const auto byte = static_cast<std::uint8_t>(s[i]);
 
         switch (decode(state, codepoint, byte)) {
             case UTF8_ACCEPT: {
                 switch (codepoint) {
                     case 0x08:
+                        flush();
                         out.append("\\b", 2);
                         break;
                     case 0x09:
+                        flush();
                         out.append("\\t", 2);
                         break;
                     case 0x0A:
+                        flush();
                         out.append("\\n", 2);
                         break;
                     case 0x0C:
+                        flush();
                         out.append("\\f", 2);
                         break;
                     case 0x0D:
+                        flush();
                         out.append("\\r", 2);
                         break;
                     case 0x22:
+                        flush();
                         out.append("\\\"", 2);
                         break;
                     case 0x5C:
+                        flush();
                         out.append("\\\\", 2);
                         break;
                     default: {
                         if (codepoint <= 0x1F || (ensure_ascii && codepoint >= 0x7F)) {
+                            flush();
                             if (codepoint <= 0xFFFF) {
                                 append_u4(out, static_cast<std::uint16_t>(codepoint));
                             } else {
@@ -519,7 +565,7 @@ inline void dump_escaped(std::string& out, const std::string& s, const bool ensu
                                 append_u4(out, static_cast<std::uint16_t>(0xDC00u + (codepoint & 0x3FFu)));
                             }
                         } else {
-                            out.append(&s[i - undumped_chars], undumped_chars + 1);
+                            copy(i - undumped_chars, i + 1);
                         }
                         break;
                     }
@@ -542,6 +588,7 @@ inline void dump_escaped(std::string& out, const std::string& s, const bool ensu
                         state = UTF8_ACCEPT;
 
                         if (error_handler == error_handler_t::replace) {
+                            flush();
                             if (ensure_ascii) {
                                 out.append("\\ufffd", 6);
                             } else {
@@ -560,6 +607,8 @@ inline void dump_escaped(std::string& out, const std::string& s, const bool ensu
             }
         }
     }
+
+    flush();
 
     if (state != UTF8_ACCEPT) {
         switch (error_handler) {
