@@ -650,6 +650,32 @@ inline void dump_escaped(std::string& out, const std::string& s, const bool ensu
 
 } // namespace utf8_impl
 
+struct json_access {
+    static json make_string(const char* s, const std::size_t len) {
+        auto ptr = std::make_unique<json::string_t>(s, len);
+        json j;
+        j.m_type = json::value_t::string;
+        j.m_value.string = ptr.release();
+        return j;
+    }
+
+    static json make_array() {
+        auto ptr = std::make_unique<json::array_t>();
+        json j;
+        j.m_type = json::value_t::array;
+        j.m_value.array = ptr.release();
+        return j;
+    }
+
+    static json make_object() {
+        auto ptr = std::make_unique<json::object_t>();
+        json j;
+        j.m_type = json::value_t::object;
+        j.m_value.object = ptr.release();
+        return j;
+    }
+};
+
 namespace {
 
 void append_uint(std::string& out, std::uint64_t v) {
@@ -802,14 +828,6 @@ void dump_value(std::string& out, const json& val, const bool pretty_print,
     }
 }
 
-// The members of a parsed object after repeated keys are resolved: one entry per distinct key, in the order of the
-// key's first occurrence, each with the value of the key's last occurrence. This is what inserting the members one
-// by one through operator[] gives (and what nlohmann::ordered_json does).
-struct object_member {
-    yyjson_val* key;
-    yyjson_val* value;
-};
-
 std::string_view member_key_view(yyjson_val* key) {
     return std::string_view(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
 }
@@ -834,38 +852,6 @@ void sort_member_keys(yyjson_val* val, const std::size_t len, std::vector<yyjson
         const int c = member_key_view(keys[a]).compare(member_key_view(keys[b]));
         return c != 0 ? c < 0 : a < b;
     });
-}
-
-// Resolves the repeated keys of the parsed object `val` (`len` members) by sorting the keys.
-std::vector<object_member> resolve_members_sorted(yyjson_val* val, const std::size_t len) {
-    std::vector<yyjson_val*> keys;
-    std::vector<std::size_t> order;
-    sort_member_keys(val, len, keys, order);
-
-    auto key_view = [&keys](const std::size_t i) { return member_key_view(keys[i]); };
-
-    // For the first occurrence of each key, the position of its last occurrence; kNone for every other position.
-    constexpr std::size_t kNone = static_cast<std::size_t>(-1);
-    std::vector<std::size_t> last_of(len, kNone);
-    std::size_t distinct = 0;
-    for (std::size_t run = 0; run < len;) {
-        std::size_t end = run + 1;
-        while (end < len && key_view(order[end]) == key_view(order[run])) {
-            ++end;
-        }
-        last_of[order[run]] = order[end - 1];
-        ++distinct;
-        run = end;
-    }
-
-    std::vector<object_member> members;
-    members.reserve(distinct);
-    for (std::size_t i = 0; i < len; ++i) {
-        if (last_of[i] != kNone) {
-            members.push_back({keys[i], yyjson_obj_iter_get_val(keys[last_of[i]])});
-        }
-    }
-    return members;
 }
 
 // For every member of the parsed object `val` (`len` members), the position of the first member with the same key.
@@ -911,59 +897,62 @@ json make_node(yyjson_val* val) {
 
         case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
         case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
-            return json(json::string_t(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val)));
+            return json_access::make_string(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
 
         case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
-            return json(json::value_t::array);
+            return json_access::make_array();
 
         case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE:
-            return json(json::value_t::object);
+            return json_access::make_object();
 
         default:
             return json(nullptr);
     }
 }
 
-// Builds the node tree of a parsed document. It keeps its own stack of the arrays and objects being filled, so the
-// call stack does not grow with the nesting of the document.
-json materialize_yyjson(yyjson_val* root) {
-    // An array or object being filled. `next` is the next element (arrays) or the next key (objects) in the parsed
-    // document; `left` counts the elements or members still to add. An object with more than kObjectIndexThreshold
-    // members has its repeated keys resolved up front, and `members` then lists what remains to add.
+// Builds the node tree of a parsed document in a single pass while enforcing `max_depth` (same semantics as
+// `within_depth`). Keeps its own explicit container stack so C stack usage is constant with nesting depth.
+json materialize_yyjson(yyjson_val* root, const std::size_t max_depth, bool& depth_exceeded) {
+    depth_exceeded = false;
+    if (!yyjson_is_ctn(root)) {
+        return make_node(root);
+    }
+
     struct frame {
-        json* node;
+        bool is_array;
+        void* container;
         yyjson_val* next;
         std::size_t left;
-        std::unique_ptr<std::vector<object_member>> members;
-        std::size_t member_index;
     };
 
     json result = make_node(root);
     std::vector<frame> open;
+    open.reserve(32);
 
     // Starts filling `node`, which was made from the container `val`.
-    auto open_container = [&open](json& node, yyjson_val* val) {
+    auto open_container = [&open, max_depth](json& node, yyjson_val* val) -> bool {
+        if (open.size() >= max_depth) {
+            return false;
+        }
         const std::size_t len = unsafe_yyjson_get_len(val);
         if (len == 0) {
-            return;
+            return true;
         }
         if (yyjson_is_arr(val)) {
-            node.get_ptr<json::array_t*>()->reserve(len);
-            open.push_back({&node, unsafe_yyjson_get_first(val), len, nullptr, 0});
-        } else if (len > kObjectIndexThreshold) {
-            auto members = std::make_unique<std::vector<object_member>>(
-                resolve_members_sorted(val, len));
-            node.get_ptr<json::object_t*>()->reserve(members->size());
-            const std::size_t count = members->size();
-            open.push_back({&node, nullptr, count, std::move(members), 0});
+            auto* arr = node.get_ptr<json::array_t*>();
+            arr->reserve(len);
+            open.push_back({true, arr, unsafe_yyjson_get_first(val), len});
         } else {
-            node.get_ptr<json::object_t*>()->reserve(len);
-            open.push_back({&node, unsafe_yyjson_get_first(val), len, nullptr, 0});
+            auto* obj = node.get_ptr<json::object_t*>();
+            obj->reserve_for_build(len);
+            open.push_back({false, obj, unsafe_yyjson_get_first(val), len});
         }
+        return true;
     };
 
-    if (yyjson_is_ctn(root)) {
-        open_container(result, root);
+    if (!open_container(result, root)) {
+        depth_exceeded = true;
+        return json(json::value_t::discarded);
     }
     while (!open.empty()) {
         frame& top = open.back();
@@ -975,31 +964,25 @@ json materialize_yyjson(yyjson_val* root) {
 
         json* child = nullptr;
         yyjson_val* child_val = nullptr;
-        if (top.node->is_array()) {
+        if (top.is_array) {
             child_val = top.next;
             top.next = unsafe_yyjson_get_next(child_val);
-            child = &top.node->get_ptr<json::array_t*>()->emplace_back(make_node(child_val));
-        } else if (top.members != nullptr) {
-            const object_member& m = (*top.members)[top.member_index++];
-            child_val = m.value;
-            const std::string_view k(unsafe_yyjson_get_str(m.key), unsafe_yyjson_get_len(m.key));
-            child = &top.node->get_ptr<json::object_t*>()
-                         ->emplace_back(std::piecewise_construct, std::forward_as_tuple(k),
-                                        std::forward_as_tuple(make_node(child_val)))
-                         .second;
+            auto* arr = static_cast<json::array_t*>(top.container);
+            child = &arr->emplace_back(make_node(child_val));
         } else {
             yyjson_val* key = top.next;
             child_val = yyjson_obj_iter_get_val(key);
             top.next = unsafe_yyjson_get_next(child_val);
             const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
-            // A repeated key keeps its position and takes the new value. ordered_map::operator[] scans the members
-            // already added, which is cheap for the few members of this object.
-            child = &(*top.node->get_ptr<json::object_t*>())[k];
-            *child = make_node(child_val);
+            auto* obj = static_cast<json::object_t*>(top.container);
+            child = &obj->emplace_or_assign_key(k, make_node(child_val));
         }
         // `top` may be invalid from here on: opening the child grows the stack.
         if (yyjson_is_ctn(child_val)) {
-            open_container(*child, child_val);
+            if (!open_container(*child, child_val)) {
+                depth_exceeded = true;
+                return json(json::value_t::discarded);
+            }
         }
     }
     return result;
@@ -2502,10 +2485,10 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
 
     auto finish_doc = [&](yyjson_doc* doc) -> json {
         yyjson_val* root = yyjson_doc_get_root(doc);
-        if (!detail::within_depth(doc, root, options.max_depth)) {
-            return fail_nesting();
-        }
         if (cb) {
+            if (!detail::within_depth(doc, root, options.max_depth)) {
+                return fail_nesting();
+            }
             json result;
             detail::dom_callback_builder builder(result, cb);
             builder.parse_tree(root);
@@ -2514,7 +2497,12 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
             }
             return result;
         }
-        return detail::materialize_yyjson(root);
+        bool depth_exceeded = false;
+        json result = detail::materialize_yyjson(root, options.max_depth, depth_exceeded);
+        if (depth_exceeded) {
+            return fail_nesting();
+        }
+        return result;
     };
 
     if (s.find('\0') != std::string_view::npos) {
