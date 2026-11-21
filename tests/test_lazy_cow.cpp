@@ -1065,4 +1065,204 @@ TEST(LazyCow, ThreadLargeCacheCrossThreadAndDumpReuse) {
     transferred.clear();
 }
 
+TEST(LazyCow, EmptyContainersAndSmallArray2EdgeCases) {
+    // 1. Zero-allocation empty arrays and objects: behavior, queries, iterators, errors.
+    {
+        jk ea = jk::array();
+        jk eo = jk::object();
+        const jk cea = jk::parse("[]");
+        const jk ceo = jk::parse("{}");
+        EXPECT_TRUE(ea.is_array());
+        EXPECT_TRUE(eo.is_object());
+        EXPECT_TRUE(ea.empty());
+        EXPECT_TRUE(eo.empty());
+        EXPECT_EQ(ea.size(), 0u);
+        EXPECT_EQ(eo.size(), 0u);
+        EXPECT_EQ(ea.begin(), ea.end());
+        EXPECT_EQ(eo.begin(), eo.end());
+        EXPECT_FALSE(ceo.contains("missing"));
+        EXPECT_FALSE(eo.contains("missing"));
+        EXPECT_EQ(ceo.find("missing"), ceo.end());
+        EXPECT_EQ(eo.find("missing"), eo.end());
+        EXPECT_EQ(eo.erase("missing"), 0u);
+        EXPECT_THROW((void)cea.at(0u), jk::out_of_range);
+        EXPECT_THROW((void)ea.at(0u), jk::out_of_range);
+        EXPECT_THROW((void)ceo.at("k"), jk::out_of_range);
+        EXPECT_THROW((void)eo.at("k"), jk::out_of_range);
+        EXPECT_EQ(ea.dump(), "[]");
+        EXPECT_EQ(eo.dump(), "{}");
+        EXPECT_EQ(ea, cea);
+        EXPECT_EQ(eo, ceo);
+        EXPECT_EQ(cea, jk::parse("[]"));
+        EXPECT_LT(ea, jk::parse("[1]"));
+        EXPECT_LT(eo, jk::parse("{\"a\":1}"));
+        ASSERT_NE(cea.get_ptr<const jk::array_t*>(), nullptr);
+        EXPECT_TRUE(cea.get_ptr<const jk::array_t*>()->empty());
+        ASSERT_NE(ceo.get_ptr<const jk::object_t*>(), nullptr);
+        EXPECT_TRUE(ceo.get_ptr<const jk::object_t*>()->empty());
+        ASSERT_NE(ea.get_ptr<jk::array_t*>(), nullptr);
+        EXPECT_TRUE(ea.get_ptr<jk::array_t*>()->empty());
+        ASSERT_NE(eo.get_ptr<jk::object_t*>(), nullptr);
+        EXPECT_TRUE(eo.get_ptr<jk::object_t*>()->empty());
+    }
+
+    // 2. SmallArray2 lifecycle: 0 -> 1 -> 2 -> 3, operator[], emplace_back, clear -> reuse.
+    {
+        jk a = jk::array();
+        a.push_back(10);
+        EXPECT_EQ(a.size(), 1u);
+        EXPECT_EQ(a[0], 10);
+        a.push_back(20);
+        EXPECT_EQ(a.size(), 2u);
+        EXPECT_EQ(a[0], 10);
+        EXPECT_EQ(a[1], 20);
+        a.push_back(30);
+        EXPECT_EQ(a.size(), 3u);
+        EXPECT_EQ(a, jk::parse("[10,20,30]"));
+        a.clear();
+        EXPECT_TRUE(a.empty());
+        EXPECT_EQ(a.dump(), "[]");
+
+        jk& ref0 = a.emplace_back("hello");
+        EXPECT_EQ(ref0, "hello");
+        a.emplace_back(2);
+        EXPECT_EQ(a.size(), 2u);
+        EXPECT_EQ(a, jk::parse(R"(["hello",2])"));
+
+        jk idx_arr;
+        idx_arr[1] = 99;
+        EXPECT_EQ(idx_arr.size(), 2u);
+        EXPECT_TRUE(idx_arr[0].is_null());
+        EXPECT_EQ(idx_arr[1], 99);
+        idx_arr[0] = "ok";
+        EXPECT_EQ(idx_arr.dump(), R"(["ok",99])");
+        idx_arr[2] = false;
+        EXPECT_EQ(idx_arr, jk::parse(R"(["ok",99,false])"));
+    }
+
+    // 3. Self-push and internal-reference push during 1->2 and 2->3 transitions.
+    {
+        jk self_arr = jk::array();
+        self_arr.push_back(1);
+        self_arr.push_back(self_arr);
+        EXPECT_EQ(self_arr.size(), 2u);
+        EXPECT_EQ(self_arr[0], 1);
+        EXPECT_EQ(self_arr[1], jk::parse("[1]"));
+
+        self_arr.push_back(self_arr[1]);
+        EXPECT_EQ(self_arr.size(), 3u);
+        EXPECT_EQ(self_arr[2], jk::parse("[1]"));
+
+        self_arr.push_back(self_arr);
+        EXPECT_EQ(self_arr.size(), 4u);
+        EXPECT_EQ(self_arr[3].size(), 3u);
+
+        jk pair = jk::parse(R"(["shared_text", -12.5])");
+        pair.push_back(pair[0]);
+        EXPECT_EQ(pair.size(), 3u);
+        EXPECT_EQ(pair[0], "shared_text");
+        EXPECT_EQ(pair[2], "shared_text");
+    }
+
+    // 4. Concurrent 4-thread const_array() / iteration / slice copy / comparison on SmallArray2.
+    {
+        const jk parsed_pair = jk::parse(R"([-122.4194,"sf"])");
+        jk built_pair = jk::array();
+        built_pair.push_back(-122.4194);
+        built_pair.push_back("sf");
+
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 4; ++t) {
+            readers.emplace_back([&]() {
+                for (int i = 0; i < 64; ++i) {
+                    const auto* pv = parsed_pair.get_ptr<const jk::array_t*>();
+                    const auto* bv = built_pair.get_ptr<const jk::array_t*>();
+                    ASSERT_NE(pv, nullptr);
+                    ASSERT_NE(bv, nullptr);
+                    EXPECT_EQ(pv->size(), 2u);
+                    EXPECT_EQ(bv->size(), 2u);
+                    EXPECT_EQ((*pv)[0], -122.4194);
+                    EXPECT_EQ((*bv)[1], "sf");
+                    EXPECT_EQ(parsed_pair, built_pair);
+                    jk sliced(parsed_pair.begin(), parsed_pair.end());
+                    EXPECT_EQ(sliced, parsed_pair);
+                }
+            });
+        }
+        for (auto& th : readers) {
+            th.join();
+        }
+
+        // Mutate after concurrent const_array() materialization.
+        built_pair[0] = 42;
+        built_pair.push_back(true);
+        EXPECT_EQ(built_pair, jk::parse(R"([42,"sf",true])"));
+        EXPECT_NE(parsed_pair, built_pair);
+        EXPECT_LT(parsed_pair, built_pair);
+        EXPECT_EQ(parsed_pair.dump(), R"([-122.4194,"sf"])");
+        EXPECT_EQ(parsed_pair.dump(2), "[\n  -122.4194,\n  \"sf\"\n]");
+
+        // Stale-cache regression on 1-element SmallArray2 after const_array() materialization.
+        jk single_edit = jk::array();
+        single_edit.push_back(1);
+        const auto* v1 = single_edit.get_ptr<const jk::array_t*>();
+        ASSERT_NE(v1, nullptr);
+        ASSERT_EQ(v1->size(), 1u);
+        single_edit[0] = 777;
+        const auto* v1_after = single_edit.get_ptr<const jk::array_t*>();
+        ASSERT_NE(v1_after, nullptr);
+        ASSERT_EQ(v1_after->size(), 1u);
+        EXPECT_EQ((*v1_after)[0], 777);
+
+        jk single_push = jk::array();
+        single_push.push_back(100);
+        const auto* v2 = single_push.get_ptr<const jk::array_t*>();
+        ASSERT_NE(v2, nullptr);
+        ASSERT_EQ(v2->size(), 1u);
+        single_push.push_back(888);
+        const auto* v2_after = single_push.get_ptr<const jk::array_t*>();
+        ASSERT_NE(v2_after, nullptr);
+        ASSERT_EQ(v2_after->size(), 2u);
+        EXPECT_EQ((*v2_after)[0], 100);
+        EXPECT_EQ((*v2_after)[1], 888);
+    }
+
+    // 5. Deep 1100-level nested [[[[1]]]] built & parsed destroyed on a 512 KiB stack.
+    {
+        constexpr std::size_t kDepth = 1100u;
+        constexpr std::size_t kStackBytes = 512u * 1024u;
+        std::string deep_raw;
+        deep_raw.reserve(kDepth * 2u + 2u);
+        deep_raw.append(kDepth, '[');
+        deep_raw.push_back('1');
+        deep_raw.append(kDepth, ']');
+
+        neojson::parse_options opts;
+        opts.max_depth = kDepth + 16u;
+
+        const std::string err = neojson::test::run_with_stack(kStackBytes, [&]() {
+            const std::size_t uses_before = neojson::detail::destroy_heap_stack_uses();
+            {
+                jk parsed_deep = jk::parse(deep_raw, nullptr, true, false, opts);
+                parsed_deep.materialize();
+                EXPECT_EQ(parsed_deep.size(), 1u);
+            }
+            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), uses_before);
+
+            const std::size_t uses_built_before = neojson::detail::destroy_heap_stack_uses();
+            {
+                jk built_deep = 1;
+                for (std::size_t d = 0; d < kDepth; ++d) {
+                    jk wrap = jk::array();
+                    wrap.push_back(std::move(built_deep));
+                    built_deep = std::move(wrap);
+                }
+                EXPECT_EQ(built_deep.size(), 1u);
+            }
+            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), uses_built_before);
+        });
+        ASSERT_TRUE(err.empty()) << err;
+    }
+}
+
 } // namespace

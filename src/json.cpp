@@ -1529,20 +1529,22 @@ struct json_access {
         return j;
     }
 
-    static json make_array() {
-        json::array_t* ptr = json::create_array();
+    static json make_array() noexcept {
         json j;
         j.m_type = json::value_t::array;
-        j.m_value.array = ptr;
+        j.m_storage = 3u;
         return j;
     }
 
-    static json make_object() {
-        json::object_t* ptr = json::create_object();
+    static json make_object() noexcept {
         json j;
         j.m_type = json::value_t::object;
-        j.m_value.object = ptr;
+        j.m_storage = 3u;
         return j;
+    }
+
+    static bool is_empty_container(const json& j) noexcept {
+        return j.m_storage == 3u;
     }
 
     static json::value_t type_of(const json& j) noexcept {
@@ -1575,12 +1577,58 @@ struct json_access {
         }
     }
 
-    static const json::array_t& array_of(const json& j) noexcept {
-        return *j.m_value.array;
+    static const json::array_t& array_of(const json& j) {
+        return *j.const_array();
     }
 
-    static const json::object_t& object_of(const json& j) noexcept {
-        return *j.m_value.object;
+    static const json::object_t& object_of(const json& j) {
+        return *j.const_object();
+    }
+
+    static const json::array_t* raw_array_ptr(const json& j) noexcept {
+        return j.m_value.array;
+    }
+
+    static const json::object_t* raw_object_ptr(const json& j) noexcept {
+        return j.m_value.object;
+    }
+
+    static bool is_small_array(const json& j) noexcept {
+        return j.m_storage == 2u && j.m_type == json::value_t::array;
+    }
+
+    static const SmallArray2& small_array_of(const json& j) noexcept {
+        return *j.m_value.small_arr;
+    }
+
+    static SmallArray2* small_array_ptr(json& j) noexcept {
+        return j.m_value.small_arr;
+    }
+
+    static json make_small_array(json&& v0) {
+        json j;
+        j.m_type = json::value_t::array;
+        j.m_storage = 2u;
+        j.m_value.small_arr = json::create_small_array1(std::move(v0));
+        return j;
+    }
+
+    static json make_small_array(json&& v0, json&& v1) {
+        json j;
+        j.m_type = json::value_t::array;
+        j.m_storage = 2u;
+        j.m_value.small_arr = json::create_small_array2(std::move(v0), std::move(v1));
+        return j;
+    }
+
+    static void drop_small_array_const_cache(SmallArray2* sa) noexcept {
+        if (sa == nullptr) {
+            return;
+        }
+        if (void* mv = sa->materialized_vec.exchange(nullptr, std::memory_order_acq_rel)) {
+            auto* vec = static_cast<json::array_t*>(mv);
+            json::json_value::destroy_container(vec);
+        }
     }
 
     static json make_lazy(const json::value_t type, LazyHeader* node) noexcept {
@@ -1592,7 +1640,7 @@ struct json_access {
     }
 
     static bool is_lazy(const json& j) noexcept {
-        return j.m_storage != 0u;
+        return j.m_storage == 1u;
     }
 
     static LazyHeader* lazy_node(const json& j) noexcept {
@@ -1944,9 +1992,11 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
         return is_arr ? json_access::make_array() : json_access::make_object();
     }
     if (is_arr && len <= 8u) {
+        yyjson_val* elems[8];
         bool all_scalar = true;
         yyjson_val* elem = unsafe_yyjson_get_first(val);
         for (std::size_t i = 0u; i < len; ++i) {
+            elems[i] = elem;
             if (yyjson_is_ctn(elem)) {
                 all_scalar = false;
                 break;
@@ -1956,6 +2006,12 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
             }
         }
         if (all_scalar) {
+            if (len == 1u) {
+                return json_access::make_small_array(make_node(elems[0]));
+            }
+            if (len == 2u) {
+                return json_access::make_small_array(make_node(elems[0]), make_node(elems[1]));
+            }
             json::array_t* arr = json_access::create_array_cap(len);
             struct ArrGuard {
                 json::array_t* p;
@@ -1965,12 +2021,8 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
                     }
                 }
             } guard{arr};
-            elem = unsafe_yyjson_get_first(val);
             for (std::size_t i = 0u; i < len; ++i) {
-                arr->emplace_back(make_node(elem));
-                if (i + 1u < len) {
-                    elem = unsafe_yyjson_get_next(elem);
-                }
+                arr->emplace_back(make_node(elems[i]));
             }
             guard.p = nullptr;
             return json_access::make_from_array_ptr(arr);
@@ -2322,6 +2374,64 @@ void* lazy_clear(LazyHeader* hdr, const value_t type) noexcept {
     }
 }
 
+namespace {
+
+inline bool array_view_equal(const json& lhs, const json& rhs) {
+    if (json_access::is_small_array(lhs)) {
+        const auto& sa = json_access::small_array_of(lhs);
+        if (json_access::is_small_array(rhs)) {
+            const auto& sb = json_access::small_array_of(rhs);
+            if (sa.count != sb.count) {
+                return false;
+            }
+            for (std::size_t i = 0u; i < sa.count; ++i) {
+                if (!(sa.elem(i) == sb.elem(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        const auto* bv = json_access::const_array_of(rhs);
+        if (sa.count != bv->size()) {
+            return false;
+        }
+        for (std::size_t i = 0u; i < sa.count; ++i) {
+            if (!(sa.elem(i) == (*bv)[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (json_access::is_small_array(rhs)) {
+        return array_view_equal(rhs, lhs);
+    }
+    return *json_access::const_array_of(lhs) == *json_access::const_array_of(rhs);
+}
+
+inline bool array_view_less(const json& lhs, const json& rhs) {
+    if (!json_access::is_small_array(lhs) && !json_access::is_small_array(rhs)) {
+        return *json_access::const_array_of(lhs) < *json_access::const_array_of(rhs);
+    }
+    const std::size_t ln = lhs.size();
+    const std::size_t rn = rhs.size();
+    const std::size_t common = (std::min)(ln, rn);
+    const auto* la = json_access::is_small_array(lhs) ? nullptr : json_access::const_array_of(lhs);
+    const auto* ra = json_access::is_small_array(rhs) ? nullptr : json_access::const_array_of(rhs);
+    for (std::size_t i = 0u; i < common; ++i) {
+        const json& le = la != nullptr ? (*la)[i] : json_access::small_array_of(lhs).elem(i);
+        const json& re = ra != nullptr ? (*ra)[i] : json_access::small_array_of(rhs).elem(i);
+        if (le < re) {
+            return true;
+        }
+        if (re < le) {
+            return false;
+        }
+    }
+    return ln < rn;
+}
+
+} // namespace
+
 bool lazy_equal(const json& lhs, const json& rhs) noexcept {
     const auto lhs_type = json_access::type_of(lhs);
     if (lhs_type != json_access::type_of(rhs)) {
@@ -2336,7 +2446,7 @@ bool lazy_equal(const json& lhs, const json& rhs) noexcept {
             return false;
         }
         if (lhs_type == value_t::array) {
-            return *json_access::const_array_of(lhs) == *json_access::const_array_of(rhs);
+            return array_view_equal(lhs, rhs);
         }
         if (lhs_type == value_t::object) {
             return *json_access::const_object_of(lhs) == *json_access::const_object_of(rhs);
@@ -2359,7 +2469,7 @@ bool lazy_less(const json& lhs, const json& rhs) noexcept {
     }
     try {
         if (lhs_type == value_t::array) {
-            return *json_access::const_array_of(lhs) < *json_access::const_array_of(rhs);
+            return array_view_less(lhs, rhs);
         }
         if (lhs_type == value_t::object) {
             return *json_access::const_object_of(lhs) < *json_access::const_object_of(rhs);
@@ -2384,21 +2494,36 @@ void lazy_materialize_deep(json& root) {
         json* cur = stack.back();
         stack.pop_back();
         if (cur->is_array()) {
-            auto* arr = json_access::detach_array(*cur);
-            for (auto& elem : *arr) {
-                if (elem.is_string()) {
-                    json_access::detach_shared_string(elem);
-                } else if (elem.is_array() || elem.is_object()) {
-                    stack.push_back(&elem);
+            if (json_access::is_small_array(*cur)) {
+                auto* sa = json_access::small_array_ptr(*cur);
+                json_access::drop_small_array_const_cache(sa);
+                for (std::size_t i = 0u; i < sa->count; ++i) {
+                    json& elem = sa->elem(i);
+                    if (elem.is_string()) {
+                        json_access::detach_shared_string(elem);
+                    } else if (elem.is_array() || elem.is_object()) {
+                        stack.push_back(&elem);
+                    }
+                }
+            } else if (!json_access::is_empty_container(*cur)) {
+                auto* arr = json_access::detach_array(*cur);
+                for (auto& elem : *arr) {
+                    if (elem.is_string()) {
+                        json_access::detach_shared_string(elem);
+                    } else if (elem.is_array() || elem.is_object()) {
+                        stack.push_back(&elem);
+                    }
                 }
             }
         } else if (cur->is_object()) {
-            auto* obj = json_access::detach_object(*cur);
-            for (auto& kv : *obj) {
-                if (kv.second.is_string()) {
-                    json_access::detach_shared_string(kv.second);
-                } else if (kv.second.is_array() || kv.second.is_object()) {
-                    stack.push_back(&kv.second);
+            if (!json_access::is_empty_container(*cur)) {
+                auto* obj = json_access::detach_object(*cur);
+                for (auto& kv : *obj) {
+                    if (kv.second.is_string()) {
+                        json_access::detach_shared_string(kv.second);
+                    } else if (kv.second.is_array() || kv.second.is_object()) {
+                        stack.push_back(&kv.second);
+                    }
                 }
             }
         }
@@ -2931,6 +3056,58 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
     }
 }
 
+inline void dump_small_array_compact_strict(DumpBuffer& out, const SmallArray2& sa) {
+    out.push('[');
+    for (std::size_t i = 0u; i < sa.count; ++i) {
+        if (i > 0u) {
+            out.push(',');
+        }
+        dump_compact_strict(out, sa.elem(i));
+    }
+    out.push(']');
+}
+
+inline void dump_small_array_value(DumpBuffer& out, const SmallArray2& sa,
+                                   const bool pretty_print, const bool ensure_ascii,
+                                   const error_handler_t error_handler,
+                                   const unsigned int indent_step, std::string& indent_string,
+                                   const unsigned int current_indent) {
+    if (sa.count == 0u) {
+        out.append("[]", 2);
+        return;
+    }
+    if (pretty_print) {
+        out.append("[\n", 2);
+        const unsigned int new_indent = current_indent + indent_step;
+        if (indent_string.size() < new_indent) {
+            indent_string.resize(
+                (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
+        }
+        for (std::size_t i = 0u; i < sa.count; ++i) {
+            out.append(indent_string.data(), new_indent);
+            dump_value(out, sa.elem(i), true, ensure_ascii, error_handler, indent_step,
+                       indent_string, new_indent);
+            if (i + 1u < sa.count) {
+                out.append(",\n", 2);
+            } else {
+                out.push('\n');
+            }
+        }
+        out.append(indent_string.data(), current_indent);
+        out.push(']');
+    } else {
+        out.push('[');
+        for (std::size_t i = 0u; i < sa.count; ++i) {
+            if (i > 0u) {
+                out.push(',');
+            }
+            dump_value(out, sa.elem(i), false, ensure_ascii, error_handler, indent_step,
+                       indent_string, current_indent);
+        }
+        out.push(']');
+    }
+}
+
 void dump_compact_strict(DumpBuffer& out, const json& val) {
     switch (json_access::type_of(val)) {
         case value_t::null:
@@ -2965,8 +3142,12 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
             if (json_access::is_lazy(val)) {
                 dump_yyjson_node_compact_strict(
                     out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::array);
+            } else if (json_access::is_small_array(val)) {
+                dump_small_array_compact_strict(out, json_access::small_array_of(val));
+            } else if (json_access::is_empty_container(val)) {
+                out.append("[]", 2);
             } else {
-                dump_eager_array_compact_strict(out, json_access::array_of(val));
+                dump_eager_array_compact_strict(out, *json_access::raw_array_ptr(val));
             }
             return;
 
@@ -2974,8 +3155,10 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
             if (json_access::is_lazy(val)) {
                 dump_yyjson_node_compact_strict(
                     out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::object);
+            } else if (json_access::is_empty_container(val)) {
+                out.append("{}", 2);
             } else {
-                dump_eager_object_compact_strict(out, json_access::object_of(val));
+                dump_eager_object_compact_strict(out, *json_access::raw_object_ptr(val));
             }
             return;
 
@@ -3029,9 +3212,16 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
                 dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
                                  value_t::array, pretty_print, ensure_ascii, error_handler,
                                  indent_step, indent_string, current_indent);
+            } else if (json_access::is_small_array(val)) {
+                dump_small_array_value(out, json_access::small_array_of(val), pretty_print,
+                                       ensure_ascii, error_handler, indent_step, indent_string,
+                                       current_indent);
+            } else if (json_access::is_empty_container(val)) {
+                out.append("[]", 2);
             } else {
-                dump_eager_array_value(out, json_access::array_of(val), pretty_print, ensure_ascii,
-                                       error_handler, indent_step, indent_string, current_indent);
+                dump_eager_array_value(out, *json_access::raw_array_ptr(val), pretty_print,
+                                       ensure_ascii, error_handler, indent_step, indent_string,
+                                       current_indent);
             }
             return;
 
@@ -3040,8 +3230,10 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
                 dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
                                  value_t::object, pretty_print, ensure_ascii, error_handler,
                                  indent_step, indent_string, current_indent);
+            } else if (json_access::is_empty_container(val)) {
+                out.append("{}", 2);
             } else {
-                dump_eager_object_value(out, json_access::object_of(val), pretty_print,
+                dump_eager_object_value(out, *json_access::raw_object_ptr(val), pretty_print,
                                         ensure_ascii, error_handler, indent_step, indent_string,
                                         current_indent);
             }
@@ -4685,6 +4877,16 @@ bool try_dump_yyjson_direct(const json& val, std::string& out) {
 
 } // namespace
 } // namespace detail
+
+const json::array_t& json::empty_array_singleton() noexcept {
+    static const array_t instance{};
+    return instance;
+}
+
+const json::object_t& json::empty_object_singleton() noexcept {
+    static const object_t instance{};
+    return instance;
+}
 
 json::string_t json::dump(const int indent, const char indent_char, const bool ensure_ascii,
                           const error_handler_t error_handler) const {

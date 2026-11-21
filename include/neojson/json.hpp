@@ -24,6 +24,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <ostream>
@@ -47,6 +48,16 @@
 #define NEOJSON_NOINLINE __declspec(noinline)
 #else
 #define NEOJSON_NOINLINE
+#endif
+#endif
+
+#ifndef NEOJSON_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define NEOJSON_ALWAYS_INLINE __attribute__((always_inline)) inline
+#elif defined(_MSC_VER)
+#define NEOJSON_ALWAYS_INLINE __forceinline
+#else
+#define NEOJSON_ALWAYS_INLINE inline
 #endif
 #endif
 
@@ -202,6 +213,8 @@ struct SharedString {
     explicit SharedString(Args&&... args) : value(std::forward<Args>(args)...) {}
 };
 static_assert(sizeof(SharedString) <= 48u, "SharedString should fit in small pooled slab");
+
+struct SmallArray2;
 
 void lazy_release(LazyHeader* node, value_t type) noexcept;
 const void* lazy_materialize_const(LazyHeader* node, value_t type);
@@ -1440,11 +1453,11 @@ public:
         return element_at(m_object, idx_ + n);
     }
 
-    const typename BasicJsonType::object_t::key_type& key() const {
+    NEOJSON_ALWAYS_INLINE const typename BasicJsonType::object_t::key_type& key() const {
         return key_at(m_object, idx_);
     }
 
-    reference value() const {
+    NEOJSON_ALWAYS_INLINE reference value() const {
         return element_at(m_object, idx_);
     }
 
@@ -1484,36 +1497,81 @@ private:
     // MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
     // `for (auto it = j.begin(); it != j.end(); ++it)` each value() after the first returned the previous element
     // while key() returned the right one. Passed by value in two words, the iterator need not be in memory at all.
-    static reference element_at(pointer object, difference_type idx) {
+    NEOJSON_NOINLINE static reference element_at_slow(pointer object, difference_type idx) {
         if (object == nullptr) {
             throw_invalid_iterator(214, "cannot get value");
         }
         switch (object->m_type) {
             case value_t::object: {
                 if constexpr (std::is_const<BasicJsonType>::value) {
-                    const auto* obj = object->const_object();
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                    const typename BasicJsonType::object_t* obj = nullptr;
+                    if (object->m_storage == 0u) {
+                        obj = object->m_value.object;
+                    } else if (object->m_storage == 1u) {
+                        void* mat =
+                            object->m_value.lazy->materialized.load(std::memory_order_acquire);
+                        obj = mat != nullptr
+                                  ? static_cast<const typename BasicJsonType::object_t*>(mat)
+                                  : object->const_object_slow();
+                    } else {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    if (static_cast<std::size_t>(idx) >= obj->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*obj)[static_cast<std::size_t>(idx)].second;
                 } else {
+                    if (object->m_storage == 3u) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
                     auto* obj = object->mutable_object();
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                    if (static_cast<std::size_t>(idx) >= obj->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*obj)[static_cast<std::size_t>(idx)].second;
                 }
             }
             case value_t::array: {
+                if (object->m_storage == 2u) {
+                    const auto* csa = object->m_value.small_arr;
+                    const std::size_t sz = BasicJsonType::small_arr_size(csa);
+                    if (static_cast<std::size_t>(idx) >= sz) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    if constexpr (std::is_const<BasicJsonType>::value) {
+                        return BasicJsonType::small_arr_elem(csa, static_cast<std::size_t>(idx));
+                    } else {
+                        if (BasicJsonType::small_arr_has_const_cache(csa)) {
+                            auto* arr = object->promote_small_array_mutable();
+                            return (*arr)[static_cast<std::size_t>(idx)];
+                        }
+                        return BasicJsonType::small_arr_elem(object->m_value.small_arr,
+                                                             static_cast<std::size_t>(idx));
+                    }
+                }
                 if constexpr (std::is_const<BasicJsonType>::value) {
-                    const auto* arr = object->const_array();
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                    const typename BasicJsonType::array_t* arr = nullptr;
+                    if (object->m_storage == 0u) {
+                        arr = object->m_value.array;
+                    } else if (object->m_storage == 1u) {
+                        void* mat =
+                            object->m_value.lazy->materialized.load(std::memory_order_acquire);
+                        arr = mat != nullptr
+                                  ? static_cast<const typename BasicJsonType::array_t*>(mat)
+                                  : object->const_array_slow();
+                    } else {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    if (static_cast<std::size_t>(idx) >= arr->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*arr)[static_cast<std::size_t>(idx)];
                 } else {
+                    if (object->m_storage == 3u) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
                     auto* arr = object->mutable_array();
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                    if (static_cast<std::size_t>(idx) >= arr->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*arr)[static_cast<std::size_t>(idx)];
@@ -1529,16 +1587,100 @@ private:
         }
     }
 
-    static const typename BasicJsonType::object_t::key_type& key_at(pointer object,
-                                                                     difference_type idx) {
+    NEOJSON_ALWAYS_INLINE static reference element_at(pointer object, difference_type idx) {
+        if (object != nullptr && idx >= 0) {
+            const auto u_idx = static_cast<std::size_t>(idx);
+            if (object->m_type == value_t::array) {
+                if (object->m_storage == 0u) {
+                    auto* arr = object->m_value.array;
+                    if (u_idx < arr->size()) {
+                        return (*arr)[u_idx];
+                    }
+                } else if (object->m_storage == 2u) {
+                    auto* sa = object->m_value.small_arr;
+                    if (u_idx < BasicJsonType::small_arr_size(sa)) {
+                        if constexpr (std::is_const<BasicJsonType>::value) {
+                            return BasicJsonType::small_arr_elem(sa, u_idx);
+                        } else if (!BasicJsonType::small_arr_has_const_cache(sa)) {
+                            return BasicJsonType::small_arr_elem(sa, u_idx);
+                        }
+                    }
+                } else if constexpr (std::is_const<BasicJsonType>::value) {
+                    if (object->m_storage == 1u) {
+                        if (void* mat = object->m_value.lazy->materialized.load(
+                                std::memory_order_acquire)) {
+                            const auto* arr =
+                                static_cast<const typename BasicJsonType::array_t*>(mat);
+                            if (u_idx < arr->size()) {
+                                return (*arr)[u_idx];
+                            }
+                        }
+                    }
+                }
+            } else if (object->m_type == value_t::object) {
+                if (object->m_storage == 0u) {
+                    auto* obj = object->m_value.object;
+                    if (u_idx < obj->size()) {
+                        return (*obj)[u_idx].second;
+                    }
+                } else if constexpr (std::is_const<BasicJsonType>::value) {
+                    if (object->m_storage == 1u) {
+                        if (void* mat = object->m_value.lazy->materialized.load(
+                                std::memory_order_acquire)) {
+                            const auto* obj =
+                                static_cast<const typename BasicJsonType::object_t*>(mat);
+                            if (u_idx < obj->size()) {
+                                return (*obj)[u_idx].second;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return element_at_slow(object, idx);
+    }
+
+    NEOJSON_NOINLINE static const typename BasicJsonType::object_t::key_type& key_at_slow(
+        pointer object, difference_type idx) {
         if (object == nullptr || object->m_type != value_t::object) {
             throw_invalid_iterator(207, "cannot use key() for non-object iterators");
         }
-        const auto* obj = object->const_object();
+        const typename BasicJsonType::object_t* obj = nullptr;
+        if (object->m_storage == 0u) {
+            obj = object->m_value.object;
+        } else if (object->m_storage == 1u) {
+            void* mat = object->m_value.lazy->materialized.load(std::memory_order_acquire);
+            obj = mat != nullptr ? static_cast<const typename BasicJsonType::object_t*>(mat)
+                                 : object->const_object_slow();
+        } else {
+            throw_invalid_iterator(214, "cannot get value");
+        }
         if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
             throw_invalid_iterator(214, "cannot get value");
         }
         return (*obj)[static_cast<std::size_t>(idx)].first;
+    }
+
+    NEOJSON_ALWAYS_INLINE static const typename BasicJsonType::object_t::key_type& key_at(
+        pointer object, difference_type idx) {
+        if (object != nullptr && object->m_type == value_t::object && idx >= 0) {
+            const auto u_idx = static_cast<std::size_t>(idx);
+            if (object->m_storage == 0u) {
+                const auto* obj = object->m_value.object;
+                if (u_idx < obj->size()) {
+                    return (*obj)[u_idx].first;
+                }
+            } else if (object->m_storage == 1u) {
+                if (void* mat =
+                        object->m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                    const auto* obj = static_cast<const typename BasicJsonType::object_t*>(mat);
+                    if (u_idx < obj->size()) {
+                        return (*obj)[u_idx].first;
+                    }
+                }
+            }
+        }
+        return key_at_slow(object, idx);
     }
 
     pointer m_object = nullptr;
@@ -2160,6 +2302,23 @@ struct external_constructor<value_t::array> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::array_t& arr) {
         j.destroy_value();
+        if (arr.empty()) {
+            j.m_storage = 3u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (arr.size() == 1u) {
+            j.m_value.small_arr = BasicJsonType::create_small_array1(arr[0]);
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (arr.size() == 2u) {
+            j.m_value.small_arr = BasicJsonType::create_small_array2_copy(arr[0], arr[1]);
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
         j.m_value.array = BasicJsonType::create_array(arr);
         j.m_type = value_t::array;
     }
@@ -2167,6 +2326,24 @@ struct external_constructor<value_t::array> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::array_t&& arr) {
         j.destroy_value();
+        if (arr.empty()) {
+            j.m_storage = 3u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (arr.size() == 1u) {
+            j.m_value.small_arr = BasicJsonType::create_small_array1(std::move(arr[0]));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (arr.size() == 2u) {
+            j.m_value.small_arr =
+                BasicJsonType::create_small_array2(std::move(arr[0]), std::move(arr[1]));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
         j.m_value.array = BasicJsonType::create_array(std::move(arr));
         j.m_type = value_t::array;
     }
@@ -2179,13 +2356,62 @@ struct external_constructor<value_t::array> {
         using std::begin;
         using std::end;
         j.destroy_value();
-        j.m_value.array = BasicJsonType::create_array(begin(arr), end(arr));
+        auto it = begin(arr);
+        auto e = end(arr);
+        if (it == e) {
+            j.m_storage = 3u;
+            j.m_type = value_t::array;
+            return;
+        }
+        BasicJsonType first_elem(*it);
+        ++it;
+        if (it == e) {
+            j.m_value.small_arr = BasicJsonType::create_small_array1(std::move(first_elem));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
+        BasicJsonType second_elem(*it);
+        ++it;
+        if (it == e) {
+            j.m_value.small_arr = BasicJsonType::create_small_array2(std::move(first_elem),
+                                                                     std::move(second_elem));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
+        auto* out = BasicJsonType::create_array();
+        j.m_value.array = out;
         j.m_type = value_t::array;
+        out->emplace_back(std::move(first_elem));
+        out->emplace_back(std::move(second_elem));
+        for (; it != e; ++it) {
+            out->emplace_back(*it);
+        }
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const std::vector<bool>& b) {
         j.destroy_value();
+        if (b.empty()) {
+            j.m_storage = 3u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (b.size() == 1u) {
+            j.m_value.small_arr =
+                BasicJsonType::create_small_array1(BasicJsonType(static_cast<bool>(b[0])));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (b.size() == 2u) {
+            j.m_value.small_arr = BasicJsonType::create_small_array2(
+                BasicJsonType(static_cast<bool>(b[0])), BasicJsonType(static_cast<bool>(b[1])));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
         auto* arr = BasicJsonType::create_array();
         j.m_value.array = arr;
         j.m_type = value_t::array;
@@ -2199,6 +2425,24 @@ struct external_constructor<value_t::array> {
               enable_if_t<std::is_convertible<T, BasicJsonType>::value, int> = 0>
     static void construct(BasicJsonType& j, const std::valarray<T>& arr) {
         j.destroy_value();
+        if (arr.size() == 0u) {
+            j.m_storage = 3u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (arr.size() == 1u) {
+            j.m_value.small_arr = BasicJsonType::create_small_array1(BasicJsonType(arr[0]));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
+        if (arr.size() == 2u) {
+            j.m_value.small_arr = BasicJsonType::create_small_array2(BasicJsonType(arr[0]),
+                                                                     BasicJsonType(arr[1]));
+            j.m_storage = 2u;
+            j.m_type = value_t::array;
+            return;
+        }
         j.m_value.array = BasicJsonType::create_array(std::begin(arr), std::end(arr));
         j.m_type = value_t::array;
     }
@@ -2209,14 +2453,22 @@ struct external_constructor<value_t::object> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::object_t& obj) {
         j.destroy_value();
-        j.m_value.object = BasicJsonType::create_object(obj);
+        if (obj.empty()) {
+            j.m_storage = 3u;
+        } else {
+            j.m_value.object = BasicJsonType::create_object(obj);
+        }
         j.m_type = value_t::object;
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::object_t&& obj) {
         j.destroy_value();
-        j.m_value.object = BasicJsonType::create_object(std::move(obj));
+        if (obj.empty()) {
+            j.m_storage = 3u;
+        } else {
+            j.m_value.object = BasicJsonType::create_object(std::move(obj));
+        }
         j.m_type = value_t::object;
     }
 
@@ -2228,10 +2480,16 @@ struct external_constructor<value_t::object> {
         using std::begin;
         using std::end;
         j.destroy_value();
+        auto it = begin(obj);
+        auto e = end(obj);
+        j.m_type = value_t::object;
+        if (it == e) {
+            j.m_storage = 3u;
+            return;
+        }
         auto* o = BasicJsonType::create_object();
         j.m_value.object = o;
-        j.m_type = value_t::object;
-        for (auto it = begin(obj); it != end(obj); ++it) {
+        for (; it != e; ++it) {
             o->emplace(it->first, it->second);
         }
     }
@@ -3305,12 +3563,10 @@ private:
     }
 
     static detail::SharedString* share_or_clone_string(detail::SharedString* src) {
-        std::uint32_t rc = src->refcount.load(std::memory_order_acquire);
-        while (rc != 0u && rc != (std::numeric_limits<std::uint32_t>::max)()) {
-            if (src->refcount.compare_exchange_weak(rc, rc + 1u, std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
-                return src;
-            }
+        const std::uint32_t rc = src->refcount.load(std::memory_order_acquire);
+        if (rc != 0u && rc < 0x80000000u) {
+            src->refcount.fetch_add(1u, std::memory_order_relaxed);
+            return src;
         }
         return create_string(src->value);
     }
@@ -3351,6 +3607,27 @@ private:
         return s->value;
     }
 
+    static const array_t& empty_array_singleton() noexcept;
+    static const object_t& empty_object_singleton() noexcept;
+
+    static detail::SmallArray2* create_small_array1(json&& v);
+    static detail::SmallArray2* create_small_array1(const json& v);
+    static detail::SmallArray2* create_small_array2(json&& v0, json&& v1);
+    static detail::SmallArray2* create_small_array2_copy(const json& v0, const json& v1);
+    static detail::SmallArray2* create_small_array_default(std::size_t n);
+    static detail::SmallArray2* clone_small_array(const detail::SmallArray2* sa);
+    NEOJSON_NOINLINE inline static void destroy_small_array_slow(
+        detail::SmallArray2*& sa) noexcept;
+    NEOJSON_ALWAYS_INLINE static void destroy_small_array(detail::SmallArray2*& sa) noexcept;
+    static std::size_t small_arr_size(const detail::SmallArray2* sa) noexcept;
+    static json& small_arr_elem(detail::SmallArray2* sa, std::size_t idx) noexcept;
+    static const json& small_arr_elem(const detail::SmallArray2* sa, std::size_t idx) noexcept;
+    static const array_t* small_arr_const_vec(const detail::SmallArray2* sa);
+    static bool small_arr_has_const_cache(const detail::SmallArray2* sa) noexcept;
+    static void drop_small_array_const_cache(detail::SmallArray2* sa) noexcept;
+    static void take_small_array_containers(detail::SmallArray2& sa, std::vector<json>& stack);
+    static void release_small_array_containers(detail::SmallArray2& sa) noexcept;
+
     template <typename... Args>
     static array_t* create_array(Args&&... args) {
         void* mem = detail::pool_alloc(sizeof(array_t));
@@ -3390,6 +3667,7 @@ private:
     union json_value {
         object_t* object;
         array_t* array;
+        detail::SmallArray2* small_arr;
         detail::SharedString* string;
         detail::LazyHeader* lazy;
         boolean_t boolean;
@@ -3405,10 +3683,10 @@ private:
         json_value(value_t t) {
             switch (t) {
                 case value_t::object:
-                    object = create_object();
+                    object = nullptr;
                     break;
                 case value_t::array:
-                    array = create_array();
+                    array = nullptr;
                     break;
                 case value_t::string:
                     string = create_string();
@@ -3436,12 +3714,19 @@ private:
         }
 
         static bool is_container(const json& j) noexcept {
-            if (j.m_storage != 0u) {
+            if (j.m_storage == 1u) {
                 return j.m_value.lazy != nullptr &&
                        j.m_value.lazy->refcount.load(std::memory_order_acquire) == 1u &&
                        j.m_value.lazy->materialized.load(std::memory_order_acquire) != nullptr;
             }
-            return j.m_type == value_t::array || j.m_type == value_t::object;
+            if (j.m_storage == 2u) {
+                return j.m_type == value_t::array && j.m_value.small_arr != nullptr;
+            }
+            if (j.m_storage == 3u) {
+                return false;
+            }
+            return (j.m_type == value_t::array && j.m_value.array != nullptr) ||
+                   (j.m_type == value_t::object && j.m_value.object != nullptr);
         }
 
         static json& element_of(json& j) noexcept {
@@ -3459,6 +3744,39 @@ private:
                 json& child = element_of(element);
                 if (is_container(child)) {
                     stack.push_back(std::move(child));
+                }
+            }
+        }
+
+        static void drain_container_stack(std::vector<json>& stack) {
+            while (!stack.empty()) {
+                json current(std::move(stack.back()));
+                stack.pop_back();
+                if (current.m_storage == 1u) {
+                    void* mat = detail::lazy_steal_owned_materialized(
+                        current.m_value.lazy, current.m_type);
+                    if (mat != nullptr) {
+                        current.m_storage = 0u;
+                        if (current.m_type == value_t::array) {
+                            current.m_value.array = static_cast<array_t*>(mat);
+                            take_containers(*current.m_value.array, stack);
+                        } else {
+                            current.m_value.object = static_cast<object_t*>(mat);
+                            take_containers(*current.m_value.object, stack);
+                        }
+                    }
+                } else if (current.m_storage == 2u) {
+                    if (current.m_type == value_t::array && current.m_value.small_arr != nullptr) {
+                        take_small_array_containers(*current.m_value.small_arr, stack);
+                    }
+                } else if (current.m_storage == 3u) {
+                    continue;
+                } else if (current.m_type == value_t::array) {
+                    if (current.m_value.array != nullptr) {
+                        take_containers(*current.m_value.array, stack);
+                    }
+                } else if (current.m_value.object != nullptr) {
+                    take_containers(*current.m_value.object, stack);
                 }
             }
         }
@@ -3483,28 +3801,7 @@ private:
             try {
                 std::vector<json> stack;
                 take_containers(c, stack);
-                while (!stack.empty()) {
-                    json current(std::move(stack.back()));
-                    stack.pop_back();
-                    if (current.m_storage != 0u) {
-                        void* mat = detail::lazy_steal_owned_materialized(
-                            current.m_value.lazy, current.m_type);
-                        if (mat != nullptr) {
-                            current.m_storage = 0u;
-                            if (current.m_type == value_t::array) {
-                                current.m_value.array = static_cast<array_t*>(mat);
-                                take_containers(*current.m_value.array, stack);
-                            } else {
-                                current.m_value.object = static_cast<object_t*>(mat);
-                                take_containers(*current.m_value.object, stack);
-                            }
-                        }
-                    } else if (current.m_type == value_t::array) {
-                        take_containers(*current.m_value.array, stack);
-                    } else {
-                        take_containers(*current.m_value.object, stack);
-                    }
-                }
+                drain_container_stack(stack);
             } catch (...) {
             }
         }
@@ -3564,36 +3861,11 @@ private:
                    static_cast<std::uint8_t>(static_cast<unsigned>(t) - 1u)) < 3u;
     }
 
-    NEOJSON_NOINLINE void destroy_non_trivial() noexcept {
-        if (m_storage != 0u) {
-            detail::lazy_release(m_value.lazy, m_type);
-        } else {
-            m_value.destroy(m_type);
-        }
-    }
-
-    NEOJSON_NOINLINE void copy_non_trivial(const json& other) {
-        if (m_storage != 0u) {
-            m_value.lazy->refcount.fetch_add(1u, std::memory_order_relaxed);
-            return;
-        }
-        switch (m_type) {
-            case value_t::object:
-                m_value.object = create_object(*(other.m_value.object));
-                break;
-            case value_t::array:
-                m_value.array = create_array(*(other.m_value.array));
-                break;
-            case value_t::string:
-                m_value.string = share_or_clone_string(other.m_value.string);
-                break;
-            default:
-                break;
-        }
-    }
+    NEOJSON_NOINLINE inline void destroy_non_trivial() noexcept;
+    NEOJSON_NOINLINE inline void copy_non_trivial(const json& other);
 
     void destroy_value() noexcept {
-        if (has_heap_payload(m_type)) {
+        if (has_heap_payload(m_type) && m_storage != 3u) {
             destroy_non_trivial();
         }
         m_storage = 0u;
@@ -3601,45 +3873,50 @@ private:
         m_type = value_t::null;
     }
 
-    object_t* mutable_object() {
-        if (m_storage != 0u) {
-            m_value.object = static_cast<object_t*>(
-                detail::lazy_detach_mutable(m_value.lazy, m_type));
-            m_storage = 0u;
+    NEOJSON_NOINLINE inline object_t* mutable_object_slow();
+    NEOJSON_NOINLINE inline array_t* mutable_array_slow();
+    NEOJSON_NOINLINE inline const object_t* const_object_slow() const;
+    NEOJSON_NOINLINE inline const array_t* const_array_slow() const;
+
+    NEOJSON_ALWAYS_INLINE object_t* mutable_object() {
+        if (m_storage == 0u) {
+            return m_value.object;
         }
-        return m_value.object;
+        return mutable_object_slow();
     }
 
-    array_t* mutable_array() {
-        if (m_storage != 0u) {
-            m_value.array = static_cast<array_t*>(
-                detail::lazy_detach_mutable(m_value.lazy, m_type));
-            m_storage = 0u;
+    NEOJSON_ALWAYS_INLINE array_t* mutable_array() {
+        if (m_storage == 0u) {
+            return m_value.array;
         }
-        return m_value.array;
+        return mutable_array_slow();
     }
 
-    const object_t* const_object() const {
-        if (m_storage != 0u) {
-            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
-                return static_cast<const object_t*>(mat);
-            }
-            return static_cast<const object_t*>(
-                detail::lazy_materialize_const(m_value.lazy, m_type));
+    NEOJSON_ALWAYS_INLINE const object_t* const_object() const {
+        if (m_storage == 0u) {
+            return m_value.object;
         }
-        return m_value.object;
+        if (m_storage == 3u) {
+            return &empty_object_singleton();
+        }
+        return const_object_slow();
     }
 
-    const array_t* const_array() const {
-        if (m_storage != 0u) {
-            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
-                return static_cast<const array_t*>(mat);
-            }
-            return static_cast<const array_t*>(
-                detail::lazy_materialize_const(m_value.lazy, m_type));
+    NEOJSON_ALWAYS_INLINE const array_t* const_array() const {
+        if (m_storage == 0u) {
+            return m_value.array;
         }
-        return m_value.array;
+        if (m_storage == 3u) {
+            return &empty_array_singleton();
+        }
+        return const_array_slow();
     }
+
+    NEOJSON_NOINLINE inline array_t* promote_small_array_mutable(std::size_t reserve_cap = 0u);
+    NEOJSON_NOINLINE inline static bool equal_with_small_container(const json& lhs,
+                                                                   const json& rhs) noexcept;
+    NEOJSON_NOINLINE inline static bool less_with_small_container(const json& lhs,
+                                                                  const json& rhs) noexcept;
 
 public:
     // ==================== Construction & Assignment ====================
@@ -3648,7 +3925,12 @@ public:
 
     json(std::nullptr_t) noexcept : m_type(value_t::null), m_value() {}
 
-    json(const value_t v) : m_type(v), m_value(v) {}
+    json(const value_t v)
+        : m_type(v),
+          m_storage((v == value_t::array || v == value_t::object)
+                        ? static_cast<std::uint8_t>(3u)
+                        : static_cast<std::uint8_t>(0u)),
+          m_value(v) {}
 
     template <typename CompatibleType,
               typename U = detail::uncvref_t<CompatibleType>,
@@ -3669,12 +3951,11 @@ public:
          value_t manual_type = value_t::array) {
         if (init.size() == 0) {
             if (!type_deduction && manual_type == value_t::array) {
-                m_value.array = create_array();
                 m_type = value_t::array;
             } else {
-                m_value.object = create_object();
                 m_type = value_t::object;
             }
+            m_storage = 3u;
             return;
         }
         bool is_an_object = std::all_of(
@@ -3702,6 +3983,16 @@ public:
                     extract_string_key((*pair_arr)[0]),
                     std::move((*pair_arr)[1]));
             }
+        } else if (init.size() == 1u) {
+            m_value.small_arr = create_small_array1(init.begin()->moved_or_copied());
+            m_storage = 2u;
+            m_type = value_t::array;
+        } else if (init.size() == 2u) {
+            json e0 = init.begin()->moved_or_copied();
+            json e1 = (init.begin() + 1)->moved_or_copied();
+            m_value.small_arr = create_small_array2(std::move(e0), std::move(e1));
+            m_storage = 2u;
+            m_type = value_t::array;
         } else {
             m_value.array = create_array();
             m_type = value_t::array;
@@ -3713,8 +4004,21 @@ public:
     }
 
     json(size_type cnt, const json& val) {
-        m_value.array = create_array(cnt, val);
-        m_type = value_t::array;
+        if (cnt == 0u) {
+            m_storage = 3u;
+            m_type = value_t::array;
+        } else if (cnt == 1u) {
+            m_value.small_arr = create_small_array1(val);
+            m_storage = 2u;
+            m_type = value_t::array;
+        } else if (cnt == 2u) {
+            m_value.small_arr = create_small_array2_copy(val, val);
+            m_storage = 2u;
+            m_type = value_t::array;
+        } else {
+            m_value.array = create_array(cnt, val);
+            m_type = value_t::array;
+        }
     }
 
     template <class InputIT,
@@ -3748,13 +4052,48 @@ public:
                 break;
             }
             case value_t::array: {
+                if (first.m_object->m_storage == 2u) {
+                    const detail::SmallArray2* sa = first.m_object->m_value.small_arr;
+                    const auto sz = static_cast<difference_type>(small_arr_size(sa));
+                    if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
+                        m_type = value_t::null;
+                        throw invalid_iterator::create(204, "iterators out of range");
+                    }
+                    const difference_type slice = last.idx_ - first.idx_;
+                    if (slice == 1) {
+                        m_value.small_arr = create_small_array1(
+                            small_arr_elem(sa, static_cast<std::size_t>(first.idx_)));
+                        m_storage = 2u;
+                    } else if (slice == 2) {
+                        m_value.small_arr = create_small_array2_copy(
+                            small_arr_elem(sa, 0u), small_arr_elem(sa, 1u));
+                        m_storage = 2u;
+                    } else {
+                        m_storage = 3u;
+                    }
+                    break;
+                }
                 const auto* arr = first.m_object->const_array();
                 const auto sz = static_cast<difference_type>(arr->size());
                 if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
                     m_type = value_t::null;
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.array = create_array(arr->begin() + first.idx_, arr->begin() + last.idx_);
+                const difference_type slice = last.idx_ - first.idx_;
+                if (slice == 1) {
+                    m_value.small_arr =
+                        create_small_array1((*arr)[static_cast<std::size_t>(first.idx_)]);
+                    m_storage = 2u;
+                } else if (slice == 2) {
+                    m_value.small_arr = create_small_array2_copy(
+                        (*arr)[static_cast<std::size_t>(first.idx_)],
+                        (*arr)[static_cast<std::size_t>(first.idx_ + 1)]);
+                    m_storage = 2u;
+                } else if (slice > 2) {
+                    m_value.array = create_array(arr->begin() + first.idx_, arr->begin() + last.idx_);
+                } else {
+                    m_storage = 3u;
+                }
                 break;
             }
             case value_t::object: {
@@ -3764,7 +4103,11 @@ public:
                     m_type = value_t::null;
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.object = create_object(obj->begin() + first.idx_, obj->begin() + last.idx_);
+                if (last.idx_ > first.idx_) {
+                    m_value.object = create_object(obj->begin() + first.idx_, obj->begin() + last.idx_);
+                } else {
+                    m_storage = 3u;
+                }
                 break;
             }
             case value_t::null:
@@ -3788,7 +4131,7 @@ public:
 
     json(const json& other)
         : m_type(other.m_type), m_storage(other.m_storage), m_value(other.m_value) {
-        if (has_heap_payload(m_type)) {
+        if (has_heap_payload(m_type) && m_storage != 3u) {
             copy_non_trivial(other);
         }
     }
@@ -3799,7 +4142,7 @@ public:
           m_value(std::exchange(other.m_value, json_value{})) {}
 
     ~json() noexcept {
-        if (has_heap_payload(m_type)) {
+        if (has_heap_payload(m_type) && m_storage != 3u) {
             destroy_non_trivial();
         }
     }
@@ -3886,43 +4229,8 @@ public:
 
     // ==================== Capacity ====================
 
-    bool empty() const noexcept {
-        switch (m_type) {
-            case value_t::null:
-                return true;
-            case value_t::array:
-                return m_storage != 0u ? (m_value.lazy->raw_len == 0u)
-                                       : m_value.array->empty();
-            case value_t::object:
-                return m_storage != 0u ? (m_value.lazy->raw_len == 0u)
-                                       : m_value.object->empty();
-            default:
-                return false;
-        }
-    }
-
-    size_type size() const noexcept {
-        switch (m_type) {
-            case value_t::null:
-                return 0;
-            case value_t::array:
-                return m_storage != 0u ? m_value.lazy->raw_len
-                                       : m_value.array->size();
-            case value_t::object:
-                if (m_storage != 0u) {
-                    if ((m_value.lazy->dedup_state.load(std::memory_order_relaxed) & 1u) != 0u) {
-                        return m_value.lazy->raw_len;
-                    }
-                    if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
-                        return static_cast<const object_t*>(mat)->size();
-                    }
-                    return detail::lazy_size(m_value.lazy, m_type);
-                }
-                return m_value.object->size();
-            default:
-                return 1;
-        }
-    }
+    NEOJSON_ALWAYS_INLINE bool empty() const noexcept;
+    NEOJSON_ALWAYS_INLINE size_type size() const noexcept;
 
     size_type max_size() const noexcept {
         switch (m_type) {
@@ -3937,32 +4245,14 @@ public:
 
     // ==================== Element Access & Lookup ====================
 
-    reference at(size_type idx) {
-        if (is_array()) {
-            auto* arr = mutable_array();
-            if (idx >= arr->size()) {
-                throw out_of_range::create(
-                    401, "array index " + std::to_string(idx) + " is out of range");
-            }
-            return (*arr)[idx];
-        }
-        throw type_error::create(304, std::string("cannot use at() with ") + type_name());
-    }
-
-    const_reference at(size_type idx) const {
-        if (is_array()) {
-            const auto* arr = const_array();
-            if (idx >= arr->size()) {
-                throw out_of_range::create(
-                    401, "array index " + std::to_string(idx) + " is out of range");
-            }
-            return (*arr)[idx];
-        }
-        throw type_error::create(304, std::string("cannot use at() with ") + type_name());
-    }
+    reference at(size_type idx);
+    const_reference at(size_type idx) const;
 
     reference at(const typename object_t::key_type& key) {
         if (is_object()) {
+            if (m_storage == 3u) {
+                throw out_of_range::create(403, "key '" + key + "' not found");
+            }
             auto* obj = mutable_object();
             auto it = obj->find(key);
             if (it == obj->end()) {
@@ -4008,6 +4298,9 @@ public:
     reference at(const KeyType& key) {
         if (is_object()) {
             std::string_view sv(key);
+            if (m_storage == 3u) {
+                throw out_of_range::create(403, "key '" + std::string(sv) + "' not found");
+            }
             auto* obj = mutable_object();
             auto it = obj->find(sv);
             if (it == obj->end()) {
@@ -4047,29 +4340,8 @@ public:
         return ptr.get_checked(this);
     }
 
-    reference operator[](size_type idx) {
-        if (is_null()) {
-            m_value.array = create_array();
-            m_type = value_t::array;
-        }
-        if (is_array()) {
-            auto* arr = mutable_array();
-            if (idx >= arr->size()) {
-                arr->resize(idx + 1);
-            }
-            return (*arr)[idx];
-        }
-        detail::throw_type_error(305, "cannot use operator[] with a numeric argument with ",
-                                 type_name());
-    }
-
-    const_reference operator[](size_type idx) const {
-        if (is_array()) {
-            return (*const_array())[idx];
-        }
-        detail::throw_type_error(305, "cannot use operator[] with a numeric argument with ",
-                                 type_name());
-    }
+    reference operator[](size_type idx);
+    const_reference operator[](size_type idx) const;
 
     reference operator[](const typename object_t::key_type& key) {
         if (is_object()) {
@@ -4324,13 +4596,13 @@ public:
         if (!is_object()) {
             return false;
         }
-        if (m_storage != 0u) {
+        if (m_storage == 1u) {
             if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                 return static_cast<const object_t*>(mat)->contains(key);
             }
             return detail::lazy_contains(m_value.lazy, std::string_view(key));
         }
-        return m_value.object->contains(key);
+        return m_storage == 0u && m_value.object->contains(key);
     }
 
     template <class KeyType,
@@ -4344,13 +4616,13 @@ public:
             return false;
         }
         const std::string_view sv(key);
-        if (m_storage != 0u) {
+        if (m_storage == 1u) {
             if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                 return static_cast<const object_t*>(mat)->contains(sv);
             }
             return detail::lazy_contains(m_value.lazy, sv);
         }
-        return m_value.object->contains(sv);
+        return m_storage == 0u && m_value.object->contains(sv);
     }
 
     bool contains(const json_pointer& ptr) const {
@@ -4359,17 +4631,17 @@ public:
 
     // ==================== Iterators ====================
 
-    iterator begin() noexcept {
+    NEOJSON_ALWAYS_INLINE iterator begin() noexcept {
         return iterator(this, 0);
     }
 
-    const_iterator begin() const noexcept { return cbegin(); }
+    NEOJSON_ALWAYS_INLINE const_iterator begin() const noexcept { return cbegin(); }
 
-    const_iterator cbegin() const noexcept {
+    NEOJSON_ALWAYS_INLINE const_iterator cbegin() const noexcept {
         return const_iterator(this, 0);
     }
 
-    iterator end() noexcept {
+    NEOJSON_ALWAYS_INLINE iterator end() noexcept {
         switch (m_type) {
             case value_t::null:
                 return iterator(this, 0);
@@ -4381,9 +4653,9 @@ public:
         }
     }
 
-    const_iterator end() const noexcept { return cend(); }
+    NEOJSON_ALWAYS_INLINE const_iterator end() const noexcept { return cend(); }
 
-    const_iterator cend() const noexcept {
+    NEOJSON_ALWAYS_INLINE const_iterator cend() const noexcept {
         switch (m_type) {
             case value_t::null:
                 return const_iterator(this, 0);
@@ -4413,90 +4685,12 @@ public:
 
     // ==================== Modifiers ====================
 
-    void clear() noexcept {
-        switch (m_type) {
-            case value_t::number_integer:
-                m_value.number_integer = 0;
-                break;
-            case value_t::number_unsigned:
-                m_value.number_unsigned = 0;
-                break;
-            case value_t::number_float:
-                m_value.number_float = 0.0;
-                break;
-            case value_t::boolean:
-                m_value.boolean = false;
-                break;
-            case value_t::string:
-                if (m_value.string->refcount.load(std::memory_order_acquire) <= 1u) {
-                    m_value.string->value.clear();
-                } else {
-                    detail::SharedString* fresh = create_string();
-                    detail::SharedString* old = m_value.string;
-                    m_value.string = fresh;
-                    release_string(old);
-                }
-                break;
-            case value_t::array:
-                if (m_storage != 0u) {
-                    m_value.array = static_cast<array_t*>(
-                        detail::lazy_clear(m_value.lazy, m_type));
-                    m_storage = 0u;
-                } else {
-                    m_value.array->clear();
-                }
-                break;
-            case value_t::object:
-                if (m_storage != 0u) {
-                    m_value.object = static_cast<object_t*>(
-                        detail::lazy_clear(m_value.lazy, m_type));
-                    m_storage = 0u;
-                } else {
-                    m_value.object->clear();
-                }
-                break;
-            default:
-                break;
-        }
-    }
-
-    void push_back(json&& val) {
-        if (is_null()) {
-            m_value.array = create_array();
-            m_type = value_t::array;
-        } else if (!is_array()) {
-            detail::throw_type_error(308, "cannot use push_back() with ", type_name());
-        }
-        auto* arr = mutable_array();
-        if (arr->size() < arr->capacity() && &val != this) {
-            arr->emplace_back(std::move(val));
-            return;
-        }
-        json tmp(std::move(val));
-        if (arr->empty()) {
-            arr->reserve(2u);
-        }
-        arr->push_back(std::move(tmp));
-    }
-
-    void push_back(const json& val) {
-        if (is_null()) {
-            m_value.array = create_array();
-            m_type = value_t::array;
-        } else if (!is_array()) {
-            detail::throw_type_error(308, "cannot use push_back() with ", type_name());
-        }
-        auto* arr = mutable_array();
-        if (arr->size() < arr->capacity() && &val != this) {
-            arr->emplace_back(val);
-            return;
-        }
-        json tmp(val);
-        if (arr->empty()) {
-            arr->reserve(2u);
-        }
-        arr->push_back(std::move(tmp));
-    }
+    void clear() noexcept;
+    NEOJSON_ALWAYS_INLINE void push_back(json&& val);
+    NEOJSON_ALWAYS_INLINE void push_back(const json& val);
+    NEOJSON_NOINLINE inline void push_back_slow(json&& val);
+    NEOJSON_NOINLINE inline void push_back_slow(const json& val);
+    NEOJSON_NOINLINE inline reference emplace_back_slow_or_small(json&& tmp);
 
     void push_back(const typename object_t::value_type& val) {
         if (is_null()) {
@@ -4545,14 +4739,12 @@ public:
             throw type_error::create(
                 311, std::string("cannot use emplace_back() with ") + type_name());
         }
-        if (is_null()) {
-            m_value.array = create_array();
-            m_type = value_t::array;
-        }
         json tmp(std::forward<Args>(args)...);
-        auto* arr = mutable_array();
-        arr->emplace_back(std::move(tmp));
-        return arr->back();
+        if (is_array() && m_storage == 0u) {
+            m_value.array->emplace_back(std::move(tmp));
+            return m_value.array->back();
+        }
+        return emplace_back_slow_or_small(std::move(tmp));
     }
 
     template <class... Args>
@@ -4721,6 +4913,9 @@ public:
 
     size_type erase(const typename object_t::key_type& key) {
         if (is_object()) {
+            if (m_storage == 3u) {
+                return 0u;
+            }
             return mutable_object()->erase(key);
         }
         throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
@@ -4730,6 +4925,9 @@ public:
               std::enable_if_t<std::is_same<std::remove_cv_t<CharT>, char>::value, int> = 0>
     size_type erase(CharT* key) {
         if (is_object()) {
+            if (m_storage == 3u) {
+                return 0u;
+            }
             return mutable_object()->erase(std::string_view(key));
         }
         throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
@@ -4745,6 +4943,9 @@ public:
                   int> = 0>
     size_type erase(const KeyType& key) {
         if (is_object()) {
+            if (m_storage == 3u) {
+                return 0u;
+            }
             return mutable_object()->erase(std::string_view(key));
         }
         throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
@@ -4897,16 +5098,21 @@ public:
 
     friend bool operator==(const json& lhs, const json& rhs) noexcept {
         if (lhs.m_storage != 0u || rhs.m_storage != 0u) {
-            return detail::lazy_equal(lhs, rhs);
+            if (lhs.m_storage == 1u || rhs.m_storage == 1u) {
+                return detail::lazy_equal(lhs, rhs);
+            }
+            return equal_with_small_container(lhs, rhs);
         }
         const auto lhs_type = lhs.type();
         const auto rhs_type = rhs.type();
         if (lhs_type == rhs_type) {
             switch (lhs_type) {
                 case value_t::array:
-                    return *lhs.m_value.array == *rhs.m_value.array;
+                    return lhs.m_value.array == rhs.m_value.array ||
+                           *lhs.m_value.array == *rhs.m_value.array;
                 case value_t::object:
-                    return *lhs.m_value.object == *rhs.m_value.object;
+                    return lhs.m_value.object == rhs.m_value.object ||
+                           *lhs.m_value.object == *rhs.m_value.object;
                 case value_t::null:
                     return true;
                 case value_t::string:
@@ -5013,16 +5219,21 @@ public:
 
     friend bool operator<(const json& lhs, const json& rhs) noexcept {
         if (lhs.m_storage != 0u || rhs.m_storage != 0u) {
-            return detail::lazy_less(lhs, rhs);
+            if (lhs.m_storage == 1u || rhs.m_storage == 1u) {
+                return detail::lazy_less(lhs, rhs);
+            }
+            return less_with_small_container(lhs, rhs);
         }
         const auto lhs_type = lhs.type();
         const auto rhs_type = rhs.type();
         if (lhs_type == rhs_type) {
             switch (lhs_type) {
                 case value_t::array:
-                    return *lhs.m_value.array < *rhs.m_value.array;
+                    return lhs.m_value.array != rhs.m_value.array &&
+                           *lhs.m_value.array < *rhs.m_value.array;
                 case value_t::object:
-                    return *lhs.m_value.object < *rhs.m_value.object;
+                    return lhs.m_value.object != rhs.m_value.object &&
+                           *lhs.m_value.object < *rhs.m_value.object;
                 case value_t::null:
                     return false;
                 case value_t::string:
@@ -5494,6 +5705,765 @@ private:
 static_assert(sizeof(json) == 16, "neojson::json must be 16 bytes");
 static_assert(std::is_nothrow_move_constructible<std::pair<std::string, json>>::value,
               "ordered_map value_type must be nothrow move-constructible");
+
+namespace detail {
+
+struct SmallArray2 {
+    static constexpr std::size_t kInlineCap = 2u;
+    std::uint8_t count = 0u;
+    mutable std::atomic<void*> materialized_vec{nullptr};
+    alignas(json) unsigned char storage[kInlineCap * sizeof(json)];
+
+    void* slot_ptr(const std::size_t idx) noexcept {
+        return static_cast<void*>(storage + idx * sizeof(json));
+    }
+
+    const void* slot_ptr(const std::size_t idx) const noexcept {
+        return static_cast<const void*>(storage + idx * sizeof(json));
+    }
+
+    json& elem(const std::size_t idx) noexcept {
+        return *std::launder(reinterpret_cast<json*>(storage + idx * sizeof(json)));
+    }
+
+    const json& elem(const std::size_t idx) const noexcept {
+        return *std::launder(reinterpret_cast<const json*>(storage + idx * sizeof(json)));
+    }
+};
+
+static_assert(sizeof(SmallArray2) <= 48u, "SmallArray2 should fit in 48-byte pooled slab");
+
+} // namespace detail
+
+inline detail::SmallArray2* json::create_small_array1(json&& v) {
+    void* mem = detail::pool_alloc(sizeof(detail::SmallArray2));
+    auto* sa = ::new (mem) detail::SmallArray2();
+    ::new (sa->slot_ptr(0u)) json(std::move(v));
+    sa->count = 1u;
+    return sa;
+}
+
+inline detail::SmallArray2* json::create_small_array1(const json& v) {
+    void* mem = detail::pool_alloc(sizeof(detail::SmallArray2));
+    auto* sa = ::new (mem) detail::SmallArray2();
+    try {
+        ::new (sa->slot_ptr(0u)) json(v);
+    } catch (...) {
+        sa->~SmallArray2();
+        detail::pool_free(sa, sizeof(detail::SmallArray2));
+        throw;
+    }
+    sa->count = 1u;
+    return sa;
+}
+
+inline detail::SmallArray2* json::create_small_array2(json&& v0, json&& v1) {
+    void* mem = detail::pool_alloc(sizeof(detail::SmallArray2));
+    auto* sa = ::new (mem) detail::SmallArray2();
+    ::new (sa->slot_ptr(0u)) json(std::move(v0));
+    ::new (sa->slot_ptr(1u)) json(std::move(v1));
+    sa->count = 2u;
+    return sa;
+}
+
+inline detail::SmallArray2* json::create_small_array2_copy(const json& v0, const json& v1) {
+    void* mem = detail::pool_alloc(sizeof(detail::SmallArray2));
+    auto* sa = ::new (mem) detail::SmallArray2();
+    try {
+        ::new (sa->slot_ptr(0u)) json(v0);
+        try {
+            ::new (sa->slot_ptr(1u)) json(v1);
+        } catch (...) {
+            sa->elem(0u).~json();
+            throw;
+        }
+    } catch (...) {
+        sa->~SmallArray2();
+        detail::pool_free(sa, sizeof(detail::SmallArray2));
+        throw;
+    }
+    sa->count = 2u;
+    return sa;
+}
+
+inline detail::SmallArray2* json::create_small_array_default(const std::size_t n) {
+    void* mem = detail::pool_alloc(sizeof(detail::SmallArray2));
+    auto* sa = ::new (mem) detail::SmallArray2();
+    for (std::size_t i = 0u; i < n; ++i) {
+        ::new (sa->slot_ptr(i)) json();
+    }
+    sa->count = static_cast<std::uint8_t>(n);
+    return sa;
+}
+
+inline detail::SmallArray2* json::clone_small_array(const detail::SmallArray2* sa) {
+    if (sa->count == 1u) {
+        return create_small_array1(sa->elem(0u));
+    }
+    if (sa->count == 2u) {
+        return create_small_array2_copy(sa->elem(0u), sa->elem(1u));
+    }
+    void* mem = detail::pool_alloc(sizeof(detail::SmallArray2));
+    return ::new (mem) detail::SmallArray2();
+}
+
+inline std::size_t json::small_arr_size(const detail::SmallArray2* sa) noexcept {
+    return sa != nullptr ? sa->count : 0u;
+}
+
+inline json& json::small_arr_elem(detail::SmallArray2* sa, const std::size_t idx) noexcept {
+    return sa->elem(idx);
+}
+
+inline const json& json::small_arr_elem(const detail::SmallArray2* sa,
+                                        const std::size_t idx) noexcept {
+    return sa->elem(idx);
+}
+
+inline const json::array_t* json::small_arr_const_vec(const detail::SmallArray2* sa) {
+    if (void* existing = sa->materialized_vec.load(std::memory_order_acquire)) {
+        return static_cast<const array_t*>(existing);
+    }
+    array_t* fresh = create_array();
+    try {
+        const std::size_t n = sa->count;
+        fresh->reserve(n);
+        for (std::size_t i = 0u; i < n; ++i) {
+            fresh->emplace_back(sa->elem(i));
+        }
+    } catch (...) {
+        destroy_array(fresh);
+        throw;
+    }
+    void* expected = nullptr;
+    if (!sa->materialized_vec.compare_exchange_strong(
+            expected, fresh, std::memory_order_release, std::memory_order_acquire)) {
+        destroy_array(fresh);
+        return static_cast<const array_t*>(expected);
+    }
+    return fresh;
+}
+
+inline bool json::small_arr_has_const_cache(const detail::SmallArray2* sa) noexcept {
+    return sa != nullptr && sa->materialized_vec.load(std::memory_order_relaxed) != nullptr;
+}
+
+inline void json::drop_small_array_const_cache(detail::SmallArray2* sa) noexcept {
+    if (sa == nullptr) {
+        return;
+    }
+    if (void* mv = sa->materialized_vec.exchange(nullptr, std::memory_order_acq_rel)) {
+        auto* vec = static_cast<array_t*>(mv);
+        json_value::destroy_container(vec);
+    }
+}
+
+inline void json::take_small_array_containers(detail::SmallArray2& sa, std::vector<json>& stack) {
+    const std::size_t n = sa.count;
+    for (std::size_t i = 0u; i < n; ++i) {
+        json& child = sa.elem(i);
+        if (json_value::is_container(child)) {
+            stack.push_back(std::move(child));
+        }
+    }
+}
+
+inline void json::release_small_array_containers(detail::SmallArray2& sa) noexcept {
+    try {
+        std::vector<json> stack;
+        take_small_array_containers(sa, stack);
+        json_value::drain_container_stack(stack);
+    } catch (...) {
+    }
+}
+
+void json::destroy_small_array_slow(detail::SmallArray2*& sa) noexcept {
+    if (sa == nullptr) {
+        return;
+    }
+    const std::size_t n = sa->count;
+    bool has_child_ctn = false;
+    for (std::size_t i = 0u; i < n; ++i) {
+        const value_t ct = sa->elem(i).m_type;
+        if (ct == value_t::array || ct == value_t::object) {
+            has_child_ctn = true;
+            break;
+        }
+    }
+    if (detail::t_destroy_depth < detail::kMaxRecursiveDestroyDepth) {
+        if (has_child_ctn) {
+            const detail::destroy_depth_guard guard;
+            for (std::size_t i = 0u; i < n; ++i) {
+                sa->elem(i).~json();
+            }
+        } else {
+            for (std::size_t i = 0u; i < n; ++i) {
+                json& e = sa->elem(i);
+                if (e.m_type == value_t::string) {
+                    release_string(e.m_value.string);
+                }
+            }
+        }
+    } else {
+        ++detail::t_destroy_heap_stack_uses;
+        if (has_child_ctn) {
+            release_small_array_containers(*sa);
+        }
+        for (std::size_t i = 0u; i < n; ++i) {
+            sa->elem(i).~json();
+        }
+    }
+    if (void* mv = sa->materialized_vec.load(std::memory_order_acquire)) {
+        auto* vec = static_cast<array_t*>(mv);
+        json_value::destroy_container(vec);
+    }
+    sa->~SmallArray2();
+    detail::pool_free(sa, sizeof(detail::SmallArray2));
+    sa = nullptr;
+}
+
+void json::destroy_small_array(detail::SmallArray2*& sa) noexcept {
+    if (sa == nullptr) {
+        return;
+    }
+    if (detail::t_destroy_depth < detail::kMaxRecursiveDestroyDepth &&
+        sa->materialized_vec.load(std::memory_order_acquire) == nullptr) {
+        const std::size_t n = sa->count;
+        if ((n == 0u || !has_heap_payload(sa->elem(0u).m_type)) &&
+            (n < 2u || !has_heap_payload(sa->elem(1u).m_type))) {
+            sa->~SmallArray2();
+            detail::pool_free(sa, sizeof(detail::SmallArray2));
+            sa = nullptr;
+            return;
+        }
+    }
+    destroy_small_array_slow(sa);
+}
+
+void json::destroy_non_trivial() noexcept {
+    if (m_storage == 1u) {
+        detail::lazy_release(m_value.lazy, m_type);
+    } else if (m_storage == 2u) {
+        destroy_small_array(m_value.small_arr);
+    } else {
+        m_value.destroy(m_type);
+    }
+}
+
+void json::copy_non_trivial(const json& other) {
+    if (m_storage == 1u) {
+        m_value.lazy->refcount.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    if (m_storage == 2u) {
+        m_value.small_arr = clone_small_array(other.m_value.small_arr);
+        return;
+    }
+    switch (m_type) {
+        case value_t::object:
+            if (other.m_value.object->empty()) {
+                m_storage = 3u;
+                m_value.object = nullptr;
+            } else {
+                m_value.object = create_object(*(other.m_value.object));
+            }
+            break;
+        case value_t::array:
+            if (other.m_value.array->empty()) {
+                m_storage = 3u;
+                m_value.array = nullptr;
+            } else {
+                m_value.array = create_array(*(other.m_value.array));
+            }
+            break;
+        case value_t::string:
+            m_value.string = share_or_clone_string(other.m_value.string);
+            break;
+        default:
+            break;
+    }
+}
+
+json::array_t* json::promote_small_array_mutable(const std::size_t reserve_cap) {
+    detail::SmallArray2* sa = m_value.small_arr;
+    const std::size_t n = sa->count;
+    const std::size_t cap = (std::max)(reserve_cap, (std::max)(n, std::size_t{4u}));
+    array_t* arr = create_array();
+    try {
+        arr->reserve(cap);
+    } catch (...) {
+        destroy_array(arr);
+        throw;
+    }
+    for (std::size_t i = 0u; i < n; ++i) {
+        arr->emplace_back(std::move(sa->elem(i)));
+    }
+    destroy_small_array(sa);
+    m_value.array = arr;
+    m_storage = 0u;
+    return arr;
+}
+
+json::object_t* json::mutable_object_slow() {
+    if (m_storage == 1u) {
+        m_value.object = static_cast<object_t*>(detail::lazy_detach_mutable(m_value.lazy, m_type));
+        m_storage = 0u;
+    } else {
+        m_value.object = create_object();
+        m_storage = 0u;
+    }
+    return m_value.object;
+}
+
+json::array_t* json::mutable_array_slow() {
+    if (m_storage == 1u) {
+        m_value.array = static_cast<array_t*>(detail::lazy_detach_mutable(m_value.lazy, m_type));
+        m_storage = 0u;
+    } else if (m_storage == 2u) {
+        return promote_small_array_mutable();
+    } else {
+        m_value.array = create_array();
+        m_storage = 0u;
+    }
+    return m_value.array;
+}
+
+const json::object_t* json::const_object_slow() const {
+    if (m_storage == 1u) {
+        if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+            return static_cast<const object_t*>(mat);
+        }
+        return static_cast<const object_t*>(detail::lazy_materialize_const(m_value.lazy, m_type));
+    }
+    return &empty_object_singleton();
+}
+
+const json::array_t* json::const_array_slow() const {
+    if (m_storage == 1u) {
+        if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+            return static_cast<const array_t*>(mat);
+        }
+        return static_cast<const array_t*>(detail::lazy_materialize_const(m_value.lazy, m_type));
+    }
+    if (m_storage == 2u) {
+        return small_arr_const_vec(m_value.small_arr);
+    }
+    return &empty_array_singleton();
+}
+
+bool json::empty() const noexcept {
+    if (m_type == value_t::array) {
+        if (m_storage == 0u) {
+            return m_value.array->empty();
+        }
+        if (m_storage == 1u) {
+            return m_value.lazy->raw_len == 0u;
+        }
+        return m_storage == 3u;
+    }
+    if (m_type == value_t::object) {
+        if (m_storage == 0u) {
+            return m_value.object->empty();
+        }
+        if (m_storage == 1u) {
+            return m_value.lazy->raw_len == 0u;
+        }
+        return m_storage == 3u;
+    }
+    return m_type == value_t::null;
+}
+
+json::size_type json::size() const noexcept {
+    if (m_type == value_t::array) {
+        if (m_storage == 0u) {
+            return m_value.array->size();
+        }
+        if (m_storage == 1u) {
+            return m_value.lazy->raw_len;
+        }
+        return (m_storage == 2u) ? m_value.small_arr->count : 0u;
+    }
+    if (m_type == value_t::object) {
+        if (m_storage == 0u) {
+            return m_value.object->size();
+        }
+        if (m_storage == 1u) {
+            if ((m_value.lazy->dedup_state.load(std::memory_order_relaxed) & 1u) != 0u) {
+                return m_value.lazy->raw_len;
+            }
+            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                return static_cast<const object_t*>(mat)->size();
+            }
+            return detail::lazy_size(m_value.lazy, m_type);
+        }
+        return 0u;
+    }
+    return (m_type == value_t::null) ? 0u : 1u;
+}
+
+inline json::reference json::at(const size_type idx) {
+    if (is_array()) {
+        if (m_storage == 2u) {
+            if (idx >= m_value.small_arr->count) {
+                throw out_of_range::create(
+                    401, "array index " + std::to_string(idx) + " is out of range");
+            }
+            if (small_arr_has_const_cache(m_value.small_arr)) {
+                auto* arr = promote_small_array_mutable();
+                return (*arr)[idx];
+            }
+            return m_value.small_arr->elem(idx);
+        }
+        if (m_storage == 3u) {
+            throw out_of_range::create(
+                401, "array index " + std::to_string(idx) + " is out of range");
+        }
+        auto* arr = mutable_array();
+        if (idx >= arr->size()) {
+            throw out_of_range::create(
+                401, "array index " + std::to_string(idx) + " is out of range");
+        }
+        return (*arr)[idx];
+    }
+    throw type_error::create(304, std::string("cannot use at() with ") + type_name());
+}
+
+inline json::const_reference json::at(const size_type idx) const {
+    if (is_array()) {
+        if (m_storage == 2u) {
+            if (idx >= m_value.small_arr->count) {
+                throw out_of_range::create(
+                    401, "array index " + std::to_string(idx) + " is out of range");
+            }
+            return m_value.small_arr->elem(idx);
+        }
+        const auto* arr = const_array();
+        if (idx >= arr->size()) {
+            throw out_of_range::create(
+                401, "array index " + std::to_string(idx) + " is out of range");
+        }
+        return (*arr)[idx];
+    }
+    throw type_error::create(304, std::string("cannot use at() with ") + type_name());
+}
+
+inline json::reference json::operator[](const size_type idx) {
+    if (is_null()) {
+        if (idx <= 1u) {
+            m_value.small_arr = create_small_array_default(idx + 1u);
+            m_storage = 2u;
+            m_type = value_t::array;
+            return m_value.small_arr->elem(idx);
+        }
+        m_value.array = create_array(idx + 1u);
+        m_type = value_t::array;
+        return (*m_value.array)[idx];
+    }
+    if (is_array()) {
+        if (m_storage == 2u) {
+            detail::SmallArray2* sa = m_value.small_arr;
+            if (small_arr_has_const_cache(sa)) {
+                auto* arr = promote_small_array_mutable((std::max)(idx + 1u, std::size_t{4u}));
+                if (idx >= arr->size()) {
+                    arr->resize(idx + 1u);
+                }
+                return (*arr)[idx];
+            }
+            if (idx < sa->count) {
+                return sa->elem(idx);
+            }
+            if (idx == 1u) {
+                ::new (sa->slot_ptr(1u)) json();
+                sa->count = 2u;
+                return sa->elem(1u);
+            }
+            auto* arr = promote_small_array_mutable(idx + 1u);
+            arr->resize(idx + 1u);
+            return (*arr)[idx];
+        }
+        if (m_storage == 3u && idx <= 1u) {
+            m_value.small_arr = create_small_array_default(idx + 1u);
+            m_storage = 2u;
+            return m_value.small_arr->elem(idx);
+        }
+        auto* arr = mutable_array();
+        if (idx >= arr->size()) {
+            arr->resize(idx + 1u);
+        }
+        return (*arr)[idx];
+    }
+    detail::throw_type_error(305, "cannot use operator[] with a numeric argument with ",
+                             type_name());
+}
+
+inline json::const_reference json::operator[](const size_type idx) const {
+    if (is_array()) {
+        if (m_storage == 2u) {
+            return m_value.small_arr->elem(idx);
+        }
+        return (*const_array())[idx];
+    }
+    detail::throw_type_error(305, "cannot use operator[] with a numeric argument with ",
+                             type_name());
+}
+
+inline void json::clear() noexcept {
+    switch (m_type) {
+        case value_t::number_integer:
+            m_value.number_integer = 0;
+            break;
+        case value_t::number_unsigned:
+            m_value.number_unsigned = 0;
+            break;
+        case value_t::number_float:
+            m_value.number_float = 0.0;
+            break;
+        case value_t::boolean:
+            m_value.boolean = false;
+            break;
+        case value_t::string:
+            if (m_value.string->refcount.load(std::memory_order_acquire) <= 1u) {
+                m_value.string->value.clear();
+            } else {
+                detail::SharedString* fresh = create_string();
+                detail::SharedString* old = m_value.string;
+                m_value.string = fresh;
+                release_string(old);
+            }
+            break;
+        case value_t::array:
+            if (m_storage == 1u) {
+                m_value.array = static_cast<array_t*>(detail::lazy_clear(m_value.lazy, m_type));
+                m_storage = 0u;
+            } else if (m_storage == 2u) {
+                destroy_small_array(m_value.small_arr);
+                m_storage = 3u;
+                m_value.array = nullptr;
+            } else if (m_storage == 0u) {
+                m_value.array->clear();
+            }
+            break;
+        case value_t::object:
+            if (m_storage == 1u) {
+                m_value.object = static_cast<object_t*>(detail::lazy_clear(m_value.lazy, m_type));
+                m_storage = 0u;
+            } else if (m_storage == 0u) {
+                m_value.object->clear();
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void json::push_back_slow(json&& val) {
+    if (&val == this) {
+        push_back_slow(static_cast<const json&>(val));
+        return;
+    }
+    if (is_null()) {
+        m_value.small_arr = create_small_array1(std::move(val));
+        m_storage = 2u;
+        m_type = value_t::array;
+        return;
+    }
+    if (!is_array()) {
+        detail::throw_type_error(308, "cannot use push_back() with ", type_name());
+    }
+    if (m_storage == 3u) {
+        m_value.small_arr = create_small_array1(std::move(val));
+        m_storage = 2u;
+        return;
+    }
+    if (m_storage == 2u) {
+        detail::SmallArray2* sa = m_value.small_arr;
+        if (sa->count < 2u) {
+            ::new (sa->slot_ptr(sa->count)) json(std::move(val));
+            ++sa->count;
+            if (small_arr_has_const_cache(sa)) {
+                drop_small_array_const_cache(sa);
+            }
+            return;
+        }
+        json tmp(std::move(val));
+        array_t* arr = promote_small_array_mutable(4u);
+        arr->emplace_back(std::move(tmp));
+        return;
+    }
+    auto* arr = mutable_array();
+    if (arr->size() < arr->capacity()) {
+        arr->emplace_back(std::move(val));
+        return;
+    }
+    json tmp(std::move(val));
+    if (arr->empty()) {
+        arr->reserve(2u);
+    }
+    arr->push_back(std::move(tmp));
+}
+
+void json::push_back(json&& val) {
+    if (&val != this && m_type == value_t::array && m_storage == 0u &&
+        m_value.array->size() < m_value.array->capacity()) {
+        m_value.array->emplace_back(std::move(val));
+        return;
+    }
+    push_back_slow(std::move(val));
+}
+
+void json::push_back_slow(const json& val) {
+    if (is_null()) {
+        m_value.small_arr = create_small_array1(val);
+        m_storage = 2u;
+        m_type = value_t::array;
+        return;
+    }
+    if (!is_array()) {
+        detail::throw_type_error(308, "cannot use push_back() with ", type_name());
+    }
+    if (m_storage == 3u) {
+        json tmp(val);
+        m_value.small_arr = create_small_array1(std::move(tmp));
+        m_storage = 2u;
+        return;
+    }
+    if (m_storage == 2u) {
+        detail::SmallArray2* sa = m_value.small_arr;
+        if (sa->count < 2u) {
+            if (&val == this) {
+                json tmp(val);
+                ::new (sa->slot_ptr(sa->count)) json(std::move(tmp));
+            } else {
+                ::new (sa->slot_ptr(sa->count)) json(val);
+            }
+            ++sa->count;
+            if (small_arr_has_const_cache(sa)) {
+                drop_small_array_const_cache(sa);
+            }
+            return;
+        }
+        json tmp(val);
+        array_t* arr = promote_small_array_mutable(4u);
+        arr->emplace_back(std::move(tmp));
+        return;
+    }
+    auto* arr = mutable_array();
+    if (arr->size() < arr->capacity() && &val != this) {
+        arr->emplace_back(val);
+        return;
+    }
+    json tmp(val);
+    if (arr->empty()) {
+        arr->reserve(2u);
+    }
+    arr->push_back(std::move(tmp));
+}
+
+void json::push_back(const json& val) {
+    if (&val != this && m_type == value_t::array && m_storage == 0u &&
+        m_value.array->size() < m_value.array->capacity()) {
+        m_value.array->emplace_back(val);
+        return;
+    }
+    push_back_slow(val);
+}
+
+json::reference json::emplace_back_slow_or_small(json&& tmp) {
+    if (is_null()) {
+        m_value.small_arr = create_small_array1(std::move(tmp));
+        m_storage = 2u;
+        m_type = value_t::array;
+        return m_value.small_arr->elem(0u);
+    }
+    if (m_storage == 3u) {
+        m_value.small_arr = create_small_array1(std::move(tmp));
+        m_storage = 2u;
+        return m_value.small_arr->elem(0u);
+    }
+    if (m_storage == 2u) {
+        detail::SmallArray2* sa = m_value.small_arr;
+        if (sa->count < 2u) {
+            const std::size_t idx = sa->count;
+            ::new (sa->slot_ptr(idx)) json(std::move(tmp));
+            ++sa->count;
+            if (small_arr_has_const_cache(sa)) {
+                drop_small_array_const_cache(sa);
+            }
+            return sa->elem(idx);
+        }
+        array_t* arr = promote_small_array_mutable(4u);
+        arr->emplace_back(std::move(tmp));
+        return arr->back();
+    }
+    auto* arr = mutable_array();
+    arr->emplace_back(std::move(tmp));
+    return arr->back();
+}
+
+bool json::equal_with_small_container(const json& lhs, const json& rhs) noexcept {
+    if (lhs.m_type != rhs.m_type) {
+        return false;
+    }
+    if (lhs.m_type == value_t::object) {
+        const object_t* lo = lhs.const_object();
+        const object_t* ro = rhs.const_object();
+        return *lo == *ro;
+    }
+    if (lhs.m_type != value_t::array) {
+        return false;
+    }
+    const std::size_t ln = lhs.size();
+    const std::size_t rn = rhs.size();
+    if (ln != rn) {
+        return false;
+    }
+    if (ln == 0u) {
+        return true;
+    }
+    const array_t* la = (lhs.m_storage == 0u) ? lhs.m_value.array : nullptr;
+    const array_t* ra = (rhs.m_storage == 0u) ? rhs.m_value.array : nullptr;
+    for (std::size_t i = 0u; i < ln; ++i) {
+        const json& le = (la != nullptr) ? (*la)[i] : small_arr_elem(lhs.m_value.small_arr, i);
+        const json& re = (ra != nullptr) ? (*ra)[i] : small_arr_elem(rhs.m_value.small_arr, i);
+        if (!(le == re)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool json::less_with_small_container(const json& lhs, const json& rhs) noexcept {
+    if (lhs.m_type != rhs.m_type) {
+        return operator<(lhs.m_type, rhs.m_type);
+    }
+    if (lhs.m_type == value_t::object) {
+        const object_t* lo = lhs.const_object();
+        const object_t* ro = rhs.const_object();
+        return *lo < *ro;
+    }
+    if (lhs.m_type != value_t::array) {
+        return false;
+    }
+    const std::size_t ln = lhs.size();
+    const std::size_t rn = rhs.size();
+    const std::size_t common = (std::min)(ln, rn);
+    if (common == 0u) {
+        return ln < rn;
+    }
+    const array_t* la = (lhs.m_storage == 0u) ? lhs.m_value.array : nullptr;
+    const array_t* ra = (rhs.m_storage == 0u) ? rhs.m_value.array : nullptr;
+    for (std::size_t i = 0u; i < common; ++i) {
+        const json& le = (la != nullptr) ? (*la)[i] : small_arr_elem(lhs.m_value.small_arr, i);
+        const json& re = (ra != nullptr) ? (*ra)[i] : small_arr_elem(rhs.m_value.small_arr, i);
+        if (le < re) {
+            return true;
+        }
+        if (re < le) {
+            return false;
+        }
+    }
+    return ln < rn;
+}
 
 // Out-of-line json member functions that depend on adl_serializer
 
