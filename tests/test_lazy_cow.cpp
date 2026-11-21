@@ -1265,4 +1265,344 @@ TEST(LazyCow, EmptyContainersAndSmallArray2EdgeCases) {
     }
 }
 
+TEST(LazyCow, SmallObject4EdgeCasesAndConcurrency) {
+    using jk = neojson::json;
+
+    // 1. 0 -> 1 -> 4 -> 5 promotion via operator[], emplace, push_back, initializer_list, external_constructor.
+    {
+        jk o = jk::object();
+        EXPECT_TRUE(o.empty());
+        EXPECT_EQ(o.size(), 0u);
+        o["a"] = 1;
+        EXPECT_EQ(o.size(), 1u);
+        EXPECT_TRUE(o.contains("a"));
+        o.emplace("b", "two");
+        o.push_back(jk::object_t::value_type{"c", 3});
+        o["d"] = true;
+        EXPECT_EQ(o.size(), 4u);
+        EXPECT_EQ(o["a"], 1);
+        EXPECT_EQ(o.at("b"), "two");
+        EXPECT_EQ(o.at("c"), 3);
+        EXPECT_EQ(o["d"], true);
+        EXPECT_EQ(o.dump(), R"({"a":1,"b":"two","c":3,"d":true})");
+
+        o["e"] = 5.5;
+        EXPECT_EQ(o.size(), 5u);
+        EXPECT_EQ(o, jk::parse(R"({"a":1,"b":"two","c":3,"d":true,"e":5.5})"));
+
+        // Explicit SmallObject4 lifecycle (3u -> 2u for 1..4 -> 0u on 5th key via emplace + operator[]).
+        jk s = jk::object();
+        EXPECT_TRUE(s.empty());
+        s.emplace("a", 1);
+        EXPECT_EQ(s.size(), 1u);
+        EXPECT_TRUE(s.contains("a"));
+        s.emplace("b", "two");
+        s.push_back(jk::object_t::value_type{"c", 3});
+        s["d"] = true;
+        EXPECT_EQ(s.size(), 4u);
+        EXPECT_EQ(s.dump(), R"({"a":1,"b":"two","c":3,"d":true})");
+        s["e"] = 5.5;
+        EXPECT_EQ(s.size(), 5u);
+        EXPECT_EQ(s, o);
+
+        jk init4 = {{"k1", 10}, {"k2", 20}, {"k3", 30}, {"k4", 40}};
+        EXPECT_EQ(init4.size(), 4u);
+        EXPECT_EQ(init4.dump(), R"({"k1":10,"k2":20,"k3":30,"k4":40})");
+
+        std::map<std::string, int> ext2{{"x", 7}, {"y", 8}};
+        jk from_ext = ext2;
+        EXPECT_EQ(from_ext.size(), 2u);
+        EXPECT_EQ(from_ext.dump(), R"({"x":7,"y":8})");
+
+        std::map<std::string, int> ext_empty;
+        jk from_empty = ext_empty;
+        EXPECT_TRUE(from_empty.is_object());
+        EXPECT_TRUE(from_empty.empty());
+        EXPECT_EQ(from_empty.dump(), "{}");
+    }
+
+    // 2. Duplicate-key order preservation: emplace/initializer_list first-wins, parsed JSON last-wins.
+    {
+        jk o = jk::object();
+        auto r1 = o.emplace("a", 1);
+        EXPECT_TRUE(r1.second);
+        EXPECT_EQ(r1.first.key(), "a");
+        o.emplace("b", 2);
+        auto rdup = o.emplace("a", 99);
+        EXPECT_FALSE(rdup.second);
+        EXPECT_EQ(rdup.first.key(), "a");
+        EXPECT_EQ(*rdup.first, 1);
+        o.emplace("c", 3);
+        o.emplace("d", 4);
+        EXPECT_EQ(o.size(), 4u);
+        auto rdup4 = o.emplace("c", 333);
+        EXPECT_FALSE(rdup4.second);
+        EXPECT_EQ(*rdup4.first, 3);
+        EXPECT_EQ(o.dump(), R"({"a":1,"b":2,"c":3,"d":4})");
+
+        jk init_dup = {{"p", 1}, {"q", 2}, {"p", 99}};
+        EXPECT_EQ(init_dup.size(), 2u);
+        EXPECT_EQ(init_dup.dump(), R"({"p":1,"q":2})");
+
+        jk parsed_dup = jk::parse(R"({"a":1,"b":2,"a":3})");
+        EXPECT_EQ(parsed_dup.size(), 2u);
+        EXPECT_EQ(parsed_dup.dump(), R"({"a":3,"b":2})");
+    }
+
+    // 3. Stale materialized_obj invalidation/promotion & self-aliasing across mutations.
+    {
+        jk obj = {{"a", 1}, {"b", 2}};
+        const auto* c1 = obj.get_ptr<const jk::object_t*>();
+        ASSERT_NE(c1, nullptr);
+        ASSERT_EQ(c1->size(), 2u);
+        obj.at("a") = 11;
+        const auto* c1_after = obj.get_ptr<const jk::object_t*>();
+        ASSERT_NE(c1_after, nullptr);
+        EXPECT_EQ((*c1_after)[0].second, 11);
+
+        jk obj_idx = {{"a", 1}, {"b", 2}};
+        ASSERT_NE(obj_idx.get_ptr<const jk::object_t*>(), nullptr);
+        obj_idx["b"] = 22;
+        obj_idx["c"] = 33;
+        EXPECT_EQ(obj_idx.dump(), R"({"a":1,"b":22,"c":33})");
+
+        jk obj_iter = {{"a", 1}, {"b", 2}};
+        ASSERT_NE(obj_iter.get_ptr<const jk::object_t*>(), nullptr);
+        *obj_iter.begin() = 77;
+        EXPECT_EQ(obj_iter["a"], 77);
+        EXPECT_EQ((*obj_iter.get_ptr<const jk::object_t*>())[0].second, 77);
+
+        jk obj_emp = {{"a", 1}, {"b", 2}};
+        ASSERT_NE(obj_emp.get_ptr<const jk::object_t*>(), nullptr);
+        obj_emp.emplace("c", 3);
+        EXPECT_EQ(obj_emp.get_ptr<const jk::object_t*>()->size(), 3u);
+
+        jk obj_er = {{"a", 1}, {"b", 2}};
+        ASSERT_NE(obj_er.get_ptr<const jk::object_t*>(), nullptr);
+        EXPECT_EQ(obj_er.erase("a"), 1u);
+        EXPECT_EQ(obj_er.get_ptr<const jk::object_t*>()->size(), 1u);
+        EXPECT_EQ(obj_er.erase("missing"), 0u);
+        EXPECT_EQ(obj_er.erase("b"), 1u);
+        EXPECT_TRUE(obj_er.empty());
+        EXPECT_EQ(obj_er.size(), 0u);
+        EXPECT_EQ(obj_er.dump(), "{}");
+
+        jk obj_clr = {{"a", 1}, {"b", 2}};
+        ASSERT_NE(obj_clr.get_ptr<const jk::object_t*>(), nullptr);
+        obj_clr.clear();
+        EXPECT_TRUE(obj_clr.empty());
+        EXPECT_EQ(obj_clr.size(), 0u);
+        obj_clr["reused"] = 42;
+        EXPECT_EQ(obj_clr.dump(), R"({"reused":42})");
+
+        // Self-aliasing on promotion from count==4 and with cached materialized_obj.
+        jk alias_raw = {{"k0", "brand_new_key_longer_than_sso_buffer"},
+                        {"k1", 1},
+                        {"k2", 2},
+                        {"k3", 3}};
+        alias_raw[alias_raw.begin().key()] = 42;
+        EXPECT_EQ(alias_raw["k0"], 42);
+        alias_raw["k0"] = "brand_new_key_longer_than_sso_buffer";
+        alias_raw[alias_raw["k0"].get_ref<const std::string&>()] = 123;
+        EXPECT_EQ(alias_raw["brand_new_key_longer_than_sso_buffer"], 123);
+
+        jk alias_cached = {{"k0", "cached_alias_key_longer_than_sso_buffer"},
+                           {"k1", 1},
+                           {"k2", 2},
+                           {"k3", 3}};
+        const auto* c_alias = alias_cached.get_ptr<const jk::object_t*>();
+        ASSERT_NE(c_alias, nullptr);
+        alias_cached[(*c_alias)[0].second.get_ref<const std::string&>()] = 99;
+        EXPECT_EQ(alias_cached["cached_alias_key_longer_than_sso_buffer"], 99);
+    }
+
+    // 4. Comparisons across storage representations (0u, 1u, 2u, 3u), dump(2), and InputIT slices.
+    {
+        const jk lazy4 = jk::parse(R"({"a":1,"b":"x","c":null,"d":[1,2]})");
+        jk built4 = {{"a", 1}, {"b", "x"}, {"c", nullptr}, {"d", {1, 2}}};
+        jk eager_reordered = {{"b", "x"}, {"a", 1}, {"c", nullptr}, {"d", {1, 2}}, {"z", 0}};
+        eager_reordered.erase("z");
+        jk empty_obj = jk::object();
+
+        EXPECT_EQ(lazy4, built4);
+        EXPECT_NE(lazy4, eager_reordered);
+        EXPECT_LT(lazy4, eager_reordered);
+        EXPECT_GT(eager_reordered, built4);
+        EXPECT_LT(empty_obj, built4);
+        EXPECT_LT(empty_obj, lazy4);
+        EXPECT_EQ(built4.dump(), lazy4.dump());
+        EXPECT_EQ(built4.dump(2), lazy4.dump(2));
+
+        // 0..3 elements for comparison combinations (2u vs 0u, 2u vs 1u, 2u vs 3u).
+        jk s2_ab = {{"a", 1}, {"b", 2}};
+        jk s2_ba = {{"b", 2}, {"a", 1}};
+        jk e5_ab = {{"a", 1}, {"b", 2}, {"c", 3}, {"d", 4}, {"e", 5}};
+        e5_ab.erase("c");
+        e5_ab.erase("d");
+        e5_ab.erase("e");
+        EXPECT_EQ(s2_ab, e5_ab);
+        EXPECT_NE(s2_ba, e5_ab);
+        EXPECT_LT(s2_ab, s2_ba);
+        EXPECT_LT(e5_ab, s2_ba);
+
+        jk src4 = {{"k1", 1}, {"k2", 2}, {"k3", 3}, {"k4", 4}};
+        jk src5 = {{"k1", 1}, {"k2", 2}, {"k3", 3}, {"k4", 4}, {"k5", 5}};
+        for (const std::size_t slice_len : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{4}}) {
+            jk c4(src4.begin(), std::next(src4.begin(), static_cast<std::ptrdiff_t>(slice_len)));
+            jk c5(src5.begin(), std::next(src5.begin(), static_cast<std::ptrdiff_t>(slice_len)));
+            EXPECT_EQ(c4.size(), slice_len);
+            EXPECT_EQ(c4, c5);
+        }
+        jk c5_full(src5.begin(), src5.end());
+        EXPECT_EQ(c5_full, src5);
+    }
+
+    // 5. 4-thread concurrent const_object() + lookup/iteration/dump on shared const SmallObject4.
+    {
+        const jk shared_parsed = jk::parse(R"({"lat":37.7749,"lon":-122.4194,"city":"sf","active":true})");
+        const jk shared_built = {{"lat", 37.7749}, {"lon", -122.4194}, {"city", "sf"}, {"active", true}};
+
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 4; ++t) {
+            readers.emplace_back([&]() {
+                for (int i = 0; i < 64; ++i) {
+                    const auto* po = shared_parsed.get_ptr<const jk::object_t*>();
+                    const auto* bo = shared_built.get_ptr<const jk::object_t*>();
+                    ASSERT_NE(po, nullptr);
+                    ASSERT_NE(bo, nullptr);
+                    EXPECT_EQ(po->size(), 4u);
+                    EXPECT_EQ(bo->size(), 4u);
+                    EXPECT_TRUE(shared_parsed.contains("city"));
+                    EXPECT_TRUE(shared_built.contains("city"));
+                    EXPECT_EQ(shared_parsed.at("city"), "sf");
+                    EXPECT_EQ(shared_built.find("lon").value(), -122.4194);
+                    EXPECT_EQ(shared_built["active"], true);
+                    EXPECT_EQ(shared_parsed.dump(), shared_built.dump());
+                    EXPECT_EQ(shared_parsed, shared_built);
+                }
+            });
+        }
+        for (auto& th : readers) {
+            th.join();
+        }
+    }
+
+    // 6. Deep 1100-level nested SmallObject4 destruction on a 512 KiB stack.
+    {
+        constexpr std::size_t kDepth = 1100u;
+        constexpr std::size_t kStackBytes = 512u * 1024u;
+        std::string deep_raw;
+        deep_raw.reserve(kDepth * 6u + 2u);
+        for (std::size_t d = 0; d < kDepth; ++d) {
+            deep_raw.append(R"({"k":)");
+        }
+        deep_raw.push_back('1');
+        deep_raw.append(kDepth, '}');
+
+        neojson::parse_options opts;
+        opts.max_depth = kDepth + 16u;
+
+        const std::string err = neojson::test::run_with_stack(kStackBytes, [&]() {
+            const std::size_t uses_before = neojson::detail::destroy_heap_stack_uses();
+            {
+                jk parsed_deep = jk::parse(deep_raw, nullptr, true, false, opts);
+                parsed_deep.materialize();
+                EXPECT_EQ(parsed_deep.size(), 1u);
+            }
+            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), uses_before);
+
+            const std::size_t uses_built_before = neojson::detail::destroy_heap_stack_uses();
+            {
+                jk built_deep = 1;
+                for (std::size_t d = 0; d < kDepth; ++d) {
+                    jk wrap = jk::object();
+                    wrap.emplace("k", std::move(built_deep));
+                    built_deep = std::move(wrap);
+                }
+                EXPECT_EQ(built_deep.size(), 1u);
+            }
+            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), uses_built_before);
+        });
+        ASSERT_TRUE(err.empty()) << err;
+    }
+}
+
+TEST(LazyCow, OrderedMapSubstringSelfAliasGrowth) {
+    // Substring views aliasing SSO keys stored inside ordered_map's flat vector buffer
+    // across capacity transitions (4->5, 8->9, 16->17, 32->33).
+    jk obj = jk::object();
+    std::vector<std::pair<std::string, int>> expected;
+
+    auto append_key = [&](const std::string& k, const int val) {
+        obj[k] = val;
+        expected.emplace_back(k, val);
+    };
+
+    append_key("k00_sso_a", 0);
+    append_key("k01_sso_b", 1);
+    append_key("k02_sso_c", 2);
+    append_key("k03_sso_d", 3);
+
+    // 4 -> 5 via emplace_default_key_grow_small (SSO substring aliases vector buffer).
+    const std::string_view sv4 = std::string_view(obj.find("k00_sso_a").key()).substr(1);
+    obj[sv4] = 4;
+    expected.emplace_back("00_sso_a", 4);
+
+    for (int i = 5; i < 8; ++i) {
+        append_key("k0" + std::to_string(i) + "_sso", i);
+    }
+
+    // 8 -> 9 via emplace_default_key_grow_small (SSO substring aliases vector buffer).
+    const std::string_view sv8 = std::string_view(obj.find("k01_sso_b").key()).substr(2);
+    obj[sv8] = 8;
+    expected.emplace_back("1_sso_b", 8);
+
+    for (int i = 9; i < 16; ++i) {
+        append_key("k" + std::to_string(i) + "_sso_mid", i);
+    }
+
+    // 16 -> 17 via emplace_default_key_indexed (builds hash index + grows capacity 16 -> 32).
+    const std::string_view sv16 = std::string_view(obj.find("k02_sso_c").key()).substr(1);
+    obj[sv16] = 16;
+    expected.emplace_back("02_sso_c", 16);
+
+    for (int i = 17; i < 32; ++i) {
+        append_key("k" + std::to_string(i) + "_sso_hi", i);
+    }
+
+    // 32 -> 33 via emplace_default_key_indexed (grows indexed capacity 32 -> 64).
+    const std::string_view sv32 = std::string_view(obj.find("k03_sso_d").key()).substr(3);
+    obj[sv32] = 32;
+    expected.emplace_back("_sso_d", 32);
+
+    // Also test non-SSO heap-allocated key alias across grow transitions.
+    jk heap_obj = jk::object();
+    std::vector<std::pair<std::string, int>> heap_expected;
+    for (int i = 0; i < 4; ++i) {
+        const std::string k = "heap_allocated_long_key_prefix_" + std::to_string(i);
+        heap_obj[k] = i;
+        heap_expected.emplace_back(k, i);
+    }
+    const std::string_view hsv4 = std::string_view(heap_obj.begin().key()).substr(5);
+    heap_obj[hsv4] = 104;
+    heap_expected.emplace_back(std::string(hsv4), 104);
+
+    ASSERT_EQ(obj.size(), expected.size());
+    std::size_t idx = 0;
+    for (auto it = obj.begin(); it != obj.end(); ++it, ++idx) {
+        EXPECT_EQ(it.key(), expected[idx].first);
+        EXPECT_EQ(it.value(), expected[idx].second);
+    }
+    for (const auto& kv : expected) {
+        ASSERT_TRUE(obj.contains(kv.first));
+        EXPECT_EQ(obj.at(kv.first), kv.second);
+    }
+
+    ASSERT_EQ(heap_obj.size(), heap_expected.size());
+    for (const auto& kv : heap_expected) {
+        ASSERT_TRUE(heap_obj.contains(kv.first));
+        EXPECT_EQ(heap_obj.at(kv.first), kv.second);
+    }
+}
+
 } // namespace

@@ -51,9 +51,47 @@ std::uint64_t hash_seed_init() noexcept {
 
 } // namespace
 
+std::atomic<std::uint64_t> g_hash_seed{0};
+
+std::uint64_t hash_seed_slow() noexcept {
+    const std::uint64_t existing = g_hash_seed.load(std::memory_order_acquire);
+    if (existing != 0u) {
+        return existing;
+    }
+    const std::uint64_t candidate = hash_seed_init();
+    std::uint64_t expected = 0u;
+    if (g_hash_seed.compare_exchange_strong(
+            expected, candidate, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return candidate;
+    }
+    return expected;
+}
+
 std::uint64_t hash_seed() noexcept {
-    static const std::uint64_t seed = hash_seed_init();
-    return seed;
+    const std::uint64_t s = g_hash_seed.load(std::memory_order_acquire);
+    return s != 0u ? s : hash_seed_slow();
+}
+
+[[maybe_unused]] const bool g_hash_seed_eager_init = (hash_seed_slow(), true);
+
+std::uint64_t hash_bytes_long(const char* data, const std::size_t len,
+                              std::uint64_t h) noexcept {
+    const auto* p = reinterpret_cast<const unsigned char*>(data);
+    std::size_t n = len;
+    while (n >= 8) {
+        std::uint64_t w = 0;
+        std::memcpy(&w, p, 8);
+        h ^= w * 0xbf58476d1ce4e5b9ULL;
+        h = rotl64(h, 31u) * 0x9e3779b97f4a7c15ULL;
+        p += 8;
+        n -= 8;
+    }
+    if (n > 0) {
+        std::uint64_t tail = 0;
+        std::memcpy(&tail, reinterpret_cast<const unsigned char*>(data) + len - 8, 8);
+        h ^= tail * 0x94d049bb133111ebULL;
+    }
+    return fmix64(h);
 }
 
 [[noreturn]] void throw_invalid_iterator(const int id, const char* msg) {
@@ -1631,6 +1669,70 @@ struct json_access {
         }
     }
 
+    static bool is_small_object(const json& j) noexcept {
+        return j.m_storage == 2u && j.m_type == json::value_t::object;
+    }
+
+    static const SmallObject4& small_object_of(const json& j) noexcept {
+        return *j.m_value.small_obj;
+    }
+
+    static SmallObject4* small_object_ptr(json& j) noexcept {
+        return j.m_value.small_obj;
+    }
+
+    static SmallObject4* create_small_object_raw() {
+        return json::create_small_object_empty();
+    }
+
+    static void destroy_small_object_raw(SmallObject4*& so) noexcept {
+        json::destroy_small_object(so);
+    }
+
+    static json make_from_small_object(SmallObject4* so) noexcept {
+        json j;
+        j.m_type = json::value_t::object;
+        j.m_storage = 2u;
+        j.m_value.small_obj = so;
+        return j;
+    }
+
+    static void drop_small_object_const_cache(SmallObject4* so) noexcept {
+        json::drop_small_object_const_cache(so);
+    }
+
+    static void small_object_append_unique(SmallObject4* so, const std::string_view key,
+                                           json&& val) {
+        const std::size_t n = so->count;
+        assert(n < kSmallObjCap);
+        const std::uint8_t tag = small_obj_key_tag(key);
+        ::new (so->slot_ptr(n)) SmallObject4::entry_t(
+            std::piecewise_construct,
+            std::forward_as_tuple(key.data(), key.size()),
+            std::forward_as_tuple(std::move(val)));
+        so->tags[n] = tag;
+        so->count = static_cast<std::uint8_t>(n + 1u);
+    }
+
+    static void small_object_emplace_or_assign(SmallObject4* so, const std::string_view key,
+                                               json&& val) {
+        const std::size_t n = so->count;
+        const std::uint8_t tag = small_obj_key_tag(key);
+        for (std::size_t i = 0u; i < n; ++i) {
+            if (so->tags[i] == tag && so->entry(i).first == key) {
+                so->entry(i).second = std::move(val);
+                return;
+            }
+        }
+        assert(n < kSmallObjCap);
+        ::new (so->slot_ptr(n)) SmallObject4::entry_t(
+            std::piecewise_construct,
+            std::forward_as_tuple(key.data(), key.size()),
+            std::forward_as_tuple(std::move(val)));
+        so->tags[n] = tag;
+        so->count = static_cast<std::uint8_t>(n + 1u);
+    }
+
     static json make_lazy(const json::value_t type, LazyHeader* node) noexcept {
         json j;
         j.m_type = type;
@@ -2028,19 +2130,49 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
             return json_access::make_from_array_ptr(arr);
         }
     } else if (!is_arr && len <= 8u) {
+        yyjson_val* keys[8];
+        yyjson_val* vals[8];
         bool cheap_leaf = true;
         yyjson_obj_iter it = yyjson_obj_iter_with(val);
-        yyjson_val* k = nullptr;
-        while ((k = yyjson_obj_iter_next(&it)) != nullptr) {
+        for (std::size_t i = 0u; i < len; ++i) {
+            yyjson_val* k = yyjson_obj_iter_next(&it);
             yyjson_val* v = yyjson_obj_iter_get_val(k);
             if (unsafe_yyjson_get_len(k) > 32u ||
                 (yyjson_is_ctn(v) && unsafe_yyjson_get_len(v) != 0u)) {
                 cheap_leaf = false;
                 break;
             }
+            keys[i] = k;
+            vals[i] = v;
         }
         if (cheap_leaf) {
-            json::object_t* obj = json_access::create_object_cap(len);
+            if (len <= kSmallObjCap) {
+                SmallObject4* so = json_access::create_small_object_raw();
+                struct SmallObjGuard {
+                    SmallObject4* p;
+                    ~SmallObjGuard() {
+                        if (p != nullptr) {
+                            json_access::destroy_small_object_raw(p);
+                        }
+                    }
+                } guard{so};
+                if (sdoc->tree_unique_verified.load(std::memory_order_acquire)) {
+                    for (std::size_t i = 0u; i < len; ++i) {
+                        const std::string_view kv(unsafe_yyjson_get_str(keys[i]),
+                                                  unsafe_yyjson_get_len(keys[i]));
+                        json_access::small_object_append_unique(so, kv, make_node(vals[i]));
+                    }
+                } else {
+                    for (std::size_t i = 0u; i < len; ++i) {
+                        const std::string_view kv(unsafe_yyjson_get_str(keys[i]),
+                                                  unsafe_yyjson_get_len(keys[i]));
+                        json_access::small_object_emplace_or_assign(so, kv, make_node(vals[i]));
+                    }
+                }
+                guard.p = nullptr;
+                return json_access::make_from_small_object(so);
+            }
+            json::object_t* obj = json_access::create_object_vec_cap(len);
             struct ObjGuard {
                 json::object_t* p;
                 ~ObjGuard() {
@@ -2049,18 +2181,17 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
                     }
                 }
             } guard{obj};
-            yyjson_obj_iter fill_it = yyjson_obj_iter_with(val);
             if (sdoc->tree_unique_verified.load(std::memory_order_acquire)) {
-                while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
-                    yyjson_val* v = yyjson_obj_iter_get_val(k);
-                    const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
-                    obj->emplace_back_unique_key(kv, make_node(v));
+                for (std::size_t i = 0u; i < len; ++i) {
+                    const std::string_view kv(unsafe_yyjson_get_str(keys[i]),
+                                              unsafe_yyjson_get_len(keys[i]));
+                    obj->emplace_back_unique_key(kv, make_node(vals[i]));
                 }
             } else {
-                while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
-                    yyjson_val* v = yyjson_obj_iter_get_val(k);
-                    const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
-                    obj->emplace_or_assign_key(kv, make_node(v));
+                for (std::size_t i = 0u; i < len; ++i) {
+                    const std::string_view kv(unsafe_yyjson_get_str(keys[i]),
+                                              unsafe_yyjson_get_len(keys[i]));
+                    obj->emplace_or_assign_key(kv, make_node(vals[i]));
                 }
             }
             guard.p = nullptr;
@@ -2430,6 +2561,72 @@ inline bool array_view_less(const json& lhs, const json& rhs) {
     return ln < rn;
 }
 
+inline bool object_view_equal(const json& lhs, const json& rhs) {
+    if (json_access::is_small_object(lhs)) {
+        const auto& lo = json_access::small_object_of(lhs);
+        if (json_access::is_small_object(rhs)) {
+            const auto& ro = json_access::small_object_of(rhs);
+            if (lo.count != ro.count) {
+                return false;
+            }
+            for (std::size_t i = 0u; i < lo.count; ++i) {
+                const auto& lp = lo.entry(i);
+                const auto& rp = ro.entry(i);
+                if (!(lp.first == rp.first && lp.second == rp.second)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        const auto* ro = json_access::const_object_of(rhs);
+        if (lo.count != ro->size()) {
+            return false;
+        }
+        for (std::size_t i = 0u; i < lo.count; ++i) {
+            const auto& lp = lo.entry(i);
+            const auto& rp = (*ro)[i];
+            if (!(lp.first == rp.first && lp.second == rp.second)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (json_access::is_small_object(rhs)) {
+        return object_view_equal(rhs, lhs);
+    }
+    return *json_access::const_object_of(lhs) == *json_access::const_object_of(rhs);
+}
+
+inline bool object_view_less(const json& lhs, const json& rhs) {
+    if (!json_access::is_small_object(lhs) && !json_access::is_small_object(rhs)) {
+        return *json_access::const_object_of(lhs) < *json_access::const_object_of(rhs);
+    }
+    const auto* lo =
+        json_access::is_small_object(lhs) ? nullptr : json_access::const_object_of(lhs);
+    const auto* ro =
+        json_access::is_small_object(rhs) ? nullptr : json_access::const_object_of(rhs);
+    const std::size_t ln = lo != nullptr ? lo->size() : json_access::small_object_of(lhs).count;
+    const std::size_t rn = ro != nullptr ? ro->size() : json_access::small_object_of(rhs).count;
+    const std::size_t common = (std::min)(ln, rn);
+    for (std::size_t i = 0u; i < common; ++i) {
+        const auto& lp = lo != nullptr ? (*lo)[i] : json_access::small_object_of(lhs).entry(i);
+        const auto& rp = ro != nullptr ? (*ro)[i] : json_access::small_object_of(rhs).entry(i);
+        if (lp.first < rp.first) {
+            return true;
+        }
+        if (rp.first < lp.first) {
+            return false;
+        }
+        if (lp.second < rp.second) {
+            return true;
+        }
+        if (rp.second < lp.second) {
+            return false;
+        }
+    }
+    return ln < rn;
+}
+
 } // namespace
 
 bool lazy_equal(const json& lhs, const json& rhs) noexcept {
@@ -2449,7 +2646,7 @@ bool lazy_equal(const json& lhs, const json& rhs) noexcept {
             return array_view_equal(lhs, rhs);
         }
         if (lhs_type == value_t::object) {
-            return *json_access::const_object_of(lhs) == *json_access::const_object_of(rhs);
+            return object_view_equal(lhs, rhs);
         }
         return false;
     } catch (...) {
@@ -2472,7 +2669,7 @@ bool lazy_less(const json& lhs, const json& rhs) noexcept {
             return array_view_less(lhs, rhs);
         }
         if (lhs_type == value_t::object) {
-            return *json_access::const_object_of(lhs) < *json_access::const_object_of(rhs);
+            return object_view_less(lhs, rhs);
         }
         return false;
     } catch (...) {
@@ -2516,7 +2713,18 @@ void lazy_materialize_deep(json& root) {
                 }
             }
         } else if (cur->is_object()) {
-            if (!json_access::is_empty_container(*cur)) {
+            if (json_access::is_small_object(*cur)) {
+                auto* so = json_access::small_object_ptr(*cur);
+                json_access::drop_small_object_const_cache(so);
+                for (std::size_t i = 0u; i < so->count; ++i) {
+                    json& val = so->entry(i).second;
+                    if (val.is_string()) {
+                        json_access::detach_shared_string(val);
+                    } else if (val.is_array() || val.is_object()) {
+                        stack.push_back(&val);
+                    }
+                }
+            } else if (!json_access::is_empty_container(*cur)) {
                 auto* obj = json_access::detach_object(*cur);
                 for (auto& kv : *obj) {
                     if (kv.second.is_string()) {
@@ -3108,6 +3316,72 @@ inline void dump_small_array_value(DumpBuffer& out, const SmallArray2& sa,
     }
 }
 
+inline void dump_small_object_compact_strict(DumpBuffer& out, const SmallObject4& so) {
+    if (so.count == 0u) {
+        out.append("{}", 2);
+        return;
+    }
+    out.push('{');
+    for (std::size_t i = 0u; i < so.count; ++i) {
+        if (i > 0u) {
+            out.push(',');
+        }
+        const auto& e = so.entry(i);
+        utf8_impl::dump_key_colon_fast_strict(out, e.first);
+        dump_compact_strict(out, e.second);
+    }
+    out.push('}');
+}
+
+inline void dump_small_object_value(DumpBuffer& out, const SmallObject4& so,
+                                    const bool pretty_print, const bool ensure_ascii,
+                                    const error_handler_t error_handler,
+                                    const unsigned int indent_step, std::string& indent_string,
+                                    const unsigned int current_indent) {
+    if (so.count == 0u) {
+        out.append("{}", 2);
+        return;
+    }
+    if (pretty_print) {
+        out.append("{\n", 2);
+        const unsigned int new_indent = current_indent + indent_step;
+        if (indent_string.size() < new_indent) {
+            indent_string.resize(
+                (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
+        }
+        for (std::size_t i = 0u; i < so.count; ++i) {
+            const auto& e = so.entry(i);
+            out.append(indent_string.data(), new_indent);
+            out.push('"');
+            utf8_impl::dump_escaped(out, e.first, ensure_ascii, error_handler);
+            out.append("\": ", 3);
+            dump_value(out, e.second, true, ensure_ascii, error_handler, indent_step,
+                       indent_string, new_indent);
+            if (i + 1u < so.count) {
+                out.append(",\n", 2);
+            } else {
+                out.push('\n');
+            }
+        }
+        out.append(indent_string.data(), current_indent);
+        out.push('}');
+    } else {
+        out.push('{');
+        for (std::size_t i = 0u; i < so.count; ++i) {
+            if (i > 0u) {
+                out.push(',');
+            }
+            const auto& e = so.entry(i);
+            out.push('"');
+            utf8_impl::dump_escaped(out, e.first, ensure_ascii, error_handler);
+            out.append("\":", 2);
+            dump_value(out, e.second, false, ensure_ascii, error_handler, indent_step,
+                       indent_string, current_indent);
+        }
+        out.push('}');
+    }
+}
+
 void dump_compact_strict(DumpBuffer& out, const json& val) {
     switch (json_access::type_of(val)) {
         case value_t::null:
@@ -3155,6 +3429,8 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
             if (json_access::is_lazy(val)) {
                 dump_yyjson_node_compact_strict(
                     out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::object);
+            } else if (json_access::is_small_object(val)) {
+                dump_small_object_compact_strict(out, json_access::small_object_of(val));
             } else if (json_access::is_empty_container(val)) {
                 out.append("{}", 2);
             } else {
@@ -3230,6 +3506,10 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
                 dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
                                  value_t::object, pretty_print, ensure_ascii, error_handler,
                                  indent_step, indent_string, current_indent);
+            } else if (json_access::is_small_object(val)) {
+                dump_small_object_value(out, json_access::small_object_of(val), pretty_print,
+                                        ensure_ascii, error_handler, indent_step, indent_string,
+                                        current_indent);
             } else if (json_access::is_empty_container(val)) {
                 out.append("{}", 2);
             } else {
