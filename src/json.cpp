@@ -557,6 +557,10 @@ public:
         return data_ + size_;
     }
 
+    char* end_ptr() noexcept {
+        return data_ + cap_;
+    }
+
     void advance_to(const char* end) noexcept {
         size_ = static_cast<std::size_t>(end - data_);
     }
@@ -1335,12 +1339,26 @@ inline void dump_escaped(DumpBuffer& out, const std::string& s, const bool ensur
     dump_escaped_from(out, s, 0, ensure_ascii, error_handler);
 }
 
-inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
+inline void ensure_space(DumpBuffer& out, char*& dst, char*& end, const std::size_t need) {
+    if (static_cast<std::size_t>(end - dst) < need) {
+        out.advance_to(dst);
+        out.reserve_extra(need);
+        dst = out.write_ptr();
+        end = out.end_ptr();
+    }
+}
+
+inline void dump_quoted_strict_impl(DumpBuffer& out, const std::string& s,
+                                    const bool with_colon) {
     const char* p = s.data();
     const std::size_t len = s.size();
+    const std::size_t extra = with_colon ? 3u : 2u;
+    if (len > (std::numeric_limits<std::size_t>::max)() - 32u) {
+        throw std::bad_alloc();
+    }
     const std::size_t first = find_non_verbatim_utf8(p, 0, len);
     if (first == len) {
-        out.reserve_extra(len + 2);
+        out.reserve_extra(len + extra);
         char* dst = out.write_ptr();
         *dst++ = '"';
         if (len != 0) {
@@ -1348,15 +1366,167 @@ inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
             dst += len;
         }
         *dst++ = '"';
+        if (with_colon) {
+            *dst++ = ':';
+        }
         out.advance_to(dst);
         return;
     }
-    out.push('"');
+
+    out.reserve_extra(len + extra + 16u);
+    char* dst = out.write_ptr();
+    char* end = out.end_ptr();
+    *dst++ = '"';
     if (first != 0) {
-        out.append(p, first);
+        std::memcpy(dst, p, first);
+        dst += first;
     }
-    dump_escaped_from(out, s, first, false, error_handler_t::strict);
-    out.push('"');
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::size_t i = first;
+    while (i < len) {
+        while (i + 8 <= len) {
+            std::uint64_t w = 0;
+            std::memcpy(&w, p + i, 8);
+            if (has_non_verbatim_utf8_8(w)) {
+                break;
+            }
+            ensure_space(out, dst, end, 8);
+            std::memcpy(dst, p + i, 8);
+            dst += 8;
+            i += 8;
+        }
+        while (i < len && kNeedsEscapeUtf8[static_cast<std::uint8_t>(p[i])] == 0u) {
+            ensure_space(out, dst, end, 1);
+            *dst++ = p[i++];
+        }
+        if (i == len) {
+            break;
+        }
+
+        const auto b0 = static_cast<std::uint8_t>(p[i]);
+        if (b0 < 0x80u) {
+            ensure_space(out, dst, end, 6);
+            switch (b0) {
+                case 0x08u:
+                    dst[0] = '\\';
+                    dst[1] = 'b';
+                    dst += 2;
+                    break;
+                case 0x09u:
+                    dst[0] = '\\';
+                    dst[1] = 't';
+                    dst += 2;
+                    break;
+                case 0x0Au:
+                    dst[0] = '\\';
+                    dst[1] = 'n';
+                    dst += 2;
+                    break;
+                case 0x0Cu:
+                    dst[0] = '\\';
+                    dst[1] = 'f';
+                    dst += 2;
+                    break;
+                case 0x0Du:
+                    dst[0] = '\\';
+                    dst[1] = 'r';
+                    dst += 2;
+                    break;
+                case 0x22u:
+                    dst[0] = '\\';
+                    dst[1] = '"';
+                    dst += 2;
+                    break;
+                case 0x5Cu:
+                    dst[0] = '\\';
+                    dst[1] = '\\';
+                    dst += 2;
+                    break;
+                default:
+                    dst[0] = '\\';
+                    dst[1] = 'u';
+                    dst[2] = '0';
+                    dst[3] = '0';
+                    dst[4] = kHex[(b0 >> 4u) & 0x0Fu];
+                    dst[5] = kHex[b0 & 0x0Fu];
+                    dst += 6;
+                    break;
+            }
+            ++i;
+            continue;
+        }
+
+        // Stream consecutive valid RFC 3629 multi-byte UTF-8 sequences without re-entering SWAR/DFA.
+        while (i < len) {
+            const auto u0 = static_cast<std::uint8_t>(p[i]);
+            if (u0 < 0x80u) {
+                break;
+            }
+            if (u0 >= 0xC2u && u0 <= 0xDFu) {
+                if (i + 1 < len && (static_cast<std::uint8_t>(p[i + 1]) & 0xC0u) == 0x80u) {
+                    ensure_space(out, dst, end, 2);
+                    dst[0] = p[i];
+                    dst[1] = p[i + 1];
+                    dst += 2;
+                    i += 2;
+                    continue;
+                }
+            } else if (u0 >= 0xE0u && u0 <= 0xEFu) {
+                if (i + 2 < len) {
+                    const auto u1 = static_cast<std::uint8_t>(p[i + 1]);
+                    const auto u2 = static_cast<std::uint8_t>(p[i + 2]);
+                    if ((u1 & 0xC0u) == 0x80u && (u2 & 0xC0u) == 0x80u &&
+                        !(u0 == 0xE0u && u1 < 0xA0u) && !(u0 == 0xEDu && u1 >= 0xA0u)) {
+                        ensure_space(out, dst, end, 3);
+                        dst[0] = p[i];
+                        dst[1] = p[i + 1];
+                        dst[2] = p[i + 2];
+                        dst += 3;
+                        i += 3;
+                        continue;
+                    }
+                }
+            } else if (u0 >= 0xF0u && u0 <= 0xF4u) {
+                if (i + 3 < len) {
+                    const auto u1 = static_cast<std::uint8_t>(p[i + 1]);
+                    const auto u2 = static_cast<std::uint8_t>(p[i + 2]);
+                    const auto u3 = static_cast<std::uint8_t>(p[i + 3]);
+                    if ((u1 & 0xC0u) == 0x80u && (u2 & 0xC0u) == 0x80u &&
+                        (u3 & 0xC0u) == 0x80u && !(u0 == 0xF0u && u1 < 0x90u) &&
+                        !(u0 == 0xF4u && u1 >= 0x90u)) {
+                        ensure_space(out, dst, end, 4);
+                        dst[0] = p[i];
+                        dst[1] = p[i + 1];
+                        dst[2] = p[i + 2];
+                        dst[3] = p[i + 3];
+                        dst += 4;
+                        i += 4;
+                        continue;
+                    }
+                }
+            }
+            out.advance_to(dst);
+            dump_escaped_from(out, s, i, false, error_handler_t::strict);
+            out.append(with_colon ? "\":" : "\"", with_colon ? 2u : 1u);
+            return;
+        }
+    }
+
+    ensure_space(out, dst, end, with_colon ? 2u : 1u);
+    *dst++ = '"';
+    if (with_colon) {
+        *dst++ = ':';
+    }
+    out.advance_to(dst);
+}
+
+inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
+    dump_quoted_strict_impl(out, s, false);
+}
+
+inline void dump_key_colon_fast_strict(DumpBuffer& out, const std::string& s) {
+    dump_quoted_strict_impl(out, s, true);
 }
 
 } // namespace utf8_impl
@@ -1531,8 +1701,7 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
                 if (i > 0) {
                     out.push(',');
                 }
-                utf8_impl::dump_quoted_fast_strict(out, obj[i].first);
-                out.push(':');
+                utf8_impl::dump_key_colon_fast_strict(out, obj[i].first);
                 dump_compact_strict(out, obj[i].second);
             }
             out.push('}');
