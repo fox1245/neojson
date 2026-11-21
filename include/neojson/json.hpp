@@ -1161,22 +1161,19 @@ public:
     // instead of passing the address of this object (and of the iterator inside it): a loop over items() then needs
     // no memory copy of the loop's iterator (see the comment at iter_impl::element_at).
     const string_type& key() const {
-        return key_at(anchor.m_object, anchor.idx_, anchor.m_ctn, array_index, array_index_last,
-                      array_index_str, empty_str);
+        return key_at(anchor.m_object, anchor.idx_, array_index, array_index_last, array_index_str, empty_str);
     }
 
     typename IteratorType::reference value() const {
-        return IteratorType::element_at(anchor.m_object, anchor.idx_, anchor.m_ctn);
+        return IteratorType::element_at(anchor.m_object, anchor.idx_);
     }
 
 private:
     static const string_type& key_at(typename IteratorType::pointer object,
                                      typename IteratorType::difference_type idx,
-                                     const void* ctn,
                                      std::size_t index, std::size_t& index_last, string_type& index_str,
                                      const string_type& empty) {
         assert(object != nullptr);
-        (void)ctn;
         switch (object->type()) {
             case value_t::array: {
                 if (index != index_last) {
@@ -1186,7 +1183,7 @@ private:
                 return index_str;
             }
             case value_t::object:
-                return IteratorType::key_at(object, idx, ctn);
+                return IteratorType::key_at(object, idx);
             default:
                 return empty;
         }
@@ -1223,6 +1220,8 @@ class iter_impl {
     friend BasicJsonType;
     template <typename It>
     friend class iteration_proxy_value;
+    template <typename Base>
+    friend class json_reverse_iterator;
 
 public:
     using value_type = typename BasicJsonType::value_type;
@@ -1240,14 +1239,13 @@ public:
     iter_impl(const iter_impl&) noexcept = default;
     iter_impl& operator=(const iter_impl&) noexcept = default;
 
-    explicit iter_impl(pointer object, difference_type idx = 0,
-                       const void* ctn = nullptr) noexcept
-        : m_object(object), idx_(idx), m_ctn(ctn) {}
+    explicit iter_impl(pointer object, difference_type idx = 0) noexcept
+        : m_object(object), idx_(idx) {}
 
     template <typename U = BasicJsonType,
               std::enable_if_t<std::is_const<U>::value, int> = 0>
     iter_impl(const iter_impl<typename std::remove_const<BasicJsonType>::type>& other) noexcept
-        : m_object(other.m_object), idx_(other.idx_), m_ctn(nullptr) {}
+        : m_object(other.m_object), idx_(other.idx_) {}
 
     template <typename U = BasicJsonType,
               std::enable_if_t<std::is_const<U>::value, int> = 0>
@@ -1255,16 +1253,15 @@ public:
         const iter_impl<typename std::remove_const<BasicJsonType>::type>& other) noexcept {
         m_object = other.m_object;
         idx_ = other.idx_;
-        m_ctn = nullptr;
         return *this;
     }
 
     reference operator*() const {
-        return element_at(m_object, idx_, m_ctn);
+        return element_at(m_object, idx_);
     }
 
     pointer operator->() const {
-        return std::addressof(element_at(m_object, idx_, m_ctn));
+        return std::addressof(element_at(m_object, idx_));
     }
 
     iter_impl operator++(int) {
@@ -1408,30 +1405,29 @@ public:
     }
 
     const typename BasicJsonType::object_t::key_type& key() const {
-        return key_at(m_object, idx_, m_ctn);
+        return key_at(m_object, idx_);
     }
 
     reference value() const {
-        return element_at(m_object, idx_, m_ctn);
+        return element_at(m_object, idx_);
     }
 
 private:
-    // The checked accessors take the container and the index by value, not the iterator. Written as member functions
-    // that the optimiser did not inline, they received the address of the loop's iterator, which then lived both in a
-    // register and in memory; MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
+    // The checked accessors take the container and the index by value, not the iterator, and iter_impl stays at
+    // two words (pointer + difference_type, 16 bytes on 64-bit) so ARM64 AAPCS64 passes and returns iterators in
+    // registers instead of spilling them to stack memory. Written as member functions that the optimiser did not
+    // inline, they received the address of the loop's iterator, which then lived both in a register and in memory;
+    // MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
     // `for (auto it = j.begin(); it != j.end(); ++it)` each value() after the first returned the previous element
-    // while key() returned the right one. Passed by value, the iterator need not be in memory at all.
-    static reference element_at(pointer object, difference_type idx, const void* ctn) {
-        (void)ctn;
+    // while key() returned the right one. Passed by value in two words, the iterator need not be in memory at all.
+    static reference element_at(pointer object, difference_type idx) {
         if (object == nullptr) {
             throw_invalid_iterator(214, "cannot get value");
         }
         switch (object->m_type) {
             case value_t::object: {
                 if constexpr (std::is_const<BasicJsonType>::value) {
-                    const auto* obj = (ctn != nullptr)
-                                          ? static_cast<const typename BasicJsonType::object_t*>(ctn)
-                                          : object->const_object();
+                    const auto* obj = object->const_object();
                     if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
@@ -1446,9 +1442,7 @@ private:
             }
             case value_t::array: {
                 if constexpr (std::is_const<BasicJsonType>::value) {
-                    const auto* arr = (ctn != nullptr)
-                                          ? static_cast<const typename BasicJsonType::array_t*>(ctn)
-                                          : object->const_array();
+                    const auto* arr = object->const_array();
                     if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
@@ -1472,14 +1466,11 @@ private:
     }
 
     static const typename BasicJsonType::object_t::key_type& key_at(pointer object,
-                                                                     difference_type idx,
-                                                                     const void* ctn) {
+                                                                     difference_type idx) {
         if (object == nullptr || object->m_type != value_t::object) {
             throw_invalid_iterator(207, "cannot use key() for non-object iterators");
         }
-        const auto* obj = (ctn != nullptr)
-                              ? static_cast<const typename BasicJsonType::object_t*>(ctn)
-                              : object->const_object();
+        const auto* obj = object->const_object();
         if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
             throw_invalid_iterator(214, "cannot get value");
         }
@@ -1488,7 +1479,6 @@ private:
 
     pointer m_object = nullptr;
     difference_type idx_ = 0;
-    const void* m_ctn = nullptr;
 };
 
 template <typename Base>
@@ -1536,18 +1526,24 @@ public:
         return base_iterator(*this) - base_iterator(other);
     }
 
+    reference operator*() const {
+        return Base::element_at(this->current.m_object, this->current.idx_ - 1);
+    }
+
+    typename Base::pointer operator->() const {
+        return std::addressof(Base::element_at(this->current.m_object, this->current.idx_ - 1));
+    }
+
     reference operator[](difference_type n) const {
         return *(this->operator+(n));
     }
 
     auto key() const -> decltype(std::declval<Base>().key()) {
-        auto it = --this->base();
-        return it.key();
+        return Base::key_at(this->current.m_object, this->current.idx_ - 1);
     }
 
     reference value() const {
-        auto it = --this->base();
-        return it.operator*();
+        return Base::element_at(this->current.m_object, this->current.idx_ - 1);
     }
 };
 
@@ -4287,14 +4283,7 @@ public:
     const_iterator begin() const noexcept { return cbegin(); }
 
     const_iterator cbegin() const noexcept {
-        switch (m_type) {
-            case value_t::object:
-                return const_iterator(this, 0, const_object());
-            case value_t::array:
-                return const_iterator(this, 0, const_array());
-            default:
-                return const_iterator(this, 0, nullptr);
-        }
+        return const_iterator(this, 0);
     }
 
     iterator end() noexcept {

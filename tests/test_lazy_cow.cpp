@@ -890,7 +890,12 @@ TEST(LazyCow, DirectYyjsonDumpEdgeCasesAndDeepStack) {
     ASSERT_TRUE(err.empty()) << err;
 }
 
-TEST(LazyCow, ConstIteratorCachingAndReverseEdgeCases) {
+TEST(LazyCow, ConstIteratorAndReverseEdgeCases) {
+    static_assert(sizeof(jk::iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
+    static_assert(sizeof(jk::const_iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
+    static_assert(sizeof(jk::reverse_iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
+    static_assert(sizeof(jk::const_reverse_iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
+
     const std::string obj_raw =
         R"({"k0":0,"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9})";
     const std::string arr_raw = "[0,1,2,3,4,5,6,7,8,9,10,11]";
@@ -933,7 +938,7 @@ TEST(LazyCow, ConstIteratorCachingAndReverseEdgeCases) {
     EXPECT_EQ(*(l_arr.cbegin() + 5), 5);
     EXPECT_EQ(*((l_arr.cend() - 1) - 3), 8);
 
-    // Non-const iterator converted to const_iterator must not carry a cached container pointer.
+    // Non-const iterator converted to const_iterator tracks container updates dynamically.
     jk mut_obj = jk::parse(obj_raw);
     auto mit = mut_obj.begin();
     jk::const_iterator cit(mit);
@@ -943,6 +948,15 @@ TEST(LazyCow, ConstIteratorCachingAndReverseEdgeCases) {
     EXPECT_EQ(cit.key(), "k0");
     EXPECT_EQ(*cit, 777);
     EXPECT_EQ(*cit2, 777);
+
+    // const_iterator remains valid across shared-handle detach on the same json handle.
+    jk shared_a = jk::parse(obj_raw);
+    jk shared_b = shared_a;
+    auto shared_cit = shared_a.cbegin();
+    shared_a["k0"] = 888;
+    EXPECT_EQ(shared_cit.key(), "k0");
+    EXPECT_EQ(*shared_cit, 888);
+    EXPECT_EQ(shared_b.at("k0"), 0);
 
     // Empty containers and scalar const iterators.
     const jk empty_obj = jk::object();
@@ -955,6 +969,14 @@ TEST(LazyCow, ConstIteratorCachingAndReverseEdgeCases) {
     EXPECT_EQ(scalar.cbegin() + 1, scalar.cend());
     EXPECT_EQ(*scalar.cbegin(), 42);
     EXPECT_EQ(*scalar.crbegin(), 42);
+
+    // Out-of-range and default-constructed reverse iterators throw invalid_iterator.
+    const jk::const_reverse_iterator empty_rev(jk::const_iterator{});
+    EXPECT_THROW((void)*l_obj.crend(), jk::invalid_iterator);
+    EXPECT_THROW((void)l_obj.crend().key(), jk::invalid_iterator);
+    EXPECT_THROW((void)*empty_rev, jk::invalid_iterator);
+    EXPECT_THROW((void)empty_rev.key(), jk::invalid_iterator);
+    EXPECT_THROW((void)*scalar.crend(), jk::invalid_iterator);
 }
 
 } // namespace
