@@ -60,11 +60,13 @@ namespace {
 
 inline constexpr std::size_t kSlabSize = 65536;
 inline constexpr std::uintptr_t kSlabMask = ~std::uintptr_t{kSlabSize - 1};
-inline constexpr std::uint32_t kNumSizeClasses = 10;
+inline constexpr std::uint32_t kNumSizeClasses = 16;
+inline constexpr std::size_t kMaxPooledSize = 4096u;
 inline constexpr std::uint32_t kMaxCachedEmptySlabs = 4;
 inline constexpr std::uint32_t kReclaimScanLimit = 8;
 inline constexpr std::array<std::uint32_t, kNumSizeClasses> kSizeClasses = {{
-    16u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u
+    16u,   32u,   48u,   64u,   96u,   128u,  192u,  256u,
+    384u,  512u,  768u,  1024u, 1536u, 2048u, 3072u, 4096u
 }};
 
 struct FreeNode {
@@ -139,21 +141,30 @@ struct SlabHeader {
 
 inline constexpr std::size_t kSlabHeaderBytes = (sizeof(SlabHeader) + 63u) & ~std::size_t{63};
 static_assert(kSlabHeaderBytes % 64u == 0u, "slab header must preserve slot alignment");
+static_assert((kSlabSize - kSlabHeaderBytes) / kMaxPooledSize >= 15u,
+              "largest pooled class must fit at least 15 slots per 64 KiB slab");
+
+constexpr std::array<std::uint8_t, 256> make_class_lut() noexcept {
+    std::array<std::uint8_t, 256> lut{};
+    for (std::size_t q = 0; q < 256u; ++q) {
+        const std::uint32_t req = static_cast<std::uint32_t>((q + 1u) * 16u);
+        std::uint8_t cls = 0;
+        while (cls + 1u < kNumSizeClasses && kSizeClasses[cls] < req) {
+            ++cls;
+        }
+        lut[q] = cls;
+    }
+    return lut;
+}
+
+inline constexpr std::array<std::uint8_t, 256> kClassLut = make_class_lut();
 
 inline std::uint32_t class_for_size(const std::size_t n) noexcept {
-    if (n <= 16u) {
+    if (n == 0u) {
         return 0u;
     }
-    if (n <= 64u) {
-        return static_cast<std::uint32_t>((n - 1u) >> 4u);
-    }
-    if (n <= 128u) {
-        return (n <= 96u) ? 4u : 5u;
-    }
-    if (n <= 256u) {
-        return (n <= 192u) ? 6u : 7u;
-    }
-    return (n <= 384u) ? 8u : 9u;
+    assert(n <= kMaxPooledSize);
+    return static_cast<std::uint32_t>(kClassLut[(n - 1u) >> 4u]);
 }
 
 inline void* alloc_aligned_64k() {
@@ -485,7 +496,7 @@ inline void remote_or_orphan_free(SlabHeader* s, void* p) noexcept {
 } // namespace
 
 void* pool_alloc(const std::size_t n) {
-    if (n > 512u) {
+    if (n > kMaxPooledSize) {
         return ::operator new(n);
     }
     const std::uint32_t cls = class_for_size(n);
@@ -509,7 +520,7 @@ void pool_free(void* p, const std::size_t n) noexcept {
     if (p == nullptr) {
         return;
     }
-    if (n > 512u) {
+    if (n > kMaxPooledSize) {
         ::operator delete(p);
         return;
     }
@@ -555,6 +566,10 @@ public:
 
     char* write_ptr() noexcept {
         return data_ + size_;
+    }
+
+    char* end_ptr() noexcept {
+        return data_ + cap_;
     }
 
     void advance_to(const char* end) noexcept {
@@ -628,6 +643,62 @@ void DumpBuffer::grow(const std::size_t need) {
     }
     cap_ = new_cap;
 }
+
+namespace {
+
+inline void append_uint(DumpBuffer& out, std::uint64_t v) {
+    static constexpr char kDigits100[201] =
+        "0001020304050607080910111213141516171819"
+        "2021222324252627282930313233343536373839"
+        "4041424344454647484950515253545556575859"
+        "6061626364656667686970717273747576777879"
+        "8081828384858687888990919293949596979899";
+    if (v < 100u) {
+        out.reserve_extra(2);
+        char* p = out.write_ptr();
+        if (v < 10u) {
+            *p++ = static_cast<char>('0' + v);
+        } else {
+            const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
+            p[0] = d[0];
+            p[1] = d[1];
+            p += 2;
+        }
+        out.advance_to(p);
+        return;
+    }
+    char buf[24];
+    char* p = buf + sizeof(buf);
+    while (v >= 100u) {
+        const auto q = v / 100u;
+        const auto r = static_cast<std::size_t>((v - q * 100u) * 2u);
+        v = q;
+        p -= 2;
+        p[0] = kDigits100[r];
+        p[1] = kDigits100[r + 1];
+    }
+    if (v >= 10u) {
+        const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
+        p -= 2;
+        p[0] = d[0];
+        p[1] = d[1];
+    } else {
+        *--p = static_cast<char>('0' + v);
+    }
+    out.append(p, static_cast<std::size_t>((buf + sizeof(buf)) - p));
+}
+
+inline void append_int(DumpBuffer& out, const std::int64_t v) {
+    if (v < 0) {
+        out.push('-');
+        const auto u = static_cast<std::uint64_t>(-(v + 1)) + 1u;
+        append_uint(out, u);
+    } else {
+        append_uint(out, static_cast<std::uint64_t>(v));
+    }
+}
+
+} // namespace
 
 namespace dtoa_impl {
 
@@ -817,45 +888,61 @@ inline cached_power get_cached_power_for_binary_exponent(int e) {
     return kCachedPowers[static_cast<std::size_t>(index)];
 }
 
-inline int find_largest_pow10(const std::uint32_t n, std::uint32_t& pow10) {
-    if (n >= 1000000000) {
-        pow10 = 1000000000;
-        return 10;
+inline int count_leading_zeros_u32(const std::uint32_t x) noexcept {
+    assert(x != 0u);
+#if (defined(__GNUC__) || defined(__clang__)) && (UINT_MAX == 0xFFFFFFFFU)
+    return __builtin_clz(x);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64) || defined(_M_IX86))
+    unsigned long idx = 0;
+    _BitScanReverse(&idx, x);
+    return 31 - static_cast<int>(idx);
+#else
+    int c = 0;
+    std::uint32_t v = x;
+    while ((v >> 31u) == 0u) {
+        v <<= 1u;
+        ++c;
     }
-    if (n >= 100000000) {
-        pow10 = 100000000;
-        return 9;
+    return c;
+#endif
+}
+
+inline int count_trailing_zeros_u64(const std::uint64_t x) noexcept {
+    assert(x != 0u);
+#if (defined(__GNUC__) || defined(__clang__)) && (ULLONG_MAX == 0xFFFFFFFFFFFFFFFFULL)
+    return __builtin_ctzll(static_cast<unsigned long long>(x));
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long idx = 0;
+    _BitScanForward64(&idx, x);
+    return static_cast<int>(idx);
+#else
+    int c = 0;
+    std::uint64_t v = x;
+    while ((v & 1u) == 0u) {
+        v >>= 1u;
+        ++c;
     }
-    if (n >= 10000000) {
-        pow10 = 10000000;
-        return 8;
+    return c;
+#endif
+}
+
+inline int find_largest_pow10(const std::uint32_t n) noexcept {
+    if (n == 0u) {
+        return 1;
     }
-    if (n >= 1000000) {
-        pow10 = 1000000;
-        return 7;
+    static constexpr std::array<std::uint8_t, 33> kMaxDigitsForBits = {{
+        1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5,
+        6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10
+    }};
+    static constexpr std::array<std::uint32_t, 10> kPow10 = {{
+        1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u
+    }};
+    const int bits = 32 - count_leading_zeros_u32(n);
+    int k = static_cast<int>(kMaxDigitsForBits[static_cast<std::size_t>(bits)]);
+    if (n < kPow10[static_cast<std::size_t>(k - 1)]) {
+        --k;
     }
-    if (n >= 100000) {
-        pow10 = 100000;
-        return 6;
-    }
-    if (n >= 10000) {
-        pow10 = 10000;
-        return 5;
-    }
-    if (n >= 1000) {
-        pow10 = 1000;
-        return 4;
-    }
-    if (n >= 100) {
-        pow10 = 100;
-        return 3;
-    }
-    if (n >= 10) {
-        pow10 = 10;
-        return 2;
-    }
-    pow10 = 1;
-    return 1;
+    return k;
 }
 
 inline void grisu2_round(char* buf, int len, std::uint64_t dist, std::uint64_t delta,
@@ -891,31 +978,60 @@ inline void grisu2_digit_gen(char* buffer, int& length, int& decimal_exponent, d
     auto p1 = static_cast<std::uint32_t>(M_plus.f >> -one.e);
     std::uint64_t p2 = M_plus.f & (one.f - 1);
 
-    static constexpr std::uint32_t kPow10[10] = {
-        1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u};
-    std::uint32_t pow10 = 0;
-    const int k = find_largest_pow10(p1, pow10);
+    const int k = find_largest_pow10(p1);
 
-    int n = k;
-    while (n > 0) {
-        const std::uint32_t d = p1 / pow10;
-        const std::uint32_t r = p1 - d * pow10;
-
-        assert(d <= 9);
-        buffer[length++] = static_cast<char>('0' + d);
-
-        const std::uint64_t rest = (static_cast<std::uint64_t>(r) << -one.e) + p2;
-        if (rest <= delta) {
-            decimal_exponent += n - 1;
-            grisu2_round(buffer, length, dist, delta, rest,
-                         static_cast<std::uint64_t>(pow10) << -one.e);
-            return;
-        }
-
-        p1 = r;
-        --n;
-        pow10 = (n > 0) ? kPow10[static_cast<std::size_t>(n - 1)] : 0u;
+#define NEOJSON_GRISU2_STEP(N, POW10)                                              \
+    case (N): {                                                                    \
+        const std::uint32_t d = p1 / (POW10);                                      \
+        const std::uint32_t r = p1 - d * (POW10);                                  \
+        assert(d <= 9);                                                            \
+        buffer[length++] = static_cast<char>('0' + d);                             \
+        const std::uint64_t rest = (static_cast<std::uint64_t>(r) << -one.e) + p2; \
+        if (rest <= delta) {                                                       \
+            decimal_exponent += (N) - 1;                                           \
+            grisu2_round(buffer, length, dist, delta, rest,                        \
+                         static_cast<std::uint64_t>(POW10) << -one.e);             \
+            return;                                                                \
+        }                                                                          \
+        p1 = r;                                                                    \
     }
+
+    switch (k) {
+        NEOJSON_GRISU2_STEP(10, 1000000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(9, 100000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(8, 10000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(7, 1000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(6, 100000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(5, 10000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(4, 1000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(3, 100u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(2, 10u)
+        [[fallthrough]];
+        case 1: {
+            const std::uint32_t d = p1;
+            assert(d <= 9);
+            buffer[length++] = static_cast<char>('0' + d);
+            if (p2 <= delta) {
+                grisu2_round(buffer, length, dist, delta, p2, one.f);
+                return;
+            }
+            p1 = 0;
+            break;
+        }
+        default:
+            assert(false);
+            break;
+    }
+
+#undef NEOJSON_GRISU2_STEP
 
     assert(p1 == 0);
     int m = 0;
@@ -995,6 +1111,8 @@ inline char* append_exponent(char* buf, int e) {
     return buf;
 }
 
+// Formats the `len` digits written by `grisu2` at `buf + 1` into `buf`, shifting only the short
+// integer prefix left by 1 on the common fixed-point decimal path (`0 < n <= max_exp`).
 inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp, int max_exp) {
     assert(min_exp < 0);
     assert(max_exp > 0);
@@ -1003,6 +1121,7 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
     const int n = len + k;
 
     if (k >= 0 && n <= max_exp) {
+        std::memmove(buf, buf + 1, static_cast<std::size_t>(len));
         std::fill_n(buf + len, k, '0');
         buf[n] = '.';
         buf[n + 1] = '0';
@@ -1011,14 +1130,14 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
 
     if (0 < n && n <= max_exp) {
         assert(k < 0);
-        std::memmove(buf + (static_cast<std::size_t>(n) + 1), buf + n,
-                     static_cast<std::size_t>(len - n));
+        std::memmove(buf, buf + 1, static_cast<std::size_t>(n));
         buf[n] = '.';
         return buf + (static_cast<std::size_t>(len) + 1U);
     }
 
     if (min_exp < n && n <= 0) {
-        std::memmove(buf + (2 + static_cast<std::size_t>(-n)), buf, static_cast<std::size_t>(len));
+        std::memmove(buf + (2 + static_cast<std::size_t>(-n)), buf + 1,
+                     static_cast<std::size_t>(len));
         buf[0] = '0';
         buf[1] = '.';
         std::fill_n(buf + 2, -n, '0');
@@ -1026,10 +1145,11 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
     }
 
     if (len > 1) {
-        std::memmove(buf + 2, buf + 1, static_cast<std::size_t>(len - 1));
+        buf[0] = buf[1];
         buf[1] = '.';
         buf += len + 1;
     } else {
+        buf[0] = buf[1];
         buf += 1;
     }
 
@@ -1057,6 +1177,27 @@ inline void append_float(DumpBuffer& out, double val) {
         return;
     }
 
+    const std::uint64_t raw = reinterpret_bits<std::uint64_t>(val);
+    const std::uint64_t exp_raw = (raw >> 52u) & 0x7FFu;
+    if (exp_raw != 0u) {
+        const int exp_bin = static_cast<int>(exp_raw) - 1023 - 52;
+        if (exp_bin >= -52 && exp_bin <= 0) {
+            const std::uint64_t sig_bin =
+                (raw & ((std::uint64_t{1} << 52u) - 1u)) | (std::uint64_t{1} << 52u);
+            if (count_trailing_zeros_u64(sig_bin) >= -exp_bin) {
+                const std::uint64_t sig_dec = sig_bin >> static_cast<unsigned>(-exp_bin);
+                if (sig_dec < 1000000000000000ULL) {
+                    if (is_negative) {
+                        out.push('-');
+                    }
+                    append_uint(out, sig_dec);
+                    out.append(".0", 2);
+                    return;
+                }
+            }
+        }
+    }
+
     out.reserve_extra(64);
     char* p = out.write_ptr();
     if (is_negative) {
@@ -1065,7 +1206,7 @@ inline void append_float(DumpBuffer& out, double val) {
 
     int length = 0;
     int decimal_exponent = 0;
-    grisu2(p, length, decimal_exponent, val);
+    grisu2(p + 1, length, decimal_exponent, val);
 
     constexpr int kMinExp = -4;
     constexpr int kMaxExp = std::numeric_limits<double>::digits10;
@@ -1335,12 +1476,26 @@ inline void dump_escaped(DumpBuffer& out, const std::string& s, const bool ensur
     dump_escaped_from(out, s, 0, ensure_ascii, error_handler);
 }
 
-inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
+inline void ensure_space(DumpBuffer& out, char*& dst, char*& end, const std::size_t need) {
+    if (static_cast<std::size_t>(end - dst) < need) {
+        out.advance_to(dst);
+        out.reserve_extra(need);
+        dst = out.write_ptr();
+        end = out.end_ptr();
+    }
+}
+
+inline void dump_quoted_strict_impl(DumpBuffer& out, const std::string& s,
+                                    const bool with_colon) {
     const char* p = s.data();
     const std::size_t len = s.size();
+    const std::size_t extra = with_colon ? 3u : 2u;
+    if (len > (std::numeric_limits<std::size_t>::max)() - 32u) {
+        throw std::bad_alloc();
+    }
     const std::size_t first = find_non_verbatim_utf8(p, 0, len);
     if (first == len) {
-        out.reserve_extra(len + 2);
+        out.reserve_extra(len + extra);
         char* dst = out.write_ptr();
         *dst++ = '"';
         if (len != 0) {
@@ -1348,15 +1503,167 @@ inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
             dst += len;
         }
         *dst++ = '"';
+        if (with_colon) {
+            *dst++ = ':';
+        }
         out.advance_to(dst);
         return;
     }
-    out.push('"');
+
+    out.reserve_extra(len + extra + 16u);
+    char* dst = out.write_ptr();
+    char* end = out.end_ptr();
+    *dst++ = '"';
     if (first != 0) {
-        out.append(p, first);
+        std::memcpy(dst, p, first);
+        dst += first;
     }
-    dump_escaped_from(out, s, first, false, error_handler_t::strict);
-    out.push('"');
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::size_t i = first;
+    while (i < len) {
+        while (i + 8 <= len) {
+            std::uint64_t w = 0;
+            std::memcpy(&w, p + i, 8);
+            if (has_non_verbatim_utf8_8(w)) {
+                break;
+            }
+            ensure_space(out, dst, end, 8);
+            std::memcpy(dst, p + i, 8);
+            dst += 8;
+            i += 8;
+        }
+        while (i < len && kNeedsEscapeUtf8[static_cast<std::uint8_t>(p[i])] == 0u) {
+            ensure_space(out, dst, end, 1);
+            *dst++ = p[i++];
+        }
+        if (i == len) {
+            break;
+        }
+
+        const auto b0 = static_cast<std::uint8_t>(p[i]);
+        if (b0 < 0x80u) {
+            ensure_space(out, dst, end, 6);
+            switch (b0) {
+                case 0x08u:
+                    dst[0] = '\\';
+                    dst[1] = 'b';
+                    dst += 2;
+                    break;
+                case 0x09u:
+                    dst[0] = '\\';
+                    dst[1] = 't';
+                    dst += 2;
+                    break;
+                case 0x0Au:
+                    dst[0] = '\\';
+                    dst[1] = 'n';
+                    dst += 2;
+                    break;
+                case 0x0Cu:
+                    dst[0] = '\\';
+                    dst[1] = 'f';
+                    dst += 2;
+                    break;
+                case 0x0Du:
+                    dst[0] = '\\';
+                    dst[1] = 'r';
+                    dst += 2;
+                    break;
+                case 0x22u:
+                    dst[0] = '\\';
+                    dst[1] = '"';
+                    dst += 2;
+                    break;
+                case 0x5Cu:
+                    dst[0] = '\\';
+                    dst[1] = '\\';
+                    dst += 2;
+                    break;
+                default:
+                    dst[0] = '\\';
+                    dst[1] = 'u';
+                    dst[2] = '0';
+                    dst[3] = '0';
+                    dst[4] = kHex[(b0 >> 4u) & 0x0Fu];
+                    dst[5] = kHex[b0 & 0x0Fu];
+                    dst += 6;
+                    break;
+            }
+            ++i;
+            continue;
+        }
+
+        // Stream consecutive valid RFC 3629 multi-byte UTF-8 sequences without re-entering SWAR/DFA.
+        while (i < len) {
+            const auto u0 = static_cast<std::uint8_t>(p[i]);
+            if (u0 < 0x80u) {
+                break;
+            }
+            if (u0 >= 0xC2u && u0 <= 0xDFu) {
+                if (i + 1 < len && (static_cast<std::uint8_t>(p[i + 1]) & 0xC0u) == 0x80u) {
+                    ensure_space(out, dst, end, 2);
+                    dst[0] = p[i];
+                    dst[1] = p[i + 1];
+                    dst += 2;
+                    i += 2;
+                    continue;
+                }
+            } else if (u0 >= 0xE0u && u0 <= 0xEFu) {
+                if (i + 2 < len) {
+                    const auto u1 = static_cast<std::uint8_t>(p[i + 1]);
+                    const auto u2 = static_cast<std::uint8_t>(p[i + 2]);
+                    if ((u1 & 0xC0u) == 0x80u && (u2 & 0xC0u) == 0x80u &&
+                        !(u0 == 0xE0u && u1 < 0xA0u) && !(u0 == 0xEDu && u1 >= 0xA0u)) {
+                        ensure_space(out, dst, end, 3);
+                        dst[0] = p[i];
+                        dst[1] = p[i + 1];
+                        dst[2] = p[i + 2];
+                        dst += 3;
+                        i += 3;
+                        continue;
+                    }
+                }
+            } else if (u0 >= 0xF0u && u0 <= 0xF4u) {
+                if (i + 3 < len) {
+                    const auto u1 = static_cast<std::uint8_t>(p[i + 1]);
+                    const auto u2 = static_cast<std::uint8_t>(p[i + 2]);
+                    const auto u3 = static_cast<std::uint8_t>(p[i + 3]);
+                    if ((u1 & 0xC0u) == 0x80u && (u2 & 0xC0u) == 0x80u &&
+                        (u3 & 0xC0u) == 0x80u && !(u0 == 0xF0u && u1 < 0x90u) &&
+                        !(u0 == 0xF4u && u1 >= 0x90u)) {
+                        ensure_space(out, dst, end, 4);
+                        dst[0] = p[i];
+                        dst[1] = p[i + 1];
+                        dst[2] = p[i + 2];
+                        dst[3] = p[i + 3];
+                        dst += 4;
+                        i += 4;
+                        continue;
+                    }
+                }
+            }
+            out.advance_to(dst);
+            dump_escaped_from(out, s, i, false, error_handler_t::strict);
+            out.append(with_colon ? "\":" : "\"", with_colon ? 2u : 1u);
+            return;
+        }
+    }
+
+    ensure_space(out, dst, end, with_colon ? 2u : 1u);
+    *dst++ = '"';
+    if (with_colon) {
+        *dst++ = ':';
+    }
+    out.advance_to(dst);
+}
+
+inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
+    dump_quoted_strict_impl(out, s, false);
+}
+
+inline void dump_key_colon_fast_strict(DumpBuffer& out, const std::string& s) {
+    dump_quoted_strict_impl(out, s, true);
 }
 
 } // namespace utf8_impl
@@ -1421,58 +1728,6 @@ struct json_access {
 
 namespace {
 
-inline void append_uint(DumpBuffer& out, std::uint64_t v) {
-    static constexpr char kDigits100[201] =
-        "0001020304050607080910111213141516171819"
-        "2021222324252627282930313233343536373839"
-        "4041424344454647484950515253545556575859"
-        "6061626364656667686970717273747576777879"
-        "8081828384858687888990919293949596979899";
-    if (v < 100u) {
-        out.reserve_extra(2);
-        char* p = out.write_ptr();
-        if (v < 10u) {
-            *p++ = static_cast<char>('0' + v);
-        } else {
-            const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
-            p[0] = d[0];
-            p[1] = d[1];
-            p += 2;
-        }
-        out.advance_to(p);
-        return;
-    }
-    char buf[24];
-    char* p = buf + sizeof(buf);
-    while (v >= 100u) {
-        const auto q = v / 100u;
-        const auto r = static_cast<std::size_t>((v - q * 100u) * 2u);
-        v = q;
-        p -= 2;
-        p[0] = kDigits100[r];
-        p[1] = kDigits100[r + 1];
-    }
-    if (v >= 10u) {
-        const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
-        p -= 2;
-        p[0] = d[0];
-        p[1] = d[1];
-    } else {
-        *--p = static_cast<char>('0' + v);
-    }
-    out.append(p, static_cast<std::size_t>((buf + sizeof(buf)) - p));
-}
-
-inline void append_int(DumpBuffer& out, const std::int64_t v) {
-    if (v < 0) {
-        out.push('-');
-        const auto u = static_cast<std::uint64_t>(-(v + 1)) + 1u;
-        append_uint(out, u);
-    } else {
-        append_uint(out, static_cast<std::uint64_t>(v));
-    }
-}
-
 void dump_compact_strict(DumpBuffer& out, const json& val) {
     switch (json_access::type_of(val)) {
         case value_t::null:
@@ -1531,8 +1786,7 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
                 if (i > 0) {
                     out.push(',');
                 }
-                utf8_impl::dump_quoted_fast_strict(out, obj[i].first);
-                out.push(':');
+                utf8_impl::dump_key_colon_fast_strict(out, obj[i].first);
                 dump_compact_strict(out, obj[i].second);
             }
             out.push('}');

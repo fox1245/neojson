@@ -46,8 +46,23 @@ TEST(DumpNumbersAndSwar, DoubleDumpMatchesOracleAcross100kRandomAndBoundaryValue
         1e-308,
         1e-309,
         1e308,
+        42.0,
+        -42.0,
+        1234567.0,
+        -1234567.0,
+        999999999999998.0,
+        999999999999999.0,
+        -999999999999999.0,
+        1000000000000000.0,
+        -1000000000000000.0,
+        9007199254740991.0,   // 2^53 - 1
+        -9007199254740991.0,
+        9007199254740992.0,   // 2^53
+        -9007199254740992.0,
         std::numeric_limits<double>::min(),
+        -std::numeric_limits<double>::min(),
         std::numeric_limits<double>::denorm_min(),
+        -std::numeric_limits<double>::denorm_min(),
         std::numeric_limits<double>::max(),
         -std::numeric_limits<double>::max(),
         std::numeric_limits<double>::epsilon(),
@@ -192,6 +207,83 @@ TEST(DumpNumbersAndSwar, SwarStringBoundariesAndBufferGrowthMatchOracle) {
         s_deep = jk::array({s_deep});
     }
     EXPECT_EQ(o_deep.dump(4, '\t'), s_deep.dump(4, '\t'));
+}
+
+TEST(DumpNumbersAndSwar, Utf8MultibyteStreamingAndErrorsMatchOracle) {
+    const std::vector<std::string> valid_cases = {
+        // Long multi-byte runs (Korean, Japanese, Arabic, emoji) with/without ASCII & escapes
+        "\xED\x95\x9C\xEA\xB5\xAD\xEC\x96\xB4\xEB\xAC\xB8\xEC\x9E\xA5",
+        "\xE3\x81\x8D\xE3\x82\x87\xE3\x81\x86\xE3\x81\xAF\xE3\x81\x84\xE3\x81\x84\xE5\xA4\xA9\xE6\xB0\x97",
+        "\xD8\xA7\xD9\x84\xD8\xB9\xD8\xB1\xD8\xA8\xD9\x8A\xD8\xA9",
+        "\xF0\x9F\x98\x80\xF0\x9F\x9A\x80\xF0\x9F\x8E\x89\xE2\x9C\xA8",
+        "prefix_abcdefgh_\xE3\x81\x82\n\t\"\\\x01\xED\x95\x9C_suffix",
+        // Exact RFC 3629 boundary code points
+        "\xC2\x80\xDF\xBF\xE0\xA0\x80\xED\x9F\xBF\xEE\x80\x80\xEF\xBF\xBF\xF0\x90\x80\x80\xF4\x8F\xBF\xBF",
+        // 0x7F DEL + multi-byte mix
+        "abc\x7F\xC2\x80\x7F\xF4\x8F\xBF\xBFxyz",
+    };
+
+    for (const std::string& s : valid_cases) {
+        neojson::test::assert_equivalent(oj(s), jk(s));
+    }
+
+    // Object keys with clean ASCII, escaped ASCII, multi-byte UTF-8, and mixed values (key-colon fusion)
+    {
+        oj o_obj = oj::object();
+        jk s_obj = jk::object();
+        for (std::size_t idx = 0; idx < valid_cases.size(); ++idx) {
+            const std::string k = "key_" + std::to_string(idx) + "_" + valid_cases[idx];
+            o_obj[k] = valid_cases[idx];
+            s_obj[k] = valid_cases[idx];
+        }
+        o_obj["plain_ascii_key_123456789"] = "plain_ascii_val_123456789";
+        s_obj["plain_ascii_key_123456789"] = "plain_ascii_val_123456789";
+        // Large expansion (> 6x input via repeated escapes) to force DumpBuffer growth mid-stream
+        std::string many_escapes;
+        for (int i = 0; i < 1200; ++i) {
+            many_escapes += "\x01\"\\\n";
+        }
+        o_obj["many_escapes"] = many_escapes;
+        s_obj["many_escapes"] = many_escapes;
+        neojson::test::assert_equivalent(o_obj, s_obj);
+    }
+
+    // Invalid and truncated UTF-8 sequences must match nlohmann::ordered_json strict error index & byte
+    const std::vector<std::string> invalid_tails = {
+        "\x80",
+        "\xC0\xAF",
+        "\xC1\xBF",
+        "\xE0\x80\xAF",
+        "\xE0\x9F\xBF",
+        "\xED\xA0\x80",
+        "\xED\xBF\xBF",
+        "\xF0\x80\x80\x80",
+        "\xF0\x8F\xBF\xBF",
+        "\xF4\x90\x80\x80",
+        "\xF5\x80\x80\x80",
+        "\xFF",
+        "\xC2",
+        "\xE2\x82",
+        "\xE2\x82 ",
+        "\xF0\x9F\x98",
+        "\xF0\x9F\x98z",
+    };
+    const std::vector<std::string> prefixes = {
+        "",
+        "0123456789abcdef",
+        "esc\n\x01\xE3\x81\x82",
+    };
+    for (const std::string& pre : prefixes) {
+        for (const std::string& bad : invalid_tails) {
+            const std::string sample = pre + bad;
+            neojson::test::assert_equivalent(oj(sample), jk(sample));
+            oj o_k = oj::object();
+            jk s_k = jk::object();
+            o_k[sample] = 42;
+            s_k[sample] = 42;
+            neojson::test::assert_equivalent(o_k, s_k);
+        }
+    }
 }
 
 } // namespace
