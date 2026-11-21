@@ -3582,9 +3582,6 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    // The document is valid but nested deeper than the limit: scan it again for the position of the first level
-    // past the limit and report it like a syntax error.
-    // Without exceptions the scan would only produce an error that nobody reads, so it is not run.
     auto fail_nesting = [&]() -> json {
         if (!allow_exceptions) {
             return json(value_t::discarded);
@@ -3617,7 +3614,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         return result;
     };
 
-    if (s.find('\0') != std::string_view::npos) {
+    auto parse_with_nul_scan = [&]() -> json {
         detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         if (!diag.diagnose(allow_exceptions)) {
             if (allow_exceptions) {
@@ -3635,9 +3632,13 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
             std::replace(clean_prefix.begin(), clean_prefix.end(), '\0', '\n');
             data = clean_prefix.data();
         }
-        yyjson_doc* doc =
-            yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
+        yyjson_read_err err{};
+        yyjson_doc* doc = yyjson_read_opts_max_depth(
+            const_cast<char*>(data), size, flg, nullptr, options.max_depth, &err);
         if (doc == nullptr) {
+            if (err.code == YYJSON_READ_ERROR_DEPTH) {
+                return fail_nesting();
+            }
             if (allow_exceptions) {
                 throw other_error::create(
                     599, "internal error: diagnostic scanner and yyjson disagreed");
@@ -3649,12 +3650,25 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
             ~DocGuard() { yyjson_doc_free(d); }
         } guard{doc};
         return finish_doc(doc);
+    };
+
+    // Only pre-scan for NUL when comments are enabled (raw NUL inside comments would not fail yyjson).
+    if (ignore_comments && s.find('\0') != std::string_view::npos) {
+        return parse_with_nul_scan();
     }
 
-    // yyjson_read_opts does not mutate the input buffer when YYJSON_READ_INSITU is not set.
-    yyjson_doc* doc =
-        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
+    // yyjson_read_opts_max_depth does not mutate the input buffer when YYJSON_READ_INSITU is not set.
+    yyjson_read_err err{};
+    yyjson_doc* doc = yyjson_read_opts_max_depth(
+        const_cast<char*>(s.data()), s.size(), flg, nullptr, options.max_depth, &err);
     if (doc == nullptr) {
+        if (!ignore_comments && err.code != YYJSON_READ_ERROR_DEPTH &&
+            s.find('\0') != std::string_view::npos) {
+            return parse_with_nul_scan();
+        }
+        if (err.code == YYJSON_READ_ERROR_DEPTH) {
+            return fail_nesting();
+        }
         if (!allow_exceptions) {
             return json(value_t::discarded);
         }
@@ -3683,7 +3697,7 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    if (s.find('\0') != std::string_view::npos) {
+    auto accept_with_nul_scan = [&]() -> bool {
         detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         if (!diag.diagnose(false)) {
             return false;
@@ -3697,24 +3711,32 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
             std::replace(clean_prefix.begin(), clean_prefix.end(), '\0', '\n');
             data = clean_prefix.data();
         }
-        yyjson_doc* doc =
-            yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
+        yyjson_read_err err{};
+        yyjson_doc* doc = yyjson_read_opts_max_depth(
+            const_cast<char*>(data), size, flg, nullptr, options.max_depth, &err);
         if (doc == nullptr) {
             return false;
         }
-        const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
         yyjson_doc_free(doc);
-        return ok;
+        return true;
+    };
+
+    if (ignore_comments && s.find('\0') != std::string_view::npos) {
+        return accept_with_nul_scan();
     }
 
-    yyjson_doc* doc =
-        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
+    yyjson_read_err err{};
+    yyjson_doc* doc = yyjson_read_opts_max_depth(
+        const_cast<char*>(s.data()), s.size(), flg, nullptr, options.max_depth, &err);
     if (doc == nullptr) {
+        if (!ignore_comments && err.code != YYJSON_READ_ERROR_DEPTH &&
+            s.find('\0') != std::string_view::npos) {
+            return accept_with_nul_scan();
+        }
         return false;
     }
-    const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
     yyjson_doc_free(doc);
-    return ok;
+    return true;
 }
 
 bool json::accept(std::istream& i, const bool ignore_comments, const parse_options& options) {
