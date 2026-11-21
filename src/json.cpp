@@ -1,9 +1,25 @@
 #include "neojson/json.hpp"
 
+#include <chrono>
+#include <random>
+
 #include "yyjson.h"
 
 namespace neojson {
 namespace detail {
+
+std::uint64_t hash_seed_init() noexcept {
+    std::uint64_t s = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    try {
+        std::random_device rd;
+        s ^= (static_cast<std::uint64_t>(rd()) << 32u) | static_cast<std::uint64_t>(rd());
+    } catch (...) {
+    }
+    s ^= reinterpret_cast<std::uintptr_t>(&hash_seed_init);
+    return fmix64(s) | 1ULL;
+}
+
 namespace dtoa_impl {
 
 template <typename Target, typename Source>
