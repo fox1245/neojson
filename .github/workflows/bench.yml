@@ -1,0 +1,55 @@
+name: Benchmark
+
+# Runs bench/ (neojson against cpp-yyjson, yyjson's C API and nlohmann/json) on pushes to bench/** branches and on
+# demand. Hosted runners are shared machines, so the absolute times vary from run to run; the ratios to yyjson's C API
+# measured in alternating rounds within one job are the result. The table goes to the job summary.
+
+on:
+  push:
+    branches: ["bench/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-clang, runner: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: linux-x64-gcc, runner: ubuntu-24.04, cc: gcc, cxx: g++ }
+          - { name: linux-arm64-clang, runner: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
+          - { name: macos-arm64, runner: macos-15, cc: cc, cxx: c++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure (Release)
+        run: |
+          cmake -S bench -B build-bench -DCMAKE_BUILD_TYPE=Release
+          cmake -S bench -B build-bench-bundled -DCMAKE_BUILD_TYPE=Release -DBENCH_CPPYYJSON_BUNDLED=ON
+      - name: Show the compiler and the flags the build uses
+        run: |
+          grep -E 'CMAKE_CXX_COMPILER:|CMAKE_BUILD_TYPE:|CMAKE_CXX_FLAGS_RELEASE:|CPPYYJSON_' build-bench/CMakeCache.txt build-bench-bundled/CMakeCache.txt
+          ${CXX} --version
+      - name: Build
+        run: |
+          cmake --build build-bench --parallel
+          cmake --build build-bench-bundled --parallel
+      - name: Run
+        run: python3 -I bench/run.py --build build-bench --build build-bench-bundled --rounds 7 --markdown table.md --json results.json
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f table.md ]; then cat table.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f results.json ]; then cat results.json; fi
