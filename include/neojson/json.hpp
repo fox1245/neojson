@@ -188,8 +188,20 @@ struct LazyHeader {
     std::atomic<void*> materialized{nullptr};
     std::size_t raw_len = 0;
     std::atomic<std::uint32_t> refcount{1u};
+    // Bitmask: 0 = unknown, 1 = own-level unique, 2 = own-level has duplicate keys,
+    // 4 = entire subtree unique, 8 = subtree has duplicate keys
     std::atomic<std::uint8_t> dedup_state{0u};
 };
+
+struct SharedString {
+    // 0u = unshareable (pinned because caller obtained mutable string_t* / string_t&)
+    std::atomic<std::uint32_t> refcount{1u};
+    std::string value;
+
+    template <typename... Args>
+    explicit SharedString(Args&&... args) : value(std::forward<Args>(args)...) {}
+};
+static_assert(sizeof(SharedString) <= 48u, "SharedString should fit in small pooled slab");
 
 void lazy_release(LazyHeader* node, value_t type) noexcept;
 const void* lazy_materialize_const(LazyHeader* node, value_t type);
@@ -1208,6 +1220,8 @@ class iter_impl {
     friend BasicJsonType;
     template <typename It>
     friend class iteration_proxy_value;
+    template <typename Base>
+    friend class json_reverse_iterator;
 
 public:
     using value_type = typename BasicJsonType::value_type;
@@ -1281,10 +1295,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator==(const IterImpl& other) const {
-        if (m_object != other.m_object) {
-            throw invalid_iterator::create(212, "cannot compare iterators of different containers");
-        }
-        return idx_ == other.idx_;
+        return equal_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     template <typename IterImpl,
@@ -1292,7 +1303,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator!=(const IterImpl& other) const {
-        return !operator==(other);
+        return !equal_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     template <typename IterImpl,
@@ -1300,13 +1311,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator<(const IterImpl& other) const {
-        if (m_object != other.m_object) {
-            throw invalid_iterator::create(212, "cannot compare iterators of different containers");
-        }
-        if (m_object != nullptr && m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(213, "cannot compare order of object iterators");
-        }
-        return idx_ < other.idx_;
+        return less_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     template <typename IterImpl,
@@ -1314,7 +1319,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator<=(const IterImpl& other) const {
-        return !other.operator<(*this);
+        return !less_at(other.m_object, other.idx_, m_object, idx_);
     }
 
     template <typename IterImpl,
@@ -1322,7 +1327,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator>(const IterImpl& other) const {
-        return !operator<=(other);
+        return less_at(other.m_object, other.idx_, m_object, idx_);
     }
 
     template <typename IterImpl,
@@ -1330,7 +1335,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator>=(const IterImpl& other) const {
-        return !operator<(other);
+        return !less_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     iter_impl& operator+=(difference_type i) {
@@ -1338,7 +1343,7 @@ public:
             return *this;
         }
         if (m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(209, "cannot use offsets with object iterators");
+            throw_invalid_iterator(209, "cannot use offsets with object iterators");
         }
         idx_ += i;
         return *this;
@@ -1371,23 +1376,14 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     difference_type operator-(const IterImpl& other) const {
-        if (m_object != other.m_object) {
-            throw invalid_iterator::create(209, "cannot use offsets with object iterators");
-        }
-        if (m_object == nullptr || m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(209, "cannot use offsets with object iterators");
-        }
-        return idx_ - other.idx_;
+        return diff_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     reference operator[](difference_type n) const {
-        if (m_object == nullptr) {
-            throw invalid_iterator::create(208, "cannot use operator[] for object iterators");
+        if (m_object == nullptr || m_object->m_type == value_t::object) {
+            throw_invalid_iterator(208, "cannot use operator[] for object iterators");
         }
-        if (m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(208, "cannot use operator[] for object iterators");
-        }
-        return *(*this + n);
+        return element_at(m_object, idx_ + n);
     }
 
     const typename BasicJsonType::object_t::key_type& key() const {
@@ -1399,11 +1395,41 @@ public:
     }
 
 private:
-    // The checked accessors take the container and the index by value, not the iterator. Written as member functions
-    // that the optimiser did not inline, they received the address of the loop's iterator, which then lived both in a
-    // register and in memory; MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
+    using const_json_pointer = const typename std::remove_const<BasicJsonType>::type*;
+
+    static bool equal_at(const void* lhs_obj, difference_type lhs_idx,
+                         const void* rhs_obj, difference_type rhs_idx) {
+        if (lhs_obj != rhs_obj) {
+            throw_invalid_iterator(212, "cannot compare iterators of different containers");
+        }
+        return lhs_idx == rhs_idx;
+    }
+
+    static bool less_at(const_json_pointer lhs_obj, difference_type lhs_idx,
+                        const_json_pointer rhs_obj, difference_type rhs_idx) {
+        if (lhs_obj != rhs_obj) {
+            throw_invalid_iterator(212, "cannot compare iterators of different containers");
+        }
+        if (lhs_obj != nullptr && lhs_obj->m_type == value_t::object) {
+            throw_invalid_iterator(213, "cannot compare order of object iterators");
+        }
+        return lhs_idx < rhs_idx;
+    }
+
+    static difference_type diff_at(const_json_pointer lhs_obj, difference_type lhs_idx,
+                                   const_json_pointer rhs_obj, difference_type rhs_idx) {
+        if (lhs_obj != rhs_obj || lhs_obj == nullptr || lhs_obj->m_type == value_t::object) {
+            throw_invalid_iterator(209, "cannot use offsets with object iterators");
+        }
+        return lhs_idx - rhs_idx;
+    }
+    // The checked accessors take the container and the index by value, not the iterator, and iter_impl stays at
+    // two words (pointer + difference_type, 16 bytes on 64-bit) so ARM64 AAPCS64 passes and returns iterators in
+    // registers instead of spilling them to stack memory. Written as member functions that the optimiser did not
+    // inline, they received the address of the loop's iterator, which then lived both in a register and in memory;
+    // MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
     // `for (auto it = j.begin(); it != j.end(); ++it)` each value() after the first returned the previous element
-    // while key() returned the right one. Passed by value, the iterator need not be in memory at all.
+    // while key() returned the right one. Passed by value in two words, the iterator need not be in memory at all.
     static reference element_at(pointer object, difference_type idx) {
         if (object == nullptr) {
             throw_invalid_iterator(214, "cannot get value");
@@ -1449,7 +1475,8 @@ private:
         }
     }
 
-    static const typename BasicJsonType::object_t::key_type& key_at(pointer object, difference_type idx) {
+    static const typename BasicJsonType::object_t::key_type& key_at(pointer object,
+                                                                     difference_type idx) {
         if (object == nullptr || object->m_type != value_t::object) {
             throw_invalid_iterator(207, "cannot use key() for non-object iterators");
         }
@@ -1482,7 +1509,8 @@ public:
     }
 
     json_reverse_iterator& operator++() {
-        return static_cast<json_reverse_iterator&>(base_iterator::operator++());
+        --this->current;
+        return *this;
     }
 
     json_reverse_iterator operator--(int) {
@@ -1490,7 +1518,8 @@ public:
     }
 
     json_reverse_iterator& operator--() {
-        return static_cast<json_reverse_iterator&>(base_iterator::operator--());
+        ++this->current;
+        return *this;
     }
 
     json_reverse_iterator& operator+=(difference_type i) {
@@ -1509,18 +1538,41 @@ public:
         return base_iterator(*this) - base_iterator(other);
     }
 
+    friend bool operator==(const json_reverse_iterator& lhs,
+                           const json_reverse_iterator& rhs) {
+        return equal_rev(lhs, rhs);
+    }
+
+    friend bool operator!=(const json_reverse_iterator& lhs,
+                           const json_reverse_iterator& rhs) {
+        return !equal_rev(lhs, rhs);
+    }
+
+    reference operator*() const {
+        return Base::element_at(this->current.m_object, this->current.idx_ - 1);
+    }
+
+    typename Base::pointer operator->() const {
+        return std::addressof(Base::element_at(this->current.m_object, this->current.idx_ - 1));
+    }
+
     reference operator[](difference_type n) const {
         return *(this->operator+(n));
     }
 
     auto key() const -> decltype(std::declval<Base>().key()) {
-        auto it = --this->base();
-        return it.key();
+        return Base::key_at(this->current.m_object, this->current.idx_ - 1);
     }
 
     reference value() const {
-        auto it = --this->base();
-        return it.operator*();
+        return Base::element_at(this->current.m_object, this->current.idx_ - 1);
+    }
+
+private:
+    static bool equal_rev(const json_reverse_iterator& lhs,
+                          const json_reverse_iterator& rhs) {
+        return Base::equal_at(lhs.current.m_object, lhs.current.idx_,
+                              rhs.current.m_object, rhs.current.idx_);
     }
 };
 
@@ -3178,21 +3230,71 @@ public:
 
 private:
     template <typename... Args>
-    static string_t* create_string(Args&&... args) {
-        void* mem = detail::pool_alloc(sizeof(string_t));
+    static detail::SharedString* create_string(Args&&... args) {
+        void* mem = detail::pool_alloc(sizeof(detail::SharedString));
         try {
-            return ::new (mem) string_t(std::forward<Args>(args)...);
+            return ::new (mem) detail::SharedString(std::forward<Args>(args)...);
         } catch (...) {
-            detail::pool_free(mem, sizeof(string_t));
+            detail::pool_free(mem, sizeof(detail::SharedString));
             throw;
         }
     }
 
-    static void destroy_string(string_t* s) noexcept {
+    static void release_string(detail::SharedString* s) noexcept {
         if (s != nullptr) {
-            s->~string_t();
-            detail::pool_free(s, sizeof(string_t));
+            const std::uint32_t rc = s->refcount.load(std::memory_order_acquire);
+            if (rc <= 1u || s->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+                s->~SharedString();
+                detail::pool_free(s, sizeof(detail::SharedString));
+            }
         }
+    }
+
+    static detail::SharedString* share_or_clone_string(detail::SharedString* src) {
+        std::uint32_t rc = src->refcount.load(std::memory_order_acquire);
+        while (rc != 0u && rc != (std::numeric_limits<std::uint32_t>::max)()) {
+            if (src->refcount.compare_exchange_weak(rc, rc + 1u, std::memory_order_relaxed,
+                                                    std::memory_order_relaxed)) {
+                return src;
+            }
+        }
+        return create_string(src->value);
+    }
+
+    string_t* mutable_string_unique() {
+        detail::SharedString* s = m_value.string;
+        if (s->refcount.load(std::memory_order_acquire) <= 1u) {
+            return &s->value;
+        }
+        detail::SharedString* fresh = create_string(s->value);
+        m_value.string = fresh;
+        release_string(s);
+        return &fresh->value;
+    }
+
+    string_t* mutable_string_pin() {
+        detail::SharedString* s = m_value.string;
+        const std::uint32_t rc = s->refcount.load(std::memory_order_acquire);
+        if (rc == 0u) {
+            return &s->value;
+        }
+        if (rc == 1u) {
+            s->refcount.store(0u, std::memory_order_relaxed);
+            return &s->value;
+        }
+        detail::SharedString* fresh = create_string(s->value);
+        fresh->refcount.store(0u, std::memory_order_relaxed);
+        m_value.string = fresh;
+        release_string(s);
+        return &fresh->value;
+    }
+
+    static string_t extract_string_key(json& key_json) {
+        detail::SharedString* s = key_json.m_value.string;
+        if (s->refcount.load(std::memory_order_acquire) <= 1u) {
+            return std::move(s->value);
+        }
+        return s->value;
     }
 
     template <typename... Args>
@@ -3234,7 +3336,7 @@ private:
     union json_value {
         object_t* object;
         array_t* array;
-        string_t* string;
+        detail::SharedString* string;
         detail::LazyHeader* lazy;
         boolean_t boolean;
         number_integer_t number_integer;
@@ -3390,7 +3492,7 @@ private:
                     destroy_container(array);
                     break;
                 case value_t::string:
-                    destroy_string(string);
+                    release_string(string);
                     string = nullptr;
                     break;
                 default:
@@ -3429,7 +3531,7 @@ private:
                 m_value.array = create_array(*(other.m_value.array));
                 break;
             case value_t::string:
-                m_value.string = create_string(*(other.m_value.string));
+                m_value.string = share_or_clone_string(other.m_value.string);
                 break;
             default:
                 break;
@@ -3543,7 +3645,7 @@ public:
                 auto element = element_ref.moved_or_copied();
                 auto* pair_arr = element.mutable_array();
                 m_value.object->emplace(
-                    std::move(*((*pair_arr)[0].m_value.string)),
+                    extract_string_key((*pair_arr)[0]),
                     std::move((*pair_arr)[1]));
             }
         } else {
@@ -3585,7 +3687,7 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (m_type == value_t::string) {
-                    m_value.string = create_string(*(first.m_object->m_value.string));
+                    m_value.string = share_or_clone_string(first.m_object->m_value.string);
                 } else {
                     m_value = first.m_object->m_value;
                 }
@@ -3754,11 +3856,11 @@ public:
                                        : m_value.array->size();
             case value_t::object:
                 if (m_storage != 0u) {
+                    if ((m_value.lazy->dedup_state.load(std::memory_order_relaxed) & 1u) != 0u) {
+                        return m_value.lazy->raw_len;
+                    }
                     if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                         return static_cast<const object_t*>(mat)->size();
-                    }
-                    if (m_value.lazy->dedup_state.load(std::memory_order_acquire) == 1u) {
-                        return m_value.lazy->raw_len;
                     }
                     return detail::lazy_size(m_value.lazy, m_type);
                 }
@@ -3916,12 +4018,13 @@ public:
     }
 
     reference operator[](const typename object_t::key_type& key) {
+        if (is_object()) {
+            return (*mutable_object())[key];
+        }
         if (is_null()) {
             m_value.object = create_object();
             m_type = value_t::object;
-        }
-        if (is_object()) {
-            return (*mutable_object())[key];
+            return (*m_value.object)[key];
         }
         detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
                                  type_name());
@@ -3941,12 +4044,13 @@ public:
     template <typename CharT,
               std::enable_if_t<std::is_same<std::remove_cv_t<CharT>, char>::value, int> = 0>
     reference operator[](CharT* key) {
+        if (is_object()) {
+            return (*mutable_object())[std::string_view(key)];
+        }
         if (is_null()) {
             m_value.object = create_object();
             m_type = value_t::object;
-        }
-        if (is_object()) {
-            return (*mutable_object())[std::string_view(key)];
+            return (*m_value.object)[std::string_view(key)];
         }
         detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
                                  type_name());
@@ -4270,7 +4374,14 @@ public:
                 m_value.boolean = false;
                 break;
             case value_t::string:
-                m_value.string->clear();
+                if (m_value.string->refcount.load(std::memory_order_acquire) <= 1u) {
+                    m_value.string->value.clear();
+                } else {
+                    detail::SharedString* fresh = create_string();
+                    detail::SharedString* old = m_value.string;
+                    m_value.string = fresh;
+                    release_string(old);
+                }
                 break;
             case value_t::array:
                 if (m_storage != 0u) {
@@ -4296,36 +4407,49 @@ public:
     }
 
     void push_back(json&& val) {
-        if (!is_null() && !is_array()) {
-            throw type_error::create(308, std::string("cannot use push_back() with ") + type_name());
-        }
         if (is_null()) {
             m_value.array = create_array();
             m_type = value_t::array;
+        } else if (!is_array()) {
+            detail::throw_type_error(308, "cannot use push_back() with ", type_name());
+        }
+        auto* arr = mutable_array();
+        if (arr->size() < arr->capacity() && &val != this) {
+            arr->emplace_back(std::move(val));
+            return;
         }
         json tmp(std::move(val));
-        mutable_array()->push_back(std::move(tmp));
+        if (arr->empty()) {
+            arr->reserve(2u);
+        }
+        arr->push_back(std::move(tmp));
     }
 
     void push_back(const json& val) {
-        if (!is_null() && !is_array()) {
-            throw type_error::create(308, std::string("cannot use push_back() with ") + type_name());
-        }
         if (is_null()) {
             m_value.array = create_array();
             m_type = value_t::array;
+        } else if (!is_array()) {
+            detail::throw_type_error(308, "cannot use push_back() with ", type_name());
+        }
+        auto* arr = mutable_array();
+        if (arr->size() < arr->capacity() && &val != this) {
+            arr->emplace_back(val);
+            return;
         }
         json tmp(val);
-        mutable_array()->push_back(std::move(tmp));
+        if (arr->empty()) {
+            arr->reserve(2u);
+        }
+        arr->push_back(std::move(tmp));
     }
 
     void push_back(const typename object_t::value_type& val) {
-        if (!is_null() && !is_object()) {
-            throw type_error::create(308, std::string("cannot use push_back() with ") + type_name());
-        }
         if (is_null()) {
             m_value.object = create_object();
             m_type = value_t::object;
+        } else if (!is_object()) {
+            detail::throw_type_error(308, "cannot use push_back() with ", type_name());
         }
         typename object_t::value_type tmp(val);
         mutable_object()->insert(std::move(tmp));
@@ -4335,7 +4459,7 @@ public:
         if (is_object() && init.size() == 2 && (*init.begin())->is_string()) {
             json key = init.begin()->moved_or_copied();
             push_back(typename object_t::value_type(
-                std::move(*(key.m_value.string)), (init.begin() + 1)->moved_or_copied()));
+                extract_string_key(key), (init.begin() + 1)->moved_or_copied()));
         } else {
             push_back(json(init));
         }
@@ -4590,7 +4714,7 @@ public:
                     throw invalid_iterator::create(205, "iterator out of range");
                 }
                 if (is_string()) {
-                    destroy_string(m_value.string);
+                    release_string(m_value.string);
                     m_value.string = nullptr;
                 }
                 m_type = value_t::null;
@@ -4636,7 +4760,7 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (is_string()) {
-                    destroy_string(m_value.string);
+                    release_string(m_value.string);
                     m_value.string = nullptr;
                 }
                 m_type = value_t::null;
@@ -4692,7 +4816,7 @@ public:
 
     void swap(string_t& other) {
         if (is_string()) {
-            std::swap(*(m_value.string), other);
+            std::swap(*mutable_string_unique(), other);
         } else {
             throw type_error::create(
                 310, std::string("cannot use swap(string_t&) with ") + type_name());
@@ -4732,7 +4856,8 @@ public:
                 case value_t::null:
                     return true;
                 case value_t::string:
-                    return *lhs.m_value.string == *rhs.m_value.string;
+                    return lhs.m_value.string == rhs.m_value.string ||
+                           lhs.m_value.string->value == rhs.m_value.string->value;
                 case value_t::boolean:
                     return lhs.m_value.boolean == rhs.m_value.boolean;
                 case value_t::number_integer:
@@ -4847,7 +4972,8 @@ public:
                 case value_t::null:
                     return false;
                 case value_t::string:
-                    return *lhs.m_value.string < *rhs.m_value.string;
+                    return lhs.m_value.string != rhs.m_value.string &&
+                           lhs.m_value.string->value < rhs.m_value.string->value;
                 case value_t::boolean:
                     return lhs.m_value.boolean < rhs.m_value.boolean;
                 case value_t::number_integer:
@@ -5109,10 +5235,10 @@ private:
         return is_array() ? const_array() : nullptr;
     }
     string_t* get_impl_ptr(string_t* /*unused*/) noexcept {
-        return is_string() ? m_value.string : nullptr;
+        return is_string() ? mutable_string_pin() : nullptr;
     }
     constexpr const string_t* get_impl_ptr(const string_t* /*unused*/) const noexcept {
-        return is_string() ? m_value.string : nullptr;
+        return is_string() ? &m_value.string->value : nullptr;
     }
     boolean_t* get_impl_ptr(boolean_t* /*unused*/) noexcept {
         return is_boolean() ? &m_value.boolean : nullptr;
@@ -5449,8 +5575,8 @@ inline void json::patch_inplace(const json& json_patch) {
             return it->second;
         };
 
-        const std::string op = *get_member("op", "op", true).m_value.string;
-        const std::string path = *get_member(op, "path", true).m_value.string;
+        const std::string op = get_member("op", "op", true).m_value.string->value;
+        const std::string path = get_member(op, "path", true).m_value.string->value;
         json_pointer ptr(path);
 
         switch (get_op(op)) {
@@ -5470,7 +5596,7 @@ inline void json::patch_inplace(const json& json_patch) {
             }
 
             case patch_operations::move: {
-                const std::string from_path = *get_member("move", "from", true).m_value.string;
+                const std::string from_path = get_member("move", "from", true).m_value.string->value;
                 json_pointer from_ptr(from_path);
 
                 json v = result.at(from_ptr);
@@ -5481,7 +5607,7 @@ inline void json::patch_inplace(const json& json_patch) {
             }
 
             case patch_operations::copy: {
-                const std::string from_path = *get_member("copy", "from", true).m_value.string;
+                const std::string from_path = get_member("copy", "from", true).m_value.string->value;
                 const json_pointer from_ptr(from_path);
 
                 json v = result.at(from_ptr);

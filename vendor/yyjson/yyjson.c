@@ -7603,6 +7603,23 @@ static_inline u8 *write_f64_exp(i32 exp, u8 *buf) {
     }
 }
 
+/** Write exponent part with explicit sign and >=2 digits (e+05 / e-05). */
+static_inline u8 *write_f64_exp_neojson(i32 exp, u8 *buf) {
+    byte_copy_2(buf, exp < 0 ? "e-" : "e+");
+    buf += 2;
+    exp = exp < 0 ? -exp : exp;
+    if (exp < 100) {
+        byte_copy_2(buf, digit_table + (u32)exp * 2);
+        return buf + 2;
+    } else {
+        u32 hi = ((u32)exp * 656) >> 16;    /* exp / 100 */
+        u32 lo = (u32)exp - hi * 100;       /* exp % 100 */
+        buf[0] = (u8)((u8)hi + (u8)'0');
+        byte_copy_2(buf + 1, digit_table + lo * 2);
+        return buf + 3;
+    }
+}
+
 /** Magic number for fast `divide by power of 10`. */
 typedef struct {
     u64 p10, mul;
@@ -8059,6 +8076,7 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
     u32 exp_raw;
     u8 *end;
     bool sign;
+    const bool neo_fp = (flg & YYJSON_WRITE_NEOJSON_FP) != 0;
 
     /* decode raw bytes from IEEE-754 double format. */
     sign = (bool)(raw >> (F64_BITS - 1));
@@ -8089,9 +8107,11 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
         if ((-F64_SIG_BITS <= exp_bin && exp_bin <= 0) &&
             (u64_tz_bits(sig_bin) >= (u32)-exp_bin)) {
             sig_dec = sig_bin >> -exp_bin; /* range: [1, 0x1FFFFFFFFFFFFF] */
-            buf = write_u64_len_1_to_16(sig_dec, buf);
-            byte_copy_2(buf, ".0");
-            return buf + 2;
+            if (!neo_fp || sig_dec < U64(0x00038D7E, 0xA4C68000)) {
+                buf = write_u64_len_1_to_16(sig_dec, buf);
+                byte_copy_2(buf, ".0");
+                return buf + 2;
+            }
         }
 
         /* binary to decimal */
@@ -8103,7 +8123,7 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
         /* the decimal point offset relative to the first digit */
         dot_ofs = sig_len + exp_dec;
 
-        if (-6 < dot_ofs && dot_ofs <= 21) {
+        if (neo_fp ? (-4 < dot_ofs && dot_ofs <= 15) : (-6 < dot_ofs && dot_ofs <= 21)) {
             i32 num_sep_pos, dot_set_pos, pre_ofs;
             u8 *num_hdr, *num_end, *num_sep, *dot_end;
             bool no_pre_zero;
@@ -8140,7 +8160,7 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
             exp_dec += sig_len - 1;
             buf[0] = buf[1];
             buf[1] = '.';
-            return write_f64_exp(exp_dec, end);
+            return neo_fp ? write_f64_exp_neojson(exp_dec, end) : write_f64_exp(exp_dec, end);
         }
 
     } else {
@@ -8164,7 +8184,7 @@ static_noinline u8 *write_f64_raw(u8 *buf, u64 raw, yyjson_write_flag flg) {
         end -= *(end - 1) == '.'; /* remove dot, e.g. 2.e-321 -> 2e-321 */
 
         /* write exponent part */
-        return write_f64_exp(exp_dec, end);
+        return neo_fp ? write_f64_exp_neojson(exp_dec, end) : write_f64_exp(exp_dec, end);
     }
 }
 
@@ -8472,6 +8492,18 @@ static_inline u8 *write_num(u8 *cur, yyjson_val *val, yyjson_write_flag flg) {
             }
         }
     }
+}
+
+#if YYJSON_DISABLE_FAST_FP_CONV
+#error "neojson requires vendored yyjson fast FP conversion (YYJSON_DISABLE_FAST_FP_CONV must be 0)"
+#endif
+
+size_t yyjson_write_f64_neojson(char *buf, double val) {
+    u8 *end;
+    if (unlikely(!buf)) return 0;
+    end = write_f64_raw((u8 *)buf, f64_to_bits(val),
+                        YYJSON_WRITE_INF_AND_NAN_AS_NULL | YYJSON_WRITE_NEOJSON_FP);
+    return end ? (usize)(end - (u8 *)buf) : 0;
 }
 
 char *yyjson_write_number(const yyjson_val *val, char *buf) {

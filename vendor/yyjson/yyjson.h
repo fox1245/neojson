@@ -1294,6 +1294,11 @@ static const yyjson_write_flag YYJSON_WRITE_NEWLINE_AT_END          = 1 << 7;
     uppercase. Only effective when `YYJSON_WRITE_ESCAPE_UNICODE` is also set. */
 static const yyjson_write_flag YYJSON_WRITE_LOWERCASE_HEX           = 1 << 8;
 
+/** Format floating-point numbers using shortest IEEE-754 round-trip with
+    nlohmann-compatible fixed/scientific bounds (-4 < dot_ofs <= 15) and
+    signed two-digit padded exponents (e+XX / e-XX). */
+static const yyjson_write_flag YYJSON_WRITE_NEOJSON_FP              = 1 << 9;
+
 
 
 /** The highest 8 bits of `yyjson_write_flag` and real number value's `tag`
@@ -1656,6 +1661,10 @@ yyjson_api char *yyjson_val_write_opts(const yyjson_val *val,
                                        const yyjson_alc *alc,
                                        size_t *len,
                                        yyjson_write_err *err);
+
+/** Write a single double using Schubfach shortest round-trip with neojson
+    formatting rules into `buf` (must hold at least 40 bytes). Returns length. */
+yyjson_api size_t yyjson_write_f64_neojson(char *buf, double val);
 
 #if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
 

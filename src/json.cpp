@@ -714,516 +714,11 @@ inline void append_int(DumpBuffer& out, const std::int64_t v) {
 
 namespace dtoa_impl {
 
-template <typename Target, typename Source>
-Target reinterpret_bits(const Source source) {
-    static_assert(sizeof(Target) == sizeof(Source), "size mismatch");
-    Target target;
-    std::memcpy(&target, &source, sizeof(Source));
-    return target;
-}
-
-struct diyfp {
-    static constexpr int kPrecision = 64;
-
-    std::uint64_t f = 0;
-    int e = 0;
-
-    constexpr diyfp(std::uint64_t f_, int e_) noexcept : f(f_), e(e_) {}
-
-    static diyfp sub(const diyfp& x, const diyfp& y) noexcept {
-        assert(x.e == y.e);
-        assert(x.f >= y.f);
-        return {x.f - y.f, x.e};
-    }
-
-    static diyfp mul(const diyfp& x, const diyfp& y) noexcept {
-        static_assert(kPrecision == 64, "internal error");
-#if defined(__SIZEOF_INT128__)
-        __extension__ using u128 = unsigned __int128;
-        const u128 prod = static_cast<u128>(x.f) * static_cast<u128>(y.f);
-        const auto lo = static_cast<std::uint64_t>(prod);
-        const auto hi = static_cast<std::uint64_t>(prod >> 64u);
-        return {hi + (lo >> 63u), x.e + y.e + 64};
-#elif defined(_MSC_VER) && defined(_M_X64)
-        unsigned __int64 hi = 0;
-        const unsigned __int64 lo = _umul128(x.f, y.f, &hi);
-        return {static_cast<std::uint64_t>(hi) + static_cast<std::uint64_t>(lo >> 63u),
-                x.e + y.e + 64};
-#elif defined(_MSC_VER) && defined(_M_ARM64)
-        const std::uint64_t lo = x.f * y.f;
-        const std::uint64_t hi = __umulh(x.f, y.f);
-        return {hi + (lo >> 63u), x.e + y.e + 64};
-#else
-        const std::uint64_t u_lo = x.f & 0xFFFFFFFFu;
-        const std::uint64_t u_hi = x.f >> 32u;
-        const std::uint64_t v_lo = y.f & 0xFFFFFFFFu;
-        const std::uint64_t v_hi = y.f >> 32u;
-
-        const std::uint64_t p0 = u_lo * v_lo;
-        const std::uint64_t p1 = u_lo * v_hi;
-        const std::uint64_t p2 = u_hi * v_lo;
-        const std::uint64_t p3 = u_hi * v_hi;
-
-        const std::uint64_t p0_hi = p0 >> 32u;
-        const std::uint64_t p1_lo = p1 & 0xFFFFFFFFu;
-        const std::uint64_t p1_hi = p1 >> 32u;
-        const std::uint64_t p2_lo = p2 & 0xFFFFFFFFu;
-        const std::uint64_t p2_hi = p2 >> 32u;
-
-        std::uint64_t Q = p0_hi + p1_lo + p2_lo;
-        Q += std::uint64_t{1} << (64u - 32u - 1u);
-
-        const std::uint64_t h = p3 + p2_hi + p1_hi + (Q >> 32u);
-        return {h, x.e + y.e + 64};
-#endif
-    }
-
-    static diyfp normalize(diyfp x) noexcept {
-        assert(x.f != 0);
-#if (defined(__GNUC__) || defined(__clang__)) && (ULLONG_MAX == 0xFFFFFFFFFFFFFFFFULL)
-        const int shift = __builtin_clzll(static_cast<unsigned long long>(x.f));
-        x.f <<= shift;
-        x.e -= shift;
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
-        unsigned long idx = 0;
-        _BitScanReverse64(&idx, x.f);
-        const int shift = 63 - static_cast<int>(idx);
-        x.f <<= shift;
-        x.e -= shift;
-#else
-        while ((x.f >> 63u) == 0) {
-            x.f <<= 1u;
-            x.e--;
-        }
-#endif
-        return x;
-    }
-
-    static diyfp normalize_to(const diyfp& x, const int target_exponent) noexcept {
-        const int delta = x.e - target_exponent;
-        assert(delta >= 0);
-        assert(((x.f << delta) >> delta) == x.f);
-        return {x.f << delta, target_exponent};
-    }
-};
-
-struct boundaries {
-    diyfp w;
-    diyfp minus;
-    diyfp plus;
-};
-
-template <typename FloatType>
-boundaries compute_boundaries(FloatType value) {
-    assert(std::isfinite(value));
-    assert(value > 0);
-
-    static constexpr int kPrecision = std::numeric_limits<FloatType>::digits;
-    static constexpr int kBias =
-        std::numeric_limits<FloatType>::max_exponent - 1 + (kPrecision - 1);
-    static constexpr int kMinExp = 1 - kBias;
-    static constexpr std::uint64_t kHiddenBit = std::uint64_t{1} << (kPrecision - 1);
-
-    using bits_type = std::uint64_t;
-    const bits_type bits = reinterpret_bits<bits_type>(value);
-    const std::uint64_t e = bits >> (kPrecision - 1);
-    const std::uint64_t f = bits & (kHiddenBit - 1);
-
-    const diyfp v = (e == 0) ? diyfp(f, kMinExp) : diyfp(kHiddenBit + f, static_cast<int>(e) - kBias);
-
-    diyfp plus = diyfp::normalize(diyfp(2 * v.f + 1, v.e - 1));
-    diyfp minus = (f == 0 && e > 1) ? diyfp(4 * v.f - 1, v.e - 2) : diyfp(2 * v.f - 1, v.e - 1);
-    minus = diyfp::normalize_to(minus, plus.e);
-
-    return {diyfp::normalize_to(v, plus.e), minus, plus};
-}
-
-struct cached_power {
-    std::uint64_t f;
-    int e;
-    int k;
-};
-
-inline cached_power get_cached_power_for_binary_exponent(int e) {
-    static constexpr int kCachedPowersMinDecExp = -300;
-    static constexpr int kCachedPowersDecStep = 8;
-
-    static constexpr std::array<cached_power, 79> kCachedPowers = {{
-        {0xAB70FE17C79AC6CAULL, -1060, -300}, {0xFF77B1FCBEBCDC4FULL, -1034, -292},
-        {0xBE5691EF416BD60CULL, -1007, -284}, {0x8DD01FAD907FFC3CULL, -980, -276},
-        {0xD3515C2831559A83ULL, -954, -268},  {0x9D71AC8FADA6C9B5ULL, -927, -260},
-        {0xEA9C227723EE8BCBULL, -901, -252},  {0xAECC49914078536DULL, -874, -244},
-        {0x823C12795DB6CE57ULL, -847, -236},  {0xC21094364DFB5637ULL, -821, -228},
-        {0x9096EA6F3848984FULL, -794, -220},  {0xD77485CB25823AC7ULL, -768, -212},
-        {0xA086CFCD97BF97F4ULL, -741, -204},  {0xEF340A98172AACE5ULL, -715, -196},
-        {0xB23867FB2A35B28EULL, -688, -188},  {0x84C8D4DFD2C63F3BULL, -661, -180},
-        {0xC5DD44271AD3CDBAULL, -635, -172},  {0x936B9FCEBB25C996ULL, -608, -164},
-        {0xDBAC6C247D62A584ULL, -582, -156},  {0xA3AB66580D5FDAF6ULL, -555, -148},
-        {0xF3E2F893DEC3F126ULL, -529, -140},  {0xB5B5ADA8AAFF80B8ULL, -502, -132},
-        {0x87625F056C7C4A8BULL, -475, -124},  {0xC9BCFF6034C13053ULL, -449, -116},
-        {0x964E858C91BA2655ULL, -422, -108},  {0xDFF9772470297EBDULL, -396, -100},
-        {0xA6DFBD9FB8E5B88FULL, -369, -92},   {0xF8A95FCF88747D94ULL, -343, -84},
-        {0xB94470938FA89BCFULL, -316, -76},   {0x8A08F0F8BF0F156BULL, -289, -68},
-        {0xCDB02555653131B6ULL, -263, -60},   {0x993FE2C6D07B7FACULL, -236, -52},
-        {0xE45C10C42A2B3B06ULL, -210, -44},   {0xAA242499697392D3ULL, -183, -36},
-        {0xFD87B5F28300CA0EULL, -157, -28},   {0xBCE5086492111AEBULL, -130, -20},
-        {0x8CBCCC096F5088CCULL, -103, -12},   {0xD1B71758E219652CULL, -77, -4},
-        {0x9C40000000000000ULL, -50, 4},      {0xE8D4A51000000000ULL, -24, 12},
-        {0xAD78EBC5AC620000ULL, 3, 20},       {0x813F3978F8940984ULL, 30, 28},
-        {0xC097CE7BC90715B3ULL, 56, 36},      {0x8F7E32CE7BEA5C70ULL, 83, 44},
-        {0xD5D238A4ABE98068ULL, 109, 52},     {0x9F4F2726179A2245ULL, 136, 60},
-        {0xED63A231D4C4FB27ULL, 162, 68},     {0xB0DE65388CC8ADA8ULL, 189, 76},
-        {0x83C7088E1AAB65DBULL, 216, 84},     {0xC45D1DF942711D9AULL, 242, 92},
-        {0x924D692CA61BE758ULL, 269, 100},    {0xDA01EE641A708DEAULL, 295, 108},
-        {0xA26DA3999AEF774AULL, 322, 116},    {0xF209787BB47D6B85ULL, 348, 124},
-        {0xB454E4A179DD1877ULL, 375, 132},    {0x865B86925B9BC5C2ULL, 402, 140},
-        {0xC83553C5C8965D3DULL, 428, 148},    {0x952AB45CFA97A0B3ULL, 455, 156},
-        {0xDE469FBD99A05FE3ULL, 481, 164},    {0xA59BC234DB398C25ULL, 508, 172},
-        {0xF6C69A72A3989F5CULL, 534, 180},    {0xB7DCBF5354E9BECEULL, 561, 188},
-        {0x88FCF317F22241E2ULL, 588, 196},    {0xCC20CE9BD35C78A5ULL, 614, 204},
-        {0x98165AF37B2153DFULL, 641, 212},    {0xE2A0B5DC971F303AULL, 667, 220},
-        {0xA8D9D1535CE3B396ULL, 694, 228},    {0xFB9B7CD9A4A7443CULL, 720, 236},
-        {0xBB764C4CA7A44410ULL, 747, 244},    {0x8BAB8EEFB6409C1AULL, 774, 252},
-        {0xD01FEF10A657842CULL, 800, 260},    {0x9B10A4E5E9913129ULL, 827, 268},
-        {0xE7109BFBA19C0C9DULL, 853, 276},    {0xAC2820D9623BF429ULL, 880, 284},
-        {0x80444B5E7AA7CF85ULL, 907, 292},     {0xBF21E44003ACDD2DULL, 933, 300},
-        {0x8E679C2F5E44FF8FULL, 960, 308},    {0xD433179D9C8CB841ULL, 986, 316},
-        {0x9E19DB92B4E31BA9ULL, 1013, 324},
-    }};
-
-    static constexpr int kAlpha = -60;
-    const int f = kAlpha - e - 1;
-    const int k = (f * 78913) / (1 << 18) + (f > 0 ? 1 : 0);
-    const int index =
-        (-kCachedPowersMinDecExp + k + (kCachedPowersDecStep - 1)) / kCachedPowersDecStep;
-    assert(index >= 0 && static_cast<std::size_t>(index) < kCachedPowers.size());
-    return kCachedPowers[static_cast<std::size_t>(index)];
-}
-
-inline int count_leading_zeros_u32(const std::uint32_t x) noexcept {
-    assert(x != 0u);
-#if (defined(__GNUC__) || defined(__clang__)) && (UINT_MAX == 0xFFFFFFFFU)
-    return __builtin_clz(x);
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64) || defined(_M_IX86))
-    unsigned long idx = 0;
-    _BitScanReverse(&idx, x);
-    return 31 - static_cast<int>(idx);
-#else
-    int c = 0;
-    std::uint32_t v = x;
-    while ((v >> 31u) == 0u) {
-        v <<= 1u;
-        ++c;
-    }
-    return c;
-#endif
-}
-
-inline int count_trailing_zeros_u64(const std::uint64_t x) noexcept {
-    assert(x != 0u);
-#if (defined(__GNUC__) || defined(__clang__)) && (ULLONG_MAX == 0xFFFFFFFFFFFFFFFFULL)
-    return __builtin_ctzll(static_cast<unsigned long long>(x));
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
-    unsigned long idx = 0;
-    _BitScanForward64(&idx, x);
-    return static_cast<int>(idx);
-#else
-    int c = 0;
-    std::uint64_t v = x;
-    while ((v & 1u) == 0u) {
-        v >>= 1u;
-        ++c;
-    }
-    return c;
-#endif
-}
-
-inline int find_largest_pow10(const std::uint32_t n) noexcept {
-    if (n == 0u) {
-        return 1;
-    }
-    static constexpr std::array<std::uint8_t, 33> kMaxDigitsForBits = {{
-        1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5,
-        6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10
-    }};
-    static constexpr std::array<std::uint32_t, 10> kPow10 = {{
-        1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u
-    }};
-    const int bits = 32 - count_leading_zeros_u32(n);
-    int k = static_cast<int>(kMaxDigitsForBits[static_cast<std::size_t>(bits)]);
-    if (n < kPow10[static_cast<std::size_t>(k - 1)]) {
-        --k;
-    }
-    return k;
-}
-
-inline void grisu2_round(char* buf, int len, std::uint64_t dist, std::uint64_t delta,
-                         std::uint64_t rest, std::uint64_t ten_k) {
-    assert(len >= 1);
-    assert(dist <= delta);
-    assert(ten_k > 0);
-
-    while (rest < dist && delta - rest >= ten_k &&
-           (rest + ten_k < dist || dist - rest > rest + ten_k - dist)) {
-        assert(buf[len - 1] != '0');
-        buf[len - 1]--;
-        rest += ten_k;
-    }
-}
-
-inline void grisu2_digit_gen(char* buffer, int& length, int& decimal_exponent, diyfp M_minus,
-                             diyfp w, diyfp M_plus) {
-    static constexpr int kAlpha = -60;
-    static constexpr int kGamma = -32;
-    (void)kAlpha;
-    (void)kGamma;
-
-    assert(M_plus.e >= kAlpha);
-    assert(M_plus.e <= kGamma);
-    assert(M_minus.e == M_plus.e);
-    assert(w.e == M_plus.e);
-
-    std::uint64_t delta = diyfp::sub(M_plus, M_minus).f;
-    std::uint64_t dist = diyfp::sub(M_plus, w).f;
-
-    const diyfp one(std::uint64_t{1} << -M_plus.e, M_plus.e);
-    auto p1 = static_cast<std::uint32_t>(M_plus.f >> -one.e);
-    std::uint64_t p2 = M_plus.f & (one.f - 1);
-
-    const int k = find_largest_pow10(p1);
-
-#define NEOJSON_GRISU2_STEP(N, POW10)                                              \
-    case (N): {                                                                    \
-        const std::uint32_t d = p1 / (POW10);                                      \
-        const std::uint32_t r = p1 - d * (POW10);                                  \
-        assert(d <= 9);                                                            \
-        buffer[length++] = static_cast<char>('0' + d);                             \
-        const std::uint64_t rest = (static_cast<std::uint64_t>(r) << -one.e) + p2; \
-        if (rest <= delta) {                                                       \
-            decimal_exponent += (N) - 1;                                           \
-            grisu2_round(buffer, length, dist, delta, rest,                        \
-                         static_cast<std::uint64_t>(POW10) << -one.e);             \
-            return;                                                                \
-        }                                                                          \
-        p1 = r;                                                                    \
-    }
-
-    switch (k) {
-        NEOJSON_GRISU2_STEP(10, 1000000000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(9, 100000000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(8, 10000000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(7, 1000000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(6, 100000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(5, 10000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(4, 1000u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(3, 100u)
-        [[fallthrough]];
-        NEOJSON_GRISU2_STEP(2, 10u)
-        [[fallthrough]];
-        case 1: {
-            const std::uint32_t d = p1;
-            assert(d <= 9);
-            buffer[length++] = static_cast<char>('0' + d);
-            if (p2 <= delta) {
-                grisu2_round(buffer, length, dist, delta, p2, one.f);
-                return;
-            }
-            p1 = 0;
-            break;
-        }
-        default:
-            assert(false);
-            break;
-    }
-
-#undef NEOJSON_GRISU2_STEP
-
-    assert(p1 == 0);
-    int m = 0;
-    for (;;) {
-        assert(p2 <= (std::numeric_limits<std::uint64_t>::max)() / 10);
-        p2 *= 10;
-        const auto d = static_cast<std::uint32_t>(p2 >> -one.e);
-        const std::uint64_t r = p2 & (one.f - 1);
-
-        assert(d <= 9);
-        buffer[length++] = static_cast<char>('0' + d);
-
-        p2 = r;
-        --m;
-        delta *= 10;
-        dist *= 10;
-        if (p2 <= delta) {
-            decimal_exponent += m;
-            grisu2_round(buffer, length, dist, delta, p2, one.f);
-            return;
-        }
-    }
-}
-
-inline void grisu2(char* buf, int& len, int& decimal_exponent, diyfp m_minus, diyfp v,
-                   diyfp m_plus) {
-    assert(m_plus.e == m_minus.e);
-    assert(m_plus.e == v.e);
-
-    const cached_power cached = get_cached_power_for_binary_exponent(m_plus.e);
-    const diyfp c_minus_k(cached.f, cached.e);
-
-    const diyfp w = diyfp::mul(v, c_minus_k);
-    diyfp w_minus = diyfp::mul(m_minus, c_minus_k);
-    diyfp w_plus = diyfp::mul(m_plus, c_minus_k);
-
-    w_minus.f++;
-    w_plus.f--;
-
-    decimal_exponent = -cached.k;
-    grisu2_digit_gen(buf, len, decimal_exponent, w_minus, w, w_plus);
-}
-
-template <typename FloatType>
-void grisu2(char* buf, int& len, int& decimal_exponent, FloatType value) {
-    const boundaries w = compute_boundaries(static_cast<double>(value));
-    grisu2(buf, len, decimal_exponent, w.minus, w.w, w.plus);
-}
-
-inline char* append_exponent(char* buf, int e) {
-    assert(e > -1000);
-    assert(e < 1000);
-
-    if (e < 0) {
-        e = -e;
-        *buf++ = '-';
-    } else {
-        *buf++ = '+';
-    }
-
-    auto k = static_cast<std::uint32_t>(e);
-    if (k < 10) {
-        *buf++ = '0';
-        *buf++ = static_cast<char>('0' + k);
-    } else if (k < 100) {
-        *buf++ = static_cast<char>('0' + k / 10);
-        k %= 10;
-        *buf++ = static_cast<char>('0' + k);
-    } else {
-        *buf++ = static_cast<char>('0' + k / 100);
-        k %= 100;
-        *buf++ = static_cast<char>('0' + k / 10);
-        k %= 10;
-        *buf++ = static_cast<char>('0' + k);
-    }
-
-    return buf;
-}
-
-// Formats the `len` digits written by `grisu2` at `buf + 1` into `buf`, shifting only the short
-// integer prefix left by 1 on the common fixed-point decimal path (`0 < n <= max_exp`).
-inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp, int max_exp) {
-    assert(min_exp < 0);
-    assert(max_exp > 0);
-
-    const int k = decimal_exponent;
-    const int n = len + k;
-
-    if (k >= 0 && n <= max_exp) {
-        std::memmove(buf, buf + 1, static_cast<std::size_t>(len));
-        std::fill_n(buf + len, k, '0');
-        buf[n] = '.';
-        buf[n + 1] = '0';
-        return buf + (static_cast<std::size_t>(n) + 2);
-    }
-
-    if (0 < n && n <= max_exp) {
-        assert(k < 0);
-        std::memmove(buf, buf + 1, static_cast<std::size_t>(n));
-        buf[n] = '.';
-        return buf + (static_cast<std::size_t>(len) + 1U);
-    }
-
-    if (min_exp < n && n <= 0) {
-        std::memmove(buf + (2 + static_cast<std::size_t>(-n)), buf + 1,
-                     static_cast<std::size_t>(len));
-        buf[0] = '0';
-        buf[1] = '.';
-        std::fill_n(buf + 2, -n, '0');
-        return buf + (2U + static_cast<std::size_t>(-n) + static_cast<std::size_t>(len));
-    }
-
-    if (len > 1) {
-        buf[0] = buf[1];
-        buf[1] = '.';
-        buf += len + 1;
-    } else {
-        buf[0] = buf[1];
-        buf += 1;
-    }
-
-    *buf++ = 'e';
-    return append_exponent(buf, n - 1);
-}
-
-inline void append_float(DumpBuffer& out, double val) {
-    if (std::isnan(val) || std::isinf(val)) {
-        out.append("null", 4);
-        return;
-    }
-
-    const bool is_negative = std::signbit(val);
-    if (is_negative) {
-        val = -val;
-    }
-
-    if (val == 0.0) {
-        if (is_negative) {
-            out.append("-0.0", 4);
-        } else {
-            out.append("0.0", 3);
-        }
-        return;
-    }
-
-    const std::uint64_t raw = reinterpret_bits<std::uint64_t>(val);
-    const std::uint64_t exp_raw = (raw >> 52u) & 0x7FFu;
-    if (exp_raw != 0u) {
-        const int exp_bin = static_cast<int>(exp_raw) - 1023 - 52;
-        if (exp_bin >= -52 && exp_bin <= 0) {
-            const std::uint64_t sig_bin =
-                (raw & ((std::uint64_t{1} << 52u) - 1u)) | (std::uint64_t{1} << 52u);
-            if (count_trailing_zeros_u64(sig_bin) >= -exp_bin) {
-                const std::uint64_t sig_dec = sig_bin >> static_cast<unsigned>(-exp_bin);
-                if (sig_dec < 1000000000000000ULL) {
-                    if (is_negative) {
-                        out.push('-');
-                    }
-                    append_uint(out, sig_dec);
-                    out.append(".0", 2);
-                    return;
-                }
-            }
-        }
-    }
-
-    out.reserve_extra(64);
+inline void append_float(DumpBuffer& out, const double val) {
+    out.reserve_extra(40u);
     char* p = out.write_ptr();
-    if (is_negative) {
-        *p++ = '-';
-    }
-
-    int length = 0;
-    int decimal_exponent = 0;
-    grisu2(p + 1, length, decimal_exponent, val);
-
-    constexpr int kMinExp = -4;
-    constexpr int kMaxExp = std::numeric_limits<double>::digits10;
-    char* end = format_buffer(p, length, decimal_exponent, kMinExp, kMaxExp);
-    out.advance_to(end);
+    const std::size_t n = yyjson_write_f64_neojson(p, val);
+    out.advance_to(p + n);
 }
 
 } // namespace dtoa_impl
@@ -1678,11 +1173,124 @@ inline void dump_key_colon_fast_strict(DumpBuffer& out, const std::string_view s
     dump_quoted_strict_impl(out, s, true);
 }
 
+inline bool has_non_verbatim_valid_utf8_8(const std::uint64_t w) noexcept {
+    constexpr std::uint64_t kHi = 0x8080808080808080ULL;
+    constexpr std::uint64_t kLo = 0x0101010101010101ULL;
+    constexpr std::uint64_t kSp = 0x2020202020202020ULL;
+    const std::uint64_t has_ctrl = (w - kSp) & ~w & kHi;
+    const std::uint64_t q = w ^ 0x2222222222222222ULL;
+    const std::uint64_t b = w ^ 0x5C5C5C5C5C5C5C5CULL;
+    const std::uint64_t has_quote = (q - kLo) & ~q & kHi;
+    const std::uint64_t has_bs = (b - kLo) & ~b & kHi;
+    return (has_ctrl | has_quote | has_bs) != 0;
+}
+
+#if defined(YYJSON_DISABLE_UTF8_VALIDATION) && YYJSON_DISABLE_UTF8_VALIDATION
+#error "neojson requires yyjson UTF-8 validation (YYJSON_DISABLE_UTF8_VALIDATION must be 0)"
+#endif
+
+inline void dump_valid_utf8_escaped_strict(DumpBuffer& out, const char* p, const std::size_t len,
+                                           const bool with_colon) {
+    const std::size_t extra = with_colon ? 3u : 2u;
+    if (len > (std::numeric_limits<std::size_t>::max)() - 32u) {
+        throw std::bad_alloc();
+    }
+    // Inputs from yyjson were already RFC-3629 validated at parse time; with ensure_ascii=false,
+    // all bytes >= 0x80 and printable ASCII != '"' and != '\\' copy verbatim.
+    out.reserve_extra(len + extra + 16u);
+    char* dst = out.write_ptr();
+    char* end = out.end_ptr();
+    *dst++ = '"';
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::size_t i = 0u;
+    while (i < len) {
+        while (i + 8u <= len) {
+            std::uint64_t w = 0u;
+            std::memcpy(&w, p + i, 8u);
+            if (has_non_verbatim_valid_utf8_8(w)) {
+                break;
+            }
+            ensure_space(out, dst, end, 8u);
+            std::memcpy(dst, p + i, 8u);
+            dst += 8u;
+            i += 8u;
+        }
+        while (i < len) {
+            const auto b0 = static_cast<std::uint8_t>(p[i]);
+            if (b0 < 0x20u || b0 == 0x22u || b0 == 0x5Cu) {
+                break;
+            }
+            ensure_space(out, dst, end, 1u);
+            *dst++ = p[i++];
+        }
+        if (i == len) {
+            break;
+        }
+        const auto b0 = static_cast<std::uint8_t>(p[i]);
+        ensure_space(out, dst, end, 6u);
+        switch (b0) {
+            case 0x08u:
+                dst[0] = '\\';
+                dst[1] = 'b';
+                dst += 2u;
+                break;
+            case 0x09u:
+                dst[0] = '\\';
+                dst[1] = 't';
+                dst += 2u;
+                break;
+            case 0x0Au:
+                dst[0] = '\\';
+                dst[1] = 'n';
+                dst += 2u;
+                break;
+            case 0x0Cu:
+                dst[0] = '\\';
+                dst[1] = 'f';
+                dst += 2u;
+                break;
+            case 0x0Du:
+                dst[0] = '\\';
+                dst[1] = 'r';
+                dst += 2u;
+                break;
+            case 0x22u:
+                dst[0] = '\\';
+                dst[1] = '"';
+                dst += 2u;
+                break;
+            case 0x5Cu:
+                dst[0] = '\\';
+                dst[1] = '\\';
+                dst += 2u;
+                break;
+            default:
+                dst[0] = '\\';
+                dst[1] = 'u';
+                dst[2] = '0';
+                dst[3] = '0';
+                dst[4] = kHex[(b0 >> 4u) & 0x0Fu];
+                dst[5] = kHex[b0 & 0x0Fu];
+                dst += 6u;
+                break;
+        }
+        ++i;
+    }
+
+    ensure_space(out, dst, end, with_colon ? 2u : 1u);
+    *dst++ = '"';
+    if (with_colon) {
+        *dst++ = ':';
+    }
+    out.advance_to(dst);
+}
+
 } // namespace utf8_impl
 
 struct json_access {
     static json make_string(const char* s, const std::size_t len) {
-        json::string_t* ptr = json::create_string(s, len);
+        detail::SharedString* ptr = json::create_string(s, len);
         json j;
         j.m_type = json::value_t::string;
         j.m_value.string = ptr;
@@ -1726,7 +1334,13 @@ struct json_access {
     }
 
     static const json::string_t& string_of(const json& j) noexcept {
-        return *j.m_value.string;
+        return j.m_value.string->value;
+    }
+
+    static void detach_shared_string(json& j) {
+        if (j.m_type == json::value_t::string) {
+            (void)j.mutable_string_unique();
+        }
     }
 
     static const json::array_t& array_of(const json& j) noexcept {
@@ -2070,7 +1684,7 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
     if (len == 0u) {
         return is_arr ? json_access::make_array() : json_access::make_object();
     }
-    if (is_arr && len <= 4u) {
+    if (is_arr && len <= 8u) {
         bool all_scalar = true;
         yyjson_val* elem = unsafe_yyjson_get_first(val);
         for (std::size_t i = 0u; i < len; ++i) {
@@ -2102,14 +1716,14 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
             guard.p = nullptr;
             return json_access::make_from_array_ptr(arr);
         }
-    } else if (!is_arr && len <= 4u) {
+    } else if (!is_arr && len <= 8u) {
         bool cheap_leaf = true;
         yyjson_obj_iter it = yyjson_obj_iter_with(val);
         yyjson_val* k = nullptr;
         while ((k = yyjson_obj_iter_next(&it)) != nullptr) {
             yyjson_val* v = yyjson_obj_iter_get_val(k);
             if (unsafe_yyjson_get_len(k) > 32u ||
-                (yyjson_is_ctn(v) ? (unsafe_yyjson_get_len(v) != 0u) : yyjson_is_str(v))) {
+                (yyjson_is_ctn(v) && unsafe_yyjson_get_len(v) != 0u)) {
                 cheap_leaf = false;
                 break;
             }
@@ -2125,10 +1739,18 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
                 }
             } guard{obj};
             yyjson_obj_iter fill_it = yyjson_obj_iter_with(val);
-            while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
-                yyjson_val* v = yyjson_obj_iter_get_val(k);
-                const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
-                obj->emplace_or_assign_key(kv, make_node(v));
+            if (sdoc->tree_unique_verified.load(std::memory_order_acquire)) {
+                while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
+                    yyjson_val* v = yyjson_obj_iter_get_val(k);
+                    const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                    obj->emplace_back_unique_key(kv, make_node(v));
+                }
+            } else {
+                while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
+                    yyjson_val* v = yyjson_obj_iter_get_val(k);
+                    const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                    obj->emplace_or_assign_key(kv, make_node(v));
+                }
             }
             guard.p = nullptr;
             return json_access::make_from_object_ptr(obj);
@@ -2215,6 +1837,24 @@ inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
         yyjson_is_arr(root) ? value_t::array : value_t::object, node);
 }
 
+inline void mark_own_unique(LazyHeader* hdr) noexcept {
+    hdr->dedup_state.fetch_or(1u, std::memory_order_acq_rel);
+}
+
+inline void mark_own_dup(LazyHeader* hdr) noexcept {
+    hdr->dedup_state.fetch_or(2u | 8u, std::memory_order_release);
+}
+
+inline bool is_yyjson_tree_unique(yyjson_val* root) {
+    yyjson_val* const end = unsafe_yyjson_get_next(root);
+    for (yyjson_val* cur = root; cur < end; ++cur) {
+        if (unsafe_yyjson_is_obj(cur) && !is_yyjson_object_unique(cur)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 void lazy_release(LazyHeader* hdr, const value_t type) noexcept {
@@ -2246,9 +1886,13 @@ const void* lazy_materialize_const(LazyHeader* hdr, const value_t type) {
     if (existing == nullptr) {
         const bool known_unique =
             (type == value_t::object) &&
-            (node->dedup_state.load(std::memory_order_acquire) == 1u ||
+            ((node->dedup_state.load(std::memory_order_acquire) & 1u) != 0u ||
              node->doc->tree_unique_verified.load(std::memory_order_acquire));
         existing = shallow_materialize(node->doc, node->val, known_unique);
+        if (type == value_t::object && !known_unique &&
+            static_cast<const json::object_t*>(existing)->size() == node->raw_len) {
+            mark_own_unique(node);
+        }
         node->materialized.store(existing, std::memory_order_release);
     }
     return existing;
@@ -2261,7 +1905,7 @@ void* lazy_detach_mutable(LazyHeader* hdr, const value_t type) {
         if (mat == nullptr) {
             const bool known_unique =
                 (type == value_t::object) &&
-                (node->dedup_state.load(std::memory_order_acquire) == 1u ||
+                ((node->dedup_state.load(std::memory_order_acquire) & 1u) != 0u ||
                  node->doc->tree_unique_verified.load(std::memory_order_acquire));
             mat = shallow_materialize(node->doc, node->val, known_unique);
         }
@@ -2299,15 +1943,15 @@ std::size_t lazy_size(LazyHeader* hdr, const value_t type) noexcept {
         return static_cast<const json::object_t*>(mat)->size();
     }
     if (node->doc->tree_unique_verified.load(std::memory_order_acquire) ||
-        node->dedup_state.load(std::memory_order_acquire) == 1u) {
+        (node->dedup_state.load(std::memory_order_acquire) & 1u) != 0u) {
         return node->raw_len;
     }
     try {
         if (is_yyjson_object_unique(node->val)) {
-            node->dedup_state.store(1u, std::memory_order_release);
+            mark_own_unique(node);
             return node->raw_len;
         }
-        node->dedup_state.store(2u, std::memory_order_release);
+        mark_own_dup(node);
         const auto* obj =
             static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
         return obj->size();
@@ -2420,6 +2064,10 @@ bool lazy_less(const json& lhs, const json& rhs) noexcept {
 }
 
 void lazy_materialize_deep(json& root) {
+    if (root.is_string()) {
+        json_access::detach_shared_string(root);
+        return;
+    }
     if (!root.is_array() && !root.is_object()) {
         return;
     }
@@ -2431,14 +2079,18 @@ void lazy_materialize_deep(json& root) {
         if (cur->is_array()) {
             auto* arr = json_access::detach_array(*cur);
             for (auto& elem : *arr) {
-                if (elem.is_array() || elem.is_object()) {
+                if (elem.is_string()) {
+                    json_access::detach_shared_string(elem);
+                } else if (elem.is_array() || elem.is_object()) {
                     stack.push_back(&elem);
                 }
             }
         } else if (cur->is_object()) {
             auto* obj = json_access::detach_object(*cur);
             for (auto& kv : *obj) {
-                if (kv.second.is_array() || kv.second.is_object()) {
+                if (kv.second.is_string()) {
+                    json_access::detach_shared_string(kv.second);
+                } else if (kv.second.is_array() || kv.second.is_object()) {
                     stack.push_back(&kv.second);
                 }
             }
@@ -2526,7 +2178,7 @@ inline void dump_yyjson_string_compact_strict(DumpBuffer& out, yyjson_val* val) 
         out.append_unchecked(sp, sl);
         out.push_unchecked('"');
     } else {
-        utf8_impl::dump_quoted_fast_strict(out, std::string_view(sp, sl));
+        utf8_impl::dump_valid_utf8_escaped_strict(out, sp, sl, false);
     }
 }
 
@@ -2540,7 +2192,7 @@ inline void dump_yyjson_key_colon_compact_strict(DumpBuffer& out, yyjson_val* ke
         out.push_unchecked('"');
         out.push_unchecked(':');
     } else {
-        utf8_impl::dump_key_colon_fast_strict(out, std::string_view(kp, kl));
+        utf8_impl::dump_valid_utf8_escaped_strict(out, kp, kl, true);
     }
 }
 
@@ -2645,9 +2297,9 @@ void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const valu
     }
     if (type == value_t::object &&
         !node->doc->tree_unique_verified.load(std::memory_order_acquire) &&
-        node->dedup_state.load(std::memory_order_acquire) != 1u &&
+        (node->dedup_state.load(std::memory_order_acquire) & 1u) == 0u &&
         !is_yyjson_object_unique(node->val)) {
-        node->dedup_state.store(2u, std::memory_order_release);
+        mark_own_dup(node);
         const auto* obj = static_cast<const json::object_t*>(
             lazy_materialize_const(node, value_t::object));
         dump_eager_object_compact_strict(out, *obj);
@@ -2657,7 +2309,7 @@ void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const valu
     dump_yyjson_val_compact_strict(out, node->doc, node->val, saw_dup,
                                    type == value_t::object ? node->val : nullptr);
     if (type == value_t::object) {
-        node->dedup_state.store(1u, std::memory_order_release);
+        mark_own_unique(node);
     }
     if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
         node->doc->tree_unique_verified.store(true, std::memory_order_release);
@@ -2951,9 +2603,9 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
     }
     if (type == value_t::object &&
         !node->doc->tree_unique_verified.load(std::memory_order_acquire) &&
-        node->dedup_state.load(std::memory_order_acquire) != 1u &&
+        (node->dedup_state.load(std::memory_order_acquire) & 1u) == 0u &&
         !is_yyjson_object_unique(node->val)) {
-        node->dedup_state.store(2u, std::memory_order_release);
+        mark_own_dup(node);
         const auto* obj = static_cast<const json::object_t*>(
             lazy_materialize_const(node, value_t::object));
         dump_eager_object_value(out, *obj, pretty_print, ensure_ascii, error_handler, indent_step,
@@ -2965,7 +2617,7 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
                     indent_step, indent_string, current_indent, saw_dup,
                     type == value_t::object ? node->val : nullptr);
     if (type == value_t::object) {
-        node->dedup_state.store(1u, std::memory_order_release);
+        mark_own_unique(node);
     }
     if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
         node->doc->tree_unique_verified.store(true, std::memory_order_release);
@@ -4671,16 +4323,107 @@ private:
     diag_token_type last_token_ = diag_token_type::uninitialized;
 };
 
+struct StringYyAlcCtx {
+    std::string* out = nullptr;
+    void* active_ptr = nullptr;
+    bool oom = false;
+};
+
+void* string_yy_malloc(void* vctx, const std::size_t size) {
+    auto* ctx = static_cast<StringYyAlcCtx*>(vctx);
+    try {
+        ctx->out->resize(size == 0u ? 1u : size);
+        ctx->active_ptr = ctx->out->data();
+        return ctx->active_ptr;
+    } catch (...) {
+        ctx->oom = true;
+        return nullptr;
+    }
+}
+
+void* string_yy_realloc(void* vctx, void* /*ptr*/, const std::size_t /*old_size*/,
+                        const std::size_t size) {
+    auto* ctx = static_cast<StringYyAlcCtx*>(vctx);
+    try {
+        ctx->out->resize(size == 0u ? 1u : size);
+        ctx->active_ptr = ctx->out->data();
+        return ctx->active_ptr;
+    } catch (...) {
+        ctx->oom = true;
+        return nullptr;
+    }
+}
+
+void string_yy_free(void* vctx, void* ptr) {
+    auto* ctx = static_cast<StringYyAlcCtx*>(vctx);
+    if (ptr != nullptr && ptr == ctx->active_ptr) {
+        ctx->out->clear();
+        ctx->active_ptr = nullptr;
+    }
+}
+
+bool try_dump_yyjson_direct(const json& val, std::string& out) {
+    if (!json_access::is_lazy(val)) {
+        return false;
+    }
+    const value_t type = json_access::type_of(val);
+    if (type != value_t::array && type != value_t::object) {
+        return false;
+    }
+    auto* node = static_cast<LazyNode*>(json_access::lazy_node(val));
+    if (node->materialized.load(std::memory_order_acquire) != nullptr) {
+        return false;
+    }
+    if (!node->doc->tree_unique_verified.load(std::memory_order_acquire)) {
+        const std::uint8_t state = node->dedup_state.load(std::memory_order_acquire);
+        if ((state & (2u | 8u)) != 0u) {
+            return false;
+        }
+        if ((state & 4u) == 0u) {
+            if (!is_yyjson_tree_unique(node->val)) {
+                node->dedup_state.fetch_or(8u, std::memory_order_release);
+                return false;
+            }
+            const std::uint8_t bits = (type == value_t::object) ? (1u | 4u) : 4u;
+            node->dedup_state.fetch_or(bits, std::memory_order_release);
+            if (node->val == yyjson_doc_get_root(node->doc->doc)) {
+                node->doc->tree_unique_verified.store(true, std::memory_order_release);
+            }
+        }
+    }
+    StringYyAlcCtx ctx{&out, nullptr, false};
+    const yyjson_alc alc{&string_yy_malloc, &string_yy_realloc, &string_yy_free, &ctx};
+    const yyjson_write_flag flg =
+        YYJSON_WRITE_NEOJSON_FP | YYJSON_WRITE_LOWERCASE_HEX | YYJSON_WRITE_INF_AND_NAN_AS_NULL;
+    std::size_t out_len = 0u;
+    yyjson_write_err err{};
+    char* raw = yyjson_val_write_opts(node->val, flg, &alc, &out_len, &err);
+    if (raw == nullptr) {
+        if (ctx.oom) {
+            throw std::bad_alloc();
+        }
+        out.clear();
+        return false;
+    }
+    out.resize(out_len);
+    return true;
+}
+
 } // namespace
 } // namespace detail
 
 json::string_t json::dump(const int indent, const char indent_char, const bool ensure_ascii,
                           const error_handler_t error_handler) const {
-    detail::DumpBuffer buf;
     if (indent < 0 && !ensure_ascii && error_handler == error_handler_t::strict) {
+        std::string direct_out;
+        if (detail::try_dump_yyjson_direct(*this, direct_out)) {
+            return direct_out;
+        }
+        detail::DumpBuffer buf;
         detail::dump_compact_strict(buf, *this);
         return buf.to_string();
     }
+    detail::DumpBuffer buf;
     if (indent >= 0) {
         std::string indent_string(512, indent_char);
         detail::dump_value(buf, *this, true, ensure_ascii, error_handler,
