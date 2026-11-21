@@ -1,7 +1,16 @@
 #include "neojson/json.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <random>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #include "yyjson.h"
 
@@ -18,6 +27,101 @@ std::uint64_t hash_seed_init() noexcept {
     }
     s ^= reinterpret_cast<std::uintptr_t>(&hash_seed_init);
     return fmix64(s) | 1ULL;
+}
+
+class DumpBuffer {
+public:
+    DumpBuffer() noexcept : data_(inline_buf_), size_(0), cap_(sizeof(inline_buf_)) {}
+
+    ~DumpBuffer() noexcept {
+        if (data_ != inline_buf_) {
+            std::free(data_);
+        }
+    }
+
+    DumpBuffer(const DumpBuffer&) = delete;
+    DumpBuffer& operator=(const DumpBuffer&) = delete;
+
+    void reserve_extra(const std::size_t n) {
+        if (n > cap_ - size_) {
+            grow(n);
+        }
+    }
+
+    char* write_ptr() noexcept {
+        return data_ + size_;
+    }
+
+    void advance_to(const char* end) noexcept {
+        size_ = static_cast<std::size_t>(end - data_);
+    }
+
+    void push_unchecked(const char c) noexcept {
+        data_[size_++] = c;
+    }
+
+    void push(const char c) {
+        if (size_ == cap_) {
+            grow(1);
+        }
+        data_[size_++] = c;
+    }
+
+    void append_unchecked(const char* p, const std::size_t n) noexcept {
+        if (n != 0) {
+            std::memcpy(data_ + size_, p, n);
+            size_ += n;
+        }
+    }
+
+    void append(const char* p, const std::size_t n) {
+        reserve_extra(n);
+        append_unchecked(p, n);
+    }
+
+    std::string to_string() const {
+        return std::string(data_, size_);
+    }
+
+private:
+    void grow(std::size_t need);
+
+    char inline_buf_[4096];
+    char* data_;
+    std::size_t size_;
+    std::size_t cap_;
+};
+
+void DumpBuffer::grow(const std::size_t need) {
+    constexpr std::size_t kMaxSize = (std::numeric_limits<std::size_t>::max)();
+    if (need > kMaxSize - size_) {
+        throw std::bad_alloc();
+    }
+    const std::size_t required = size_ + need;
+    std::size_t new_cap = (cap_ <= kMaxSize / 2) ? cap_ * 2 : kMaxSize;
+    if (new_cap < 8192) {
+        new_cap = 8192;
+    }
+    if (new_cap < required) {
+        new_cap = required;
+    }
+    if (data_ == inline_buf_) {
+        auto* p = static_cast<char*>(std::malloc(new_cap));
+        if (p == nullptr) {
+            throw std::bad_alloc();
+        }
+        if (size_ != 0) {
+            std::memcpy(p, inline_buf_, size_);
+        }
+        data_ = p;
+    } else {
+        auto* p = static_cast<char*>(std::realloc(data_, new_cap));
+        if (p == nullptr) {
+            throw std::bad_alloc();
+        }
+        data_ = p;
+    }
+    cap_ = new_cap;
 }
 
 namespace dtoa_impl {
@@ -46,7 +150,22 @@ struct diyfp {
 
     static diyfp mul(const diyfp& x, const diyfp& y) noexcept {
         static_assert(kPrecision == 64, "internal error");
-
+#if defined(__SIZEOF_INT128__)
+        __extension__ using u128 = unsigned __int128;
+        const u128 prod = static_cast<u128>(x.f) * static_cast<u128>(y.f);
+        const auto lo = static_cast<std::uint64_t>(prod);
+        const auto hi = static_cast<std::uint64_t>(prod >> 64u);
+        return {hi + (lo >> 63u), x.e + y.e + 64};
+#elif defined(_MSC_VER) && defined(_M_X64)
+        unsigned __int64 hi = 0;
+        const unsigned __int64 lo = _umul128(x.f, y.f, &hi);
+        return {static_cast<std::uint64_t>(hi) + static_cast<std::uint64_t>(lo >> 63u),
+                x.e + y.e + 64};
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+        const std::uint64_t lo = x.f * y.f;
+        const std::uint64_t hi = __umulh(x.f, y.f);
+        return {hi + (lo >> 63u), x.e + y.e + 64};
+#else
         const std::uint64_t u_lo = x.f & 0xFFFFFFFFu;
         const std::uint64_t u_hi = x.f >> 32u;
         const std::uint64_t v_lo = y.f & 0xFFFFFFFFu;
@@ -68,14 +187,27 @@ struct diyfp {
 
         const std::uint64_t h = p3 + p2_hi + p1_hi + (Q >> 32u);
         return {h, x.e + y.e + 64};
+#endif
     }
 
     static diyfp normalize(diyfp x) noexcept {
         assert(x.f != 0);
+#if (defined(__GNUC__) || defined(__clang__)) && (ULLONG_MAX == 0xFFFFFFFFFFFFFFFFULL)
+        const int shift = __builtin_clzll(static_cast<unsigned long long>(x.f));
+        x.f <<= shift;
+        x.e -= shift;
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+        unsigned long idx = 0;
+        _BitScanReverse64(&idx, x.f);
+        const int shift = 63 - static_cast<int>(idx);
+        x.f <<= shift;
+        x.e -= shift;
+#else
         while ((x.f >> 63u) == 0) {
             x.f <<= 1u;
             x.e--;
         }
+#endif
         return x;
     }
 
@@ -254,13 +386,15 @@ inline void grisu2_digit_gen(char* buffer, int& length, int& decimal_exponent, d
     auto p1 = static_cast<std::uint32_t>(M_plus.f >> -one.e);
     std::uint64_t p2 = M_plus.f & (one.f - 1);
 
+    static constexpr std::uint32_t kPow10[10] = {
+        1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u};
     std::uint32_t pow10 = 0;
     const int k = find_largest_pow10(p1, pow10);
 
     int n = k;
     while (n > 0) {
         const std::uint32_t d = p1 / pow10;
-        const std::uint32_t r = p1 % pow10;
+        const std::uint32_t r = p1 - d * pow10;
 
         assert(d <= 9);
         buffer[length++] = static_cast<char>('0' + d);
@@ -274,8 +408,8 @@ inline void grisu2_digit_gen(char* buffer, int& length, int& decimal_exponent, d
         }
 
         p1 = r;
-        pow10 /= 10;
         --n;
+        pow10 = (n > 0) ? kPow10[static_cast<std::size_t>(n - 1)] : 0u;
     }
 
     assert(p1 == 0);
@@ -398,7 +532,7 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
     return append_exponent(buf, n - 1);
 }
 
-inline void append_float(std::string& out, double val) {
+inline void append_float(DumpBuffer& out, double val) {
     if (std::isnan(val) || std::isinf(val)) {
         out.append("null", 4);
         return;
@@ -418,8 +552,8 @@ inline void append_float(std::string& out, double val) {
         return;
     }
 
-    std::array<char, 64> number_buffer{{}};
-    char* p = number_buffer.data();
+    out.reserve_extra(64);
+    char* p = out.write_ptr();
     if (is_negative) {
         *p++ = '-';
     }
@@ -431,7 +565,7 @@ inline void append_float(std::string& out, double val) {
     constexpr int kMinExp = -4;
     constexpr int kMaxExp = std::numeric_limits<double>::digits10;
     char* end = format_buffer(p, length, decimal_exponent, kMinExp, kMaxExp);
-    out.append(number_buffer.data(), static_cast<std::size_t>(end - number_buffer.data()));
+    out.advance_to(end);
 }
 
 } // namespace dtoa_impl
@@ -470,7 +604,7 @@ inline std::uint8_t decode(std::uint8_t& state, std::uint32_t& codep,
     return state;
 }
 
-inline void append_u4(std::string& out, std::uint16_t cp) {
+inline void append_u4(DumpBuffer& out, std::uint16_t cp) {
     static constexpr char kHex[] = "0123456789abcdef";
     char buf[6] = {'\\', 'u',
                    kHex[(cp >> 12u) & 0x0Fu],
@@ -493,24 +627,66 @@ inline void throw_incomplete_utf8(std::uint8_t byte) {
     throw type_error::create(316, std::string("incomplete UTF-8 string; last byte: ") + hex);
 }
 
-// A byte that dump_escaped copies as it is when no multi-byte sequence is open: printable ASCII other than the quote
-// and the backslash (and DEL, which ensure_ascii escapes).
-inline bool is_verbatim_ascii(const std::uint8_t byte, const bool ensure_ascii) noexcept {
-    return byte >= 0x20u && byte < 0x7Fu + (ensure_ascii ? 0u : 1u) && byte != 0x22u && byte != 0x5Cu;
+constexpr std::array<std::uint8_t, 256> make_escape_lut(const bool ensure_ascii) noexcept {
+    std::array<std::uint8_t, 256> lut{};
+    for (std::size_t i = 0; i < 256; ++i) {
+        const bool verbatim =
+            i >= 0x20u && i < (ensure_ascii ? 0x7Fu : 0x80u) && i != 0x22u && i != 0x5Cu;
+        lut[i] = verbatim ? 0u : 1u;
+    }
+    return lut;
+}
+
+inline constexpr std::array<std::uint8_t, 256> kNeedsEscapeUtf8 = make_escape_lut(false);
+inline constexpr std::array<std::uint8_t, 256> kNeedsEscapeAscii = make_escape_lut(true);
+
+inline bool has_non_verbatim_utf8_8(const std::uint64_t w) noexcept {
+    constexpr std::uint64_t kHi = 0x8080808080808080ULL;
+    constexpr std::uint64_t kLo = 0x0101010101010101ULL;
+    constexpr std::uint64_t kSp = 0x2020202020202020ULL;
+    const std::uint64_t non_ascii_or_ctrl = (w & kHi) | ((w - kSp) & ~w & kHi);
+    const std::uint64_t q = w ^ 0x2222222222222222ULL;
+    const std::uint64_t b = w ^ 0x5C5C5C5C5C5C5C5CULL;
+    const std::uint64_t has_quote = (q - kLo) & ~q & kHi;
+    const std::uint64_t has_bs = (b - kLo) & ~b & kHi;
+    return (non_ascii_or_ctrl | has_quote | has_bs) != 0;
+}
+
+inline std::size_t find_non_verbatim_utf8(const char* p, std::size_t pos,
+                                          const std::size_t len) noexcept {
+    while (pos + 8 <= len) {
+        std::uint64_t w = 0;
+        std::memcpy(&w, p + pos, 8);
+        if (has_non_verbatim_utf8_8(w)) {
+            break;
+        }
+        pos += 8;
+    }
+    while (pos < len && kNeedsEscapeUtf8[static_cast<std::uint8_t>(p[pos])] == 0u) {
+        ++pos;
+    }
+    return pos;
+}
+
+inline std::size_t find_non_verbatim_ascii(const char* p, std::size_t pos,
+                                           const std::size_t len) noexcept {
+    while (pos < len && kNeedsEscapeAscii[static_cast<std::uint8_t>(p[pos])] == 0u) {
+        ++pos;
+    }
+    return pos;
 }
 
 // The algorithm of nlohmann/json's serializer::dump_escaped, with the same output and the same errors. The bytes that
-// are copied as they are form spans of `s`, and each span is appended with one call: appending them one by one cost
-// more than the rest of dump on documents with many strings.
-inline void dump_escaped(std::string& out, const std::string& s, const bool ensure_ascii,
-                         const error_handler_t error_handler) {
+// are copied as they are form spans of `s`, and each span is appended with one call from `start_pos` onward.
+inline void dump_escaped_from(DumpBuffer& out, const std::string& s, const std::size_t start_pos,
+                              const bool ensure_ascii, const error_handler_t error_handler) {
     std::uint32_t codepoint = 0;
     std::uint8_t state = UTF8_ACCEPT;
     std::size_t undumped_chars = 0;
 
     // s[span_begin, span_end) is copied to out but not yet appended.
-    std::size_t span_begin = 0;
-    std::size_t span_end = 0;
+    std::size_t span_begin = start_pos;
+    std::size_t span_end = start_pos;
     const auto flush = [&] {
         if (span_end > span_begin) {
             out.append(s.data() + span_begin, span_end - span_begin);
@@ -525,17 +701,18 @@ inline void dump_escaped(std::string& out, const std::string& s, const bool ensu
         span_end = end;
     };
 
-    for (std::size_t i = 0; i < s.size(); ++i) {
+    for (std::size_t i = start_pos; i < s.size(); ++i) {
         // With no sequence open (state is UTF8_ACCEPT, so undumped_chars is 0), a run of verbatim bytes needs no
         // decoding: each would decode to itself and leave the state as it is.
-        if (state == UTF8_ACCEPT && is_verbatim_ascii(static_cast<std::uint8_t>(s[i]), ensure_ascii)) {
-            std::size_t end = i + 1;
-            while (end < s.size() && is_verbatim_ascii(static_cast<std::uint8_t>(s[end]), ensure_ascii)) {
-                ++end;
+        if (state == UTF8_ACCEPT) {
+            const std::size_t end =
+                ensure_ascii ? find_non_verbatim_ascii(s.data(), i, s.size())
+                             : find_non_verbatim_utf8(s.data(), i, s.size());
+            if (end > i) {
+                copy(i, end);
+                i = end - 1;
+                continue;
             }
-            copy(i, end);
-            i = end - 1;
-            continue;
         }
 
         const auto byte = static_cast<std::uint8_t>(s[i]);
@@ -648,6 +825,35 @@ inline void dump_escaped(std::string& out, const std::string& s, const bool ensu
     }
 }
 
+inline void dump_escaped(DumpBuffer& out, const std::string& s, const bool ensure_ascii,
+                         const error_handler_t error_handler) {
+    dump_escaped_from(out, s, 0, ensure_ascii, error_handler);
+}
+
+inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
+    const char* p = s.data();
+    const std::size_t len = s.size();
+    const std::size_t first = find_non_verbatim_utf8(p, 0, len);
+    if (first == len) {
+        out.reserve_extra(len + 2);
+        char* dst = out.write_ptr();
+        *dst++ = '"';
+        if (len != 0) {
+            std::memcpy(dst, p, len);
+            dst += len;
+        }
+        *dst++ = '"';
+        out.advance_to(dst);
+        return;
+    }
+    out.push('"');
+    if (first != 0) {
+        out.append(p, first);
+    }
+    dump_escaped_from(out, s, first, false, error_handler_t::strict);
+    out.push('"');
+}
+
 } // namespace utf8_impl
 
 struct json_access {
@@ -674,23 +880,87 @@ struct json_access {
         j.m_value.object = ptr.release();
         return j;
     }
+
+    static json::value_t type_of(const json& j) noexcept {
+        return j.m_type;
+    }
+
+    static bool bool_of(const json& j) noexcept {
+        return j.m_value.boolean;
+    }
+
+    static json::number_integer_t int_of(const json& j) noexcept {
+        return j.m_value.number_integer;
+    }
+
+    static json::number_unsigned_t uint_of(const json& j) noexcept {
+        return j.m_value.number_unsigned;
+    }
+
+    static json::number_float_t float_of(const json& j) noexcept {
+        return j.m_value.number_float;
+    }
+
+    static const json::string_t& string_of(const json& j) noexcept {
+        return *j.m_value.string;
+    }
+
+    static const json::array_t& array_of(const json& j) noexcept {
+        return *j.m_value.array;
+    }
+
+    static const json::object_t& object_of(const json& j) noexcept {
+        return *j.m_value.object;
+    }
 };
 
 namespace {
 
-void append_uint(std::string& out, std::uint64_t v) {
+inline void append_uint(DumpBuffer& out, std::uint64_t v) {
+    static constexpr char kDigits100[201] =
+        "0001020304050607080910111213141516171819"
+        "2021222324252627282930313233343536373839"
+        "4041424344454647484950515253545556575859"
+        "6061626364656667686970717273747576777879"
+        "8081828384858687888990919293949596979899";
+    if (v < 100u) {
+        out.reserve_extra(2);
+        char* p = out.write_ptr();
+        if (v < 10u) {
+            *p++ = static_cast<char>('0' + v);
+        } else {
+            const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
+            p[0] = d[0];
+            p[1] = d[1];
+            p += 2;
+        }
+        out.advance_to(p);
+        return;
+    }
     char buf[24];
     char* p = buf + sizeof(buf);
-    do {
-        *--p = static_cast<char>('0' + (v % 10));
-        v /= 10;
-    } while (v != 0);
+    while (v >= 100u) {
+        const auto q = v / 100u;
+        const auto r = static_cast<std::size_t>((v - q * 100u) * 2u);
+        v = q;
+        p -= 2;
+        p[0] = kDigits100[r];
+        p[1] = kDigits100[r + 1];
+    }
+    if (v >= 10u) {
+        const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
+        p -= 2;
+        p[0] = d[0];
+        p[1] = d[1];
+    } else {
+        *--p = static_cast<char>('0' + v);
+    }
     out.append(p, static_cast<std::size_t>((buf + sizeof(buf)) - p));
 }
 
-void append_int(std::string& out, std::int64_t v) {
+inline void append_int(DumpBuffer& out, const std::int64_t v) {
     if (v < 0) {
-        out.push_back('-');
+        out.push('-');
         const auto u = static_cast<std::uint64_t>(-(v + 1)) + 1u;
         append_uint(out, u);
     } else {
@@ -698,17 +968,14 @@ void append_int(std::string& out, std::int64_t v) {
     }
 }
 
-void dump_value(std::string& out, const json& val, const bool pretty_print,
-                const bool ensure_ascii, const error_handler_t error_handler,
-                const unsigned int indent_step, std::string& indent_string,
-                const unsigned int current_indent) {
-    switch (val.type()) {
+void dump_compact_strict(DumpBuffer& out, const json& val) {
+    switch (json_access::type_of(val)) {
         case value_t::null:
             out.append("null", 4);
             return;
 
         case value_t::boolean:
-            if (val.get<bool>()) {
+            if (json_access::bool_of(val)) {
                 out.append("true", 4);
             } else {
                 out.append("false", 5);
@@ -716,27 +983,105 @@ void dump_value(std::string& out, const json& val, const bool pretty_print,
             return;
 
         case value_t::number_integer:
-            append_int(out, *val.get_ptr<const json::number_integer_t*>());
+            append_int(out, json_access::int_of(val));
             return;
 
         case value_t::number_unsigned:
-            append_uint(out, *val.get_ptr<const json::number_unsigned_t*>());
+            append_uint(out, json_access::uint_of(val));
             return;
 
         case value_t::number_float:
-            dtoa_impl::append_float(out, *val.get_ptr<const json::number_float_t*>());
+            dtoa_impl::append_float(out, json_access::float_of(val));
             return;
 
         case value_t::string:
-            out.push_back('"');
-            utf8_impl::dump_escaped(
-                out, *val.get_ptr<const json::string_t*>(), ensure_ascii, error_handler);
-            out.push_back('"');
+            utf8_impl::dump_quoted_fast_strict(out, json_access::string_of(val));
             return;
 
         case value_t::array: {
-            const auto* arr = val.get_ptr<const json::array_t*>();
-            if (arr->empty()) {
+            const auto& arr = json_access::array_of(val);
+            if (arr.empty()) {
+                out.append("[]", 2);
+                return;
+            }
+            out.push('[');
+            for (std::size_t i = 0; i < arr.size(); ++i) {
+                if (i > 0) {
+                    out.push(',');
+                }
+                dump_compact_strict(out, arr[i]);
+            }
+            out.push(']');
+            return;
+        }
+
+        case value_t::object: {
+            const auto& obj = json_access::object_of(val);
+            if (obj.empty()) {
+                out.append("{}", 2);
+                return;
+            }
+            out.push('{');
+            for (std::size_t i = 0; i < obj.size(); ++i) {
+                if (i > 0) {
+                    out.push(',');
+                }
+                utf8_impl::dump_quoted_fast_strict(out, obj[i].first);
+                out.push(':');
+                dump_compact_strict(out, obj[i].second);
+            }
+            out.push('}');
+            return;
+        }
+
+        case value_t::discarded:
+            out.append("<discarded>", 11);
+            return;
+
+        case value_t::binary:
+        default:
+            return;
+    }
+}
+
+void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
+                const bool ensure_ascii, const error_handler_t error_handler,
+                const unsigned int indent_step, std::string& indent_string,
+                const unsigned int current_indent) {
+    switch (json_access::type_of(val)) {
+        case value_t::null:
+            out.append("null", 4);
+            return;
+
+        case value_t::boolean:
+            if (json_access::bool_of(val)) {
+                out.append("true", 4);
+            } else {
+                out.append("false", 5);
+            }
+            return;
+
+        case value_t::number_integer:
+            append_int(out, json_access::int_of(val));
+            return;
+
+        case value_t::number_unsigned:
+            append_uint(out, json_access::uint_of(val));
+            return;
+
+        case value_t::number_float:
+            dtoa_impl::append_float(out, json_access::float_of(val));
+            return;
+
+        case value_t::string:
+            out.push('"');
+            utf8_impl::dump_escaped(out, json_access::string_of(val), ensure_ascii, error_handler);
+            out.push('"');
+            return;
+
+        case value_t::array: {
+            const auto& arr = json_access::array_of(val);
+            if (arr.empty()) {
                 out.append("[]", 2);
                 return;
             }
@@ -745,37 +1090,39 @@ void dump_value(std::string& out, const json& val, const bool pretty_print,
                 out.append("[\n", 2);
                 const unsigned int new_indent = current_indent + indent_step;
                 if (indent_string.size() < new_indent) {
-                    indent_string.resize(indent_string.size() * 2, ' ');
+                    indent_string.resize(
+                        (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)),
+                        ' ');
                 }
-                for (std::size_t i = 0; i < arr->size(); ++i) {
+                for (std::size_t i = 0; i < arr.size(); ++i) {
                     out.append(indent_string.data(), new_indent);
-                    dump_value(out, (*arr)[i], true, ensure_ascii, error_handler, indent_step,
+                    dump_value(out, arr[i], true, ensure_ascii, error_handler, indent_step,
                                indent_string, new_indent);
-                    if (i + 1 < arr->size()) {
+                    if (i + 1 < arr.size()) {
                         out.append(",\n", 2);
                     } else {
-                        out.push_back('\n');
+                        out.push('\n');
                     }
                 }
                 out.append(indent_string.data(), current_indent);
-                out.push_back(']');
+                out.push(']');
             } else {
-                out.push_back('[');
-                for (std::size_t i = 0; i < arr->size(); ++i) {
+                out.push('[');
+                for (std::size_t i = 0; i < arr.size(); ++i) {
                     if (i > 0) {
-                        out.push_back(',');
+                        out.push(',');
                     }
-                    dump_value(out, (*arr)[i], false, ensure_ascii, error_handler, indent_step,
+                    dump_value(out, arr[i], false, ensure_ascii, error_handler, indent_step,
                                indent_string, current_indent);
                 }
-                out.push_back(']');
+                out.push(']');
             }
             return;
         }
 
         case value_t::object: {
-            const auto* obj = val.get_ptr<const json::object_t*>();
-            if (obj->empty()) {
+            const auto& obj = json_access::object_of(val);
+            if (obj.empty()) {
                 out.append("{}", 2);
                 return;
             }
@@ -784,36 +1131,38 @@ void dump_value(std::string& out, const json& val, const bool pretty_print,
                 out.append("{\n", 2);
                 const unsigned int new_indent = current_indent + indent_step;
                 if (indent_string.size() < new_indent) {
-                    indent_string.resize(indent_string.size() * 2, ' ');
+                    indent_string.resize(
+                        (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)),
+                        ' ');
                 }
-                for (std::size_t i = 0; i < obj->size(); ++i) {
+                for (std::size_t i = 0; i < obj.size(); ++i) {
                     out.append(indent_string.data(), new_indent);
-                    out.push_back('"');
-                    utf8_impl::dump_escaped(out, (*obj)[i].first, ensure_ascii, error_handler);
+                    out.push('"');
+                    utf8_impl::dump_escaped(out, obj[i].first, ensure_ascii, error_handler);
                     out.append("\": ", 3);
-                    dump_value(out, (*obj)[i].second, true, ensure_ascii, error_handler,
-                               indent_step, indent_string, new_indent);
-                    if (i + 1 < obj->size()) {
+                    dump_value(out, obj[i].second, true, ensure_ascii, error_handler, indent_step,
+                               indent_string, new_indent);
+                    if (i + 1 < obj.size()) {
                         out.append(",\n", 2);
                     } else {
-                        out.push_back('\n');
+                        out.push('\n');
                     }
                 }
                 out.append(indent_string.data(), current_indent);
-                out.push_back('}');
+                out.push('}');
             } else {
-                out.push_back('{');
-                for (std::size_t i = 0; i < obj->size(); ++i) {
+                out.push('{');
+                for (std::size_t i = 0; i < obj.size(); ++i) {
                     if (i > 0) {
-                        out.push_back(',');
+                        out.push(',');
                     }
-                    out.push_back('"');
-                    utf8_impl::dump_escaped(out, (*obj)[i].first, ensure_ascii, error_handler);
+                    out.push('"');
+                    utf8_impl::dump_escaped(out, obj[i].first, ensure_ascii, error_handler);
                     out.append("\":", 2);
-                    dump_value(out, (*obj)[i].second, false, ensure_ascii, error_handler,
-                               indent_step, indent_string, current_indent);
+                    dump_value(out, obj[i].second, false, ensure_ascii, error_handler, indent_step,
+                               indent_string, current_indent);
                 }
-                out.push_back('}');
+                out.push('}');
             }
             return;
         }
@@ -2442,16 +2791,20 @@ private:
 
 json::string_t json::dump(const int indent, const char indent_char, const bool ensure_ascii,
                           const error_handler_t error_handler) const {
-    string_t out;
-    out.reserve(detail::kDumpInitialBufferCapacity);
-    std::string indent_string(512, indent_char);
+    detail::DumpBuffer buf;
+    if (indent < 0 && !ensure_ascii && error_handler == error_handler_t::strict) {
+        detail::dump_compact_strict(buf, *this);
+        return buf.to_string();
+    }
     if (indent >= 0) {
-        detail::dump_value(out, *this, true, ensure_ascii, error_handler,
+        std::string indent_string(512, indent_char);
+        detail::dump_value(buf, *this, true, ensure_ascii, error_handler,
                            static_cast<unsigned int>(indent), indent_string, 0);
     } else {
-        detail::dump_value(out, *this, false, ensure_ascii, error_handler, 0, indent_string, 0);
+        std::string indent_string;
+        detail::dump_value(buf, *this, false, ensure_ascii, error_handler, 0, indent_string, 0);
     }
-    return out;
+    return buf.to_string();
 }
 
 std::ostream& operator<<(std::ostream& o, const json& j) {
