@@ -52,6 +52,8 @@ class json_pointer;
 
 namespace detail {
 
+struct json_access;
+
 // Member count above which a parsed object is built by sorting its keys instead of scanning the members
 // inserted so far (see materialize_yyjson in json.cpp). Objects up to this size keep the scan, which is faster for
 // a handful of members. To be set from the benchmark.
@@ -2916,6 +2918,7 @@ private:
     friend class detail::iter_impl;
     template <detail::value_t>
     friend struct detail::external_constructor;
+    friend struct detail::json_access;
     friend class ::neojson::json_pointer;
 
 public:
