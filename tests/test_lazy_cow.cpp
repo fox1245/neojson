@@ -1767,4 +1767,223 @@ TEST(LazyCow, DocArenaConstViewsIsolationAndConcurrency) {
     }
 }
 
+TEST(LazyCow, DocArenaStringInterningAndConstIterCache) {
+    // 1. Duplicate long (>15B) string values in a parsed document share one DocArena SharedString,
+    //    yet escape independently (5u) and detach cleanly on pin/mutate with zero leaks or double-free.
+    const std::string long_a(40, 'a');
+    const std::string long_b(40, 'b');
+    const std::string long_huge(20000, 'z');
+    std::string raw = "{\"x\":\"" + long_a + "\",\"y\":\"" + long_b + "\",\"z\":\"" +
+                      long_a + "\",\"huge1\":\"" + long_huge + "\",\"huge2\":\"" +
+                      long_huge + "\",\"arr\":[\"" + long_a + "\",\"" + long_b + "\"]}";
+
+    jk esc_x;
+    jk esc_z;
+    jk esc_h1;
+    jk esc_h2;
+    {
+        const jk doc = jk::parse(raw);
+        const auto* px = doc["x"].get_ptr<const std::string*>();
+        const auto* pz = doc.at("z").get_ptr<const std::string*>();
+        const auto* pa0 = doc["arr"][0].get_ptr<const std::string*>();
+        ASSERT_NE(px, nullptr);
+        ASSERT_NE(pz, nullptr);
+        ASSERT_NE(pa0, nullptr);
+        EXPECT_EQ(px, pz);
+        EXPECT_EQ(px, pa0);
+        EXPECT_EQ(*px, long_a);
+        EXPECT_EQ(doc["huge1"], long_huge);
+        EXPECT_EQ(doc["huge2"], long_huge);
+
+        // Const iterator cache paths on DocArena object & array, reverse iteration, it[n], and find()
+        auto it_find = doc.find("z");
+        ASSERT_NE(it_find, doc.cend());
+        EXPECT_EQ(it_find.key(), "z");
+        EXPECT_EQ(*it_find, long_a);
+
+        const jk& arr = doc["arr"];
+        auto arr_it = arr.cbegin();
+        EXPECT_EQ(arr_it[0], long_a);
+        EXPECT_EQ(arr_it[1], long_b);
+        EXPECT_EQ(*arr.crbegin(), long_b);
+        auto arr_end = arr.cend();
+        --arr_end;
+        EXPECT_EQ(*arr_end, long_b);
+
+        auto obj_it = doc.cbegin();
+        EXPECT_THROW((void)obj_it[0], jk::invalid_iterator);
+
+        esc_x = doc["x"];
+        esc_z = doc["z"];
+        esc_h1 = doc["huge1"];
+        esc_h2 = doc["huge2"];
+    }
+
+    EXPECT_EQ(esc_x, long_a);
+    EXPECT_EQ(esc_z, long_a);
+    EXPECT_EQ(esc_h1, long_huge);
+    EXPECT_EQ(esc_h2, long_huge);
+
+    // Mutate/pin esc_x while esc_z remains untouched and valid.
+    std::string* mut_px = esc_x.get_ptr<std::string*>();
+    ASSERT_NE(mut_px, nullptr);
+    mut_px->append("_edited");
+    EXPECT_EQ(esc_x, long_a + "_edited");
+    EXPECT_EQ(esc_z, long_a);
+
+    // 2. Converting-assigning non-const iterator over a previously cached const_iterator clears cache.
+    const jk arena_doc = jk::parse(R"({"arr":[10,20,30],"obj":{"a":1,"b":2}})");
+    const jk& arena_arr = arena_doc["arr"];
+    EXPECT_EQ(*arena_arr.cbegin(), 10);
+
+    jk mut_arr = jk::array({100, 200});
+    jk::const_iterator cit = arena_arr.cbegin();
+    EXPECT_EQ(*cit, 10);
+    cit = mut_arr.begin();
+    EXPECT_EQ(*cit, 100);
+    EXPECT_EQ(cit[1], 200);
+
+    jk mut_small = jk::array({7, 8});
+    const jk& csmall = mut_small;
+    EXPECT_EQ(*csmall.cbegin(), 7);
+    auto csmall_end = csmall.cend();
+    --csmall_end;
+    EXPECT_EQ(*csmall_end, 8);
+
+    jk empty_arr = jk::array();
+    jk empty_obj = jk::object();
+    const jk& ce_arr = empty_arr;
+    const jk& ce_obj = empty_obj;
+    EXPECT_EQ(ce_arr.cbegin(), ce_arr.cend());
+    EXPECT_EQ(ce_obj.cbegin(), ce_obj.cend());
+}
+
+TEST(LazyCow, ArenaShapeCacheAndTaggedConstIterator) {
+    static_assert(sizeof(jk::iterator) == 16u);
+    static_assert(sizeof(jk::const_iterator) == 16u);
+
+    // 1. Repeated identical schemas across 1, 2, 6, and 40 keys, mixed with schema mismatches
+    //    that share (len, key0) and duplicate-key objects with the same (len, key0).
+    std::string raw = R"({"single1":[{"only":1},{"only":2},{"other":3}],)";
+    raw += R"("pairs":[{"a":1,"b":2},{"a":3,"b":4},{"a":10,"a":20},{"a":5,"c":6}],)";
+    raw += R"("six":[{"k0":"v0","k1":"v1","k2":"v2","k3":"v3","k4":"v4","k5":"v5"},)";
+    raw += R"({"k0":"w0","k1":"w1","k2":"w2","k3":"w3","k4":"w4","k5":"w5"},)";
+    raw += R"({"k0":"x0","k1":"x1","k2":"x2","k3":"alt","k4":"x4","k9":"x9"}],)";
+    raw += R"("wide":[)";
+    for (int r = 0; r < 3; ++r) {
+        if (r > 0) {
+            raw += ',';
+        }
+        raw += '{';
+        for (int k = 0; k < 40; ++k) {
+            if (k > 0) {
+                raw += ',';
+            }
+            const std::string key = (r == 2 && k == 39) ? "field_alt_39"
+                                                        : ("field_" + std::to_string(k));
+            raw += "\"" + key + "\":" + std::to_string(r * 100 + k);
+        }
+        raw += '}';
+    }
+    raw += R"(],"collisions":[)";
+
+    // 12 distinct 48-byte strings sharing first-8, middle-8, and last-8 bytes (differing only
+    // at byte 10) to exercise sample-hash collision probe cap safety in StringValInternTable.
+    std::vector<std::string> collide_strs;
+    for (int i = 0; i < 12; ++i) {
+        std::string s(48, 'M');
+        s[10] = static_cast<char>('A' + i);
+        collide_strs.push_back(s);
+        if (i > 0) {
+            raw += ',';
+        }
+        raw += "\"" + s + "\"";
+    }
+    raw += "]}";
+
+    const jk doc = jk::parse(raw);
+    const oj ref = oj::parse(raw);
+    neojson::test::assert_tree_equal(ref, doc);
+    EXPECT_EQ(doc["pairs"][2].size(), 1u);
+    EXPECT_EQ(doc["pairs"][2].at("a"), 20);
+    EXPECT_EQ(doc["pairs"][3].at("c"), 6);
+    EXPECT_EQ(doc["six"][2].at("k9"), "x9");
+    EXPECT_EQ(doc["wide"][1].at("field_39"), 139);
+    EXPECT_EQ(doc["wide"][2].at("field_alt_39"), 239);
+    for (std::size_t i = 0u; i < collide_strs.size(); ++i) {
+        EXPECT_EQ(doc["collisions"][i].get_ref<const std::string&>(), collide_strs[i]);
+    }
+
+    // 2. Tagged const_iterator directly over nested m_storage == 4u array and object.
+    const jk nested = jk::parse(
+        R"({"arr":[10,20,30,40],"obj":{"k0":{"x":1},"k1":{"x":2},"k2":3},"other":{"a":7,"k0":{"x":99}}})");
+    const jk& arr = nested["arr"];
+    const jk& obj = nested["obj"];
+    const jk& other = nested["other"];
+
+    EXPECT_EQ(arr.cbegin() + 2, arr.cend() - 2);
+    EXPECT_EQ(arr.cend() - arr.cbegin(), 4);
+    EXPECT_TRUE(arr.cbegin() + 1 < arr.cend());
+    EXPECT_EQ((arr.cbegin() + 1)[2], 40);
+    EXPECT_EQ(*arr.crbegin(), 40);
+    EXPECT_EQ(*(--arr.cend()), 40);
+    EXPECT_THROW((void)arr.cbegin().key(), jk::invalid_iterator);
+    EXPECT_THROW((void)*arr.cend(), jk::invalid_iterator);
+
+    auto obj_it = obj.find("k1");
+    ASSERT_NE(obj_it, obj.cend());
+    EXPECT_EQ(obj_it.key(), "k1");
+    EXPECT_EQ(obj_it->at("x"), 2);
+    EXPECT_EQ(obj.find("missing"), obj.cend());
+
+    std::vector<std::pair<std::string, int>> seen_items;
+    for (const auto& kv : obj.items()) {
+        seen_items.emplace_back(kv.key(), kv.value().is_object() ? kv.value().at("x").get<int>()
+                                                                  : kv.value().get<int>());
+    }
+    ASSERT_EQ(seen_items.size(), 3u);
+    EXPECT_EQ(seen_items[0].first, "k0");
+    EXPECT_EQ(seen_items[2].second, 3);
+    EXPECT_EQ(obj.crbegin().key(), "k2");
+    EXPECT_EQ(*obj.crbegin(), 3);
+
+    EXPECT_THROW((void)obj.cbegin()[0], jk::invalid_iterator);
+    EXPECT_THROW((void)(obj.cbegin() + 1), jk::invalid_iterator);
+    EXPECT_THROW((void)(obj.cbegin() < obj.cend()), jk::invalid_iterator);
+    EXPECT_THROW((void)(obj.cend() - obj.cbegin()), jk::invalid_iterator);
+    EXPECT_THROW((void)*obj.cend(), jk::invalid_iterator);
+    EXPECT_THROW((void)(obj.cbegin() == other.cbegin()), jk::invalid_iterator);
+    EXPECT_THROW((void)(obj.cbegin() < other.cbegin()), jk::invalid_iterator);
+
+    // Construct / insert / update directly from tagged const_iterators.
+    const jk sliced_arr(arr.cbegin() + 1, arr.cend());
+    EXPECT_EQ(sliced_arr, jk::array({20, 30, 40}));
+    const jk sliced_obj(obj.cbegin(), std::next(obj.cbegin(), 2));
+    EXPECT_EQ(sliced_obj, jk::parse(R"({"k0":{"x":1},"k1":{"x":2}})"));
+
+    jk target_arr = jk::array({1, 2});
+    target_arr.insert(target_arr.cbegin() + 1, arr.cbegin(), arr.cbegin() + 2);
+    EXPECT_EQ(target_arr, jk::array({1, 10, 20, 2}));
+
+    jk target_obj = jk::parse(R"({"k0":{"x":0,"keep":5},"old":9})");
+    target_obj.insert(obj.cbegin(), obj.cend());
+    EXPECT_EQ(target_obj.at("k2"), 3);
+
+    jk merge_target = jk::parse(R"({"k0":{"keep":5},"k1":{"old_sub":8}})");
+    merge_target.update(obj.cbegin(), std::next(obj.cbegin(), 2), true);
+    EXPECT_EQ(merge_target["k0"]["keep"], 5);
+    EXPECT_EQ(merge_target["k0"]["x"], 1);
+    EXPECT_EQ(merge_target["k1"]["old_sub"], 8);
+    EXPECT_EQ(merge_target["k1"]["x"], 2);
+    EXPECT_THROW(merge_target.update(arr.cbegin(), arr.cend(), false), jk::type_error);
+
+    // Root m_storage == 1u keeps mutable/const iterator interoperability.
+    jk mut_root = jk::parse(R"({"arr":[1,2],"obj":{"a":1}})");
+    EXPECT_EQ(mut_root.begin(), mut_root.cbegin());
+    EXPECT_EQ(mut_root.end(), mut_root.cend());
+    EXPECT_EQ(mut_root.find("obj"), std::as_const(mut_root).find("obj"));
+    EXPECT_EQ(std::as_const(mut_root).find("missing"), mut_root.end());
+    EXPECT_EQ(std::as_const(mut_root).find("missing"), mut_root.cend());
+}
+
 } // namespace
