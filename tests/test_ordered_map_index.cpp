@@ -180,4 +180,46 @@ TEST(OrderedMapIndex, ConcurrentConstReadsAreRaceFree) {
     }
 }
 
+TEST(OrderedMapIndex, ResizeAssignAndPopBackKeepIndexConsistent) {
+    jk j = jk::object();
+    for (int i = 0; i < 40; ++i) {
+        j["k" + std::to_string(i)] = i;
+    }
+    auto& obj = j.get_ref<jk::object_t&>();
+    obj.resize(20);
+    EXPECT_EQ(obj.size(), 20u);
+    EXPECT_TRUE(j.contains("k0"));
+    EXPECT_TRUE(j.contains("k19"));
+    EXPECT_FALSE(j.contains("k20"));
+    EXPECT_FALSE(j.contains("k39"));
+
+    obj.pop_back();
+    EXPECT_EQ(obj.size(), 19u);
+    EXPECT_FALSE(j.contains("k19"));
+    EXPECT_TRUE(j.contains("k18"));
+
+    obj.resize(1);
+    EXPECT_EQ(obj.size(), 1u);
+    EXPECT_TRUE(j.contains("k0"));
+    EXPECT_FALSE(j.contains("k18"));
+    j["added"] = 99;
+    EXPECT_EQ(j.size(), 2u);
+    EXPECT_EQ(j.at("added"), 99);
+
+    std::vector<jk::object_t::value_type> replacement;
+    for (int i = 0; i < 24; ++i) {
+        replacement.emplace_back("r" + std::to_string(i), i * 10);
+    }
+    obj.assign(replacement.begin(), replacement.end());
+    EXPECT_EQ(obj.size(), 24u);
+    EXPECT_FALSE(j.contains("k0"));
+    EXPECT_TRUE(j.contains("r23"));
+    EXPECT_EQ(j.at("r23"), 230);
+
+    obj.assign({{"solo", 7}});
+    EXPECT_EQ(obj.size(), 1u);
+    EXPECT_FALSE(j.contains("r23"));
+    EXPECT_EQ(j.at("solo"), 7);
+}
+
 }  // namespace
