@@ -1004,6 +1004,14 @@ yyjson_api yyjson_doc *yyjson_read_opts(char *dat,
                                         const yyjson_alc *alc,
                                         yyjson_read_err *err);
 
+/** Read JSON with options and an explicit runtime nesting depth limit (0 disables containers). */
+yyjson_api yyjson_doc *yyjson_read_opts_max_depth(char *dat,
+                                                  size_t len,
+                                                  yyjson_read_flag flg,
+                                                  const yyjson_alc *alc,
+                                                  size_t max_depth,
+                                                  yyjson_read_err *err);
+
 #if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
 
 /**

@@ -56,6 +56,14 @@ std::uint64_t hash_seed() noexcept {
     return seed;
 }
 
+[[noreturn]] void throw_invalid_iterator(const int id, const char* msg) {
+    throw invalid_iterator::create(id, msg);
+}
+
+[[noreturn]] void throw_type_error(const int id, const char* prefix, const char* type_name) {
+    throw type_error::create(id, std::string(prefix) + type_name);
+}
+
 namespace {
 
 inline constexpr std::size_t kSlabSize = 65536;
@@ -74,6 +82,24 @@ struct FreeNode {
 };
 
 struct ThreadPool;
+
+inline void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(_MSC_VER)
+    _mm_pause();
+#else
+    __builtin_ia32_pause();
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_MSC_VER)
+    __yield();
+#else
+    __asm__ volatile("yield" ::: "memory");
+#endif
+#else
+    std::this_thread::yield();
+#endif
+}
 
 struct SlabHeader {
     SlabHeader* prev;
@@ -115,21 +141,7 @@ struct SlabHeader {
     void lock_remote() noexcept {
         while (remote_lock.exchange(1u, std::memory_order_acquire) != 0u) {
             while (remote_lock.load(std::memory_order_relaxed) != 0u) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#if defined(_MSC_VER)
-                _mm_pause();
-#else
-                __builtin_ia32_pause();
-#endif
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#if defined(_MSC_VER)
-                __yield();
-#else
-                __asm__ volatile("yield" ::: "memory");
-#endif
-#else
-                std::this_thread::yield();
-#endif
+                cpu_relax();
             }
         }
     }
@@ -1324,7 +1336,7 @@ inline std::size_t find_non_verbatim_ascii(const char* p, std::size_t pos,
 
 // The algorithm of nlohmann/json's serializer::dump_escaped, with the same output and the same errors. The bytes that
 // are copied as they are form spans of `s`, and each span is appended with one call from `start_pos` onward.
-inline void dump_escaped_from(DumpBuffer& out, const std::string& s, const std::size_t start_pos,
+inline void dump_escaped_from(DumpBuffer& out, const std::string_view s, const std::size_t start_pos,
                               const bool ensure_ascii, const error_handler_t error_handler) {
     std::uint32_t codepoint = 0;
     std::uint8_t state = UTF8_ACCEPT;
@@ -1471,7 +1483,7 @@ inline void dump_escaped_from(DumpBuffer& out, const std::string& s, const std::
     }
 }
 
-inline void dump_escaped(DumpBuffer& out, const std::string& s, const bool ensure_ascii,
+inline void dump_escaped(DumpBuffer& out, const std::string_view s, const bool ensure_ascii,
                          const error_handler_t error_handler) {
     dump_escaped_from(out, s, 0, ensure_ascii, error_handler);
 }
@@ -1485,7 +1497,7 @@ inline void ensure_space(DumpBuffer& out, char*& dst, char*& end, const std::siz
     }
 }
 
-inline void dump_quoted_strict_impl(DumpBuffer& out, const std::string& s,
+inline void dump_quoted_strict_impl(DumpBuffer& out, const std::string_view s,
                                     const bool with_colon) {
     const char* p = s.data();
     const std::size_t len = s.size();
@@ -1658,11 +1670,11 @@ inline void dump_quoted_strict_impl(DumpBuffer& out, const std::string& s,
     out.advance_to(dst);
 }
 
-inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
+inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string_view s) {
     dump_quoted_strict_impl(out, s, false);
 }
 
-inline void dump_key_colon_fast_strict(DumpBuffer& out, const std::string& s) {
+inline void dump_key_colon_fast_strict(DumpBuffer& out, const std::string_view s) {
     dump_quoted_strict_impl(out, s, true);
 }
 
@@ -1724,9 +1736,1241 @@ struct json_access {
     static const json::object_t& object_of(const json& j) noexcept {
         return *j.m_value.object;
     }
+
+    static json make_lazy(const json::value_t type, LazyHeader* node) noexcept {
+        json j;
+        j.m_type = type;
+        j.m_storage = 1u;
+        j.m_value.lazy = node;
+        return j;
+    }
+
+    static bool is_lazy(const json& j) noexcept {
+        return j.m_storage != 0u;
+    }
+
+    static LazyHeader* lazy_node(const json& j) noexcept {
+        return j.m_value.lazy;
+    }
+
+    static const json::array_t* const_array_of(const json& j) {
+        return j.const_array();
+    }
+
+    static const json::object_t* const_object_of(const json& j) {
+        return j.const_object();
+    }
+
+    static json::array_t* detach_array(json& j) {
+        return j.mutable_array();
+    }
+
+    static json::object_t* detach_object(json& j) {
+        return j.mutable_object();
+    }
+
+    static json::array_t* create_array_cap(const std::size_t cap) {
+        auto* ptr = json::create_array();
+        if (cap > 0u) {
+            ptr->reserve(cap);
+        }
+        return ptr;
+    }
+
+    static json::object_t* create_object_cap(const std::size_t cap) {
+        auto* ptr = json::create_object();
+        if (cap > 0u) {
+            ptr->reserve_for_build(cap);
+        }
+        return ptr;
+    }
+
+    static json::array_t* clone_array(const json::array_t* src) {
+        return json::create_array(*src);
+    }
+
+    static json::object_t* clone_object(const json::object_t* src) {
+        return json::create_object(*src);
+    }
+
+    static void destroy_erased_container(void* ptr, const json::value_t type) noexcept {
+        if (ptr == nullptr) {
+            return;
+        }
+        if (type == json::value_t::array) {
+            auto* arr = static_cast<json::array_t*>(ptr);
+            json::json_value::destroy_container(arr);
+        } else {
+            auto* obj = static_cast<json::object_t*>(ptr);
+            json::json_value::destroy_container(obj);
+        }
+    }
+
+    static json make_from_array_ptr(json::array_t* arr) noexcept {
+        json j;
+        j.m_type = json::value_t::array;
+        j.m_value.array = arr;
+        return j;
+    }
+
+    static json make_from_object_ptr(json::object_t* obj) noexcept {
+        json j;
+        j.m_type = json::value_t::object;
+        j.m_value.object = obj;
+        return j;
+    }
 };
 
 namespace {
+
+struct SharedYyDoc {
+    std::atomic<std::uint32_t> refcount{1u};
+    std::atomic<bool> tree_unique_verified{false};
+    yyjson_doc* doc = nullptr;
+
+    explicit SharedYyDoc(yyjson_doc* d) noexcept : doc(d) {}
+};
+
+inline void shared_doc_release(SharedYyDoc* sdoc) noexcept {
+    if (sdoc != nullptr &&
+        (sdoc->refcount.load(std::memory_order_acquire) == 1u ||
+         sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u)) {
+        yyjson_doc_free(sdoc->doc);
+        delete sdoc;
+    }
+}
+
+struct LazyNode : LazyHeader {
+    SharedYyDoc* doc;
+    yyjson_val* val;
+#if __cplusplus >= 202002L || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
+    std::atomic_flag init_lock{};
+#else
+    std::atomic_flag init_lock = ATOMIC_FLAG_INIT;
+#endif
+    std::atomic<std::uint8_t> lookup_probes{0u};
+
+    LazyNode(SharedYyDoc* d, yyjson_val* v) noexcept
+        : LazyHeader(), doc(d), val(v) {
+        raw_len = unsafe_yyjson_get_len(v);
+    }
+};
+static_assert(sizeof(LazyNode) <= 48u, "LazyNode should fit in small pooled slab");
+
+struct SpinGuard {
+    std::atomic_flag& flag;
+    explicit SpinGuard(std::atomic_flag& f) noexcept : flag(f) {
+        std::uint32_t spins = 0u;
+        while (flag.test_and_set(std::memory_order_acquire)) {
+            if (++spins < 64u) {
+                cpu_relax();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
+    ~SpinGuard() {
+        flag.clear(std::memory_order_release);
+    }
+    SpinGuard(const SpinGuard&) = delete;
+    SpinGuard& operator=(const SpinGuard&) = delete;
+};
+
+NEOJSON_NOINLINE bool check_large_object_unique_sorted(yyjson_val* obj, const std::size_t len) {
+    std::vector<std::string_view> keys;
+    keys.reserve(len);
+    yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
+    yyjson_val* key = nullptr;
+    while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+        keys.emplace_back(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+    }
+    std::sort(keys.begin(), keys.end());
+    for (std::size_t i = 1u; i < keys.size(); ++i) {
+        if (keys[i - 1u] == keys[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct DupProbeEntry {
+    std::size_t hash = 0;
+    const char* ptr = nullptr;
+    std::size_t len = 0;
+    std::uint32_t stamp = 0;
+};
+
+struct DupProbeTable {
+    // Standard heap vector so arbitrary reader/writer threads never depend on ThreadPool state.
+    std::vector<DupProbeEntry> slots;
+    std::uint32_t stamp = 1u;
+
+    bool check(yyjson_val* obj, const std::size_t len) {
+        std::size_t cap = 64u;
+        const std::size_t need = len * 2u;
+        while (cap < need) {
+            cap <<= 1u;
+        }
+        if (slots.size() < cap) {
+            slots.assign(cap, DupProbeEntry{});
+            stamp = 1u;
+        } else if (slots.size() > 4096u && cap <= 512u) {
+            slots.assign(cap, DupProbeEntry{});
+            stamp = 1u;
+        } else {
+            ++stamp;
+            if (stamp == 0u) {
+                std::fill(slots.begin(), slots.end(), DupProbeEntry{});
+                stamp = 1u;
+            }
+        }
+        const std::size_t mask = slots.size() - 1u;
+        yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
+        yyjson_val* key = nullptr;
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            const char* kptr = unsafe_yyjson_get_str(key);
+            const std::size_t klen = unsafe_yyjson_get_len(key);
+            const std::size_t h = hash_bytes(kptr, klen);
+            std::size_t pos = h & mask;
+            std::size_t probes = 0u;
+            for (;;) {
+                auto& e = slots[pos];
+                if (e.stamp != stamp) {
+                    e = DupProbeEntry{h, kptr, klen, stamp};
+                    break;
+                }
+                if (e.hash == h && e.len == klen &&
+                    (klen == 0u || std::memcmp(e.ptr, kptr, klen) == 0)) {
+                    return false;
+                }
+                if (++probes >= 64u) {
+                    return check_large_object_unique_sorted(obj, len);
+                }
+                pos = (pos + 1u) & mask;
+            }
+        }
+        return true;
+    }
+};
+
+NEOJSON_NOINLINE bool check_small_object_unique(yyjson_val* obj, const std::size_t len) noexcept {
+    std::string_view seen[16];
+    std::size_t count = 0u;
+    yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
+    yyjson_val* key = nullptr;
+    while ((key = yyjson_obj_iter_next(&iter)) != nullptr && count < len) {
+        const std::string_view sv(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+        for (std::size_t i = 0u; i < count; ++i) {
+            if (seen[i].size() == sv.size() &&
+                (sv.empty() || std::memcmp(seen[i].data(), sv.data(), sv.size()) == 0)) {
+                return false;
+            }
+        }
+        seen[count++] = sv;
+    }
+    return true;
+}
+
+NEOJSON_NOINLINE bool check_large_object_unique(yyjson_val* obj, const std::size_t len) {
+    thread_local DupProbeTable table;
+    return table.check(obj, len);
+}
+
+inline bool is_yyjson_object_unique(yyjson_val* obj) {
+    const std::size_t len = unsafe_yyjson_get_len(obj);
+    if (len <= 1u) {
+        return true;
+    }
+    if (len <= 16u) {
+        return check_small_object_unique(obj, len);
+    }
+    return check_large_object_unique(obj, len);
+}
+
+// A scalar as a node, or an empty array or object for a container (whose elements the caller adds).
+json make_node(yyjson_val* val) {
+    switch (yyjson_get_tag(val)) {
+        case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+            return json(nullptr);
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+            return json(true);
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+            return json(false);
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+            return json(static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+            return json(static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+            return json(static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
+
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
+            return json_access::make_string(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
+
+        case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
+            return json_access::make_array();
+
+        case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE:
+            return json_access::make_object();
+
+        default:
+            return json(nullptr);
+    }
+}
+
+
+struct DocRefBatch {
+    SharedYyDoc* sdoc;
+    std::size_t credit = 0u;
+
+    explicit DocRefBatch(SharedYyDoc* d) noexcept : sdoc(d) {}
+
+    ~DocRefBatch() noexcept {
+        if (credit > 0u) {
+            const std::uint32_t sub = static_cast<std::uint32_t>(credit);
+            if (sdoc->refcount.fetch_sub(sub, std::memory_order_acq_rel) == sub) {
+                yyjson_doc_free(sdoc->doc);
+                delete sdoc;
+            }
+        }
+    }
+
+    DocRefBatch(const DocRefBatch&) = delete;
+    DocRefBatch& operator=(const DocRefBatch&) = delete;
+
+    void take(const std::size_t remaining_hint) noexcept {
+        if (credit == 0u) {
+            const std::size_t chunk = (remaining_hint > 0u && remaining_hint < 16u)
+                                          ? remaining_hint
+                                          : 16u;
+            sdoc->refcount.fetch_add(static_cast<std::uint32_t>(chunk),
+                                      std::memory_order_relaxed);
+            credit = chunk;
+        }
+        --credit;
+    }
+
+    void unget() noexcept {
+        ++credit;
+    }
+};
+
+inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& batch,
+                            const std::size_t remaining_hint) {
+    if (!yyjson_is_ctn(val)) {
+        return make_node(val);
+    }
+    const std::size_t len = unsafe_yyjson_get_len(val);
+    const bool is_arr = yyjson_is_arr(val);
+    if (len == 0u) {
+        return is_arr ? json_access::make_array() : json_access::make_object();
+    }
+    if (is_arr && len <= 4u) {
+        bool all_scalar = true;
+        yyjson_val* elem = unsafe_yyjson_get_first(val);
+        for (std::size_t i = 0u; i < len; ++i) {
+            if (yyjson_is_ctn(elem)) {
+                all_scalar = false;
+                break;
+            }
+            if (i + 1u < len) {
+                elem = unsafe_yyjson_get_next(elem);
+            }
+        }
+        if (all_scalar) {
+            json::array_t* arr = json_access::create_array_cap(len);
+            struct ArrGuard {
+                json::array_t* p;
+                ~ArrGuard() {
+                    if (p != nullptr) {
+                        json_access::destroy_erased_container(p, value_t::array);
+                    }
+                }
+            } guard{arr};
+            elem = unsafe_yyjson_get_first(val);
+            for (std::size_t i = 0u; i < len; ++i) {
+                arr->emplace_back(make_node(elem));
+                if (i + 1u < len) {
+                    elem = unsafe_yyjson_get_next(elem);
+                }
+            }
+            guard.p = nullptr;
+            return json_access::make_from_array_ptr(arr);
+        }
+    } else if (!is_arr && len <= 4u) {
+        bool cheap_leaf = true;
+        yyjson_obj_iter it = yyjson_obj_iter_with(val);
+        yyjson_val* k = nullptr;
+        while ((k = yyjson_obj_iter_next(&it)) != nullptr) {
+            yyjson_val* v = yyjson_obj_iter_get_val(k);
+            if (unsafe_yyjson_get_len(k) > 32u ||
+                (yyjson_is_ctn(v) ? (unsafe_yyjson_get_len(v) != 0u) : yyjson_is_str(v))) {
+                cheap_leaf = false;
+                break;
+            }
+        }
+        if (cheap_leaf) {
+            json::object_t* obj = json_access::create_object_cap(len);
+            struct ObjGuard {
+                json::object_t* p;
+                ~ObjGuard() {
+                    if (p != nullptr) {
+                        json_access::destroy_erased_container(p, value_t::object);
+                    }
+                }
+            } guard{obj};
+            yyjson_obj_iter fill_it = yyjson_obj_iter_with(val);
+            while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
+                yyjson_val* v = yyjson_obj_iter_get_val(k);
+                const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                obj->emplace_or_assign_key(kv, make_node(v));
+            }
+            guard.p = nullptr;
+            return json_access::make_from_object_ptr(obj);
+        }
+    }
+    batch.take(remaining_hint);
+    void* mem = nullptr;
+    try {
+        mem = pool_alloc(sizeof(LazyNode));
+    } catch (...) {
+        batch.unget();
+        throw;
+    }
+    auto* node = new (mem) LazyNode(sdoc, val);
+    return json_access::make_lazy(is_arr ? value_t::array : value_t::object, node);
+}
+
+inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool known_unique) {
+    const std::size_t len = unsafe_yyjson_get_len(val);
+    DocRefBatch batch(sdoc);
+    if (yyjson_is_arr(val)) {
+        json::array_t* arr = json_access::create_array_cap(len);
+        struct ArrGuard {
+            json::array_t* p;
+            ~ArrGuard() {
+                if (p != nullptr) {
+                    json_access::destroy_erased_container(p, value_t::array);
+                }
+            }
+        } guard{arr};
+        yyjson_val* cur = unsafe_yyjson_get_first(val);
+        for (std::size_t i = 0u; i < len; ++i) {
+            arr->emplace_back(make_lazy_child(sdoc, cur, batch, len - i));
+            if (i + 1u < len) {
+                cur = unsafe_yyjson_get_next(cur);
+            }
+        }
+        guard.p = nullptr;
+        return arr;
+    }
+    json::object_t* obj = json_access::create_object_cap(len);
+    struct ObjGuard {
+        json::object_t* p;
+        ~ObjGuard() {
+            if (p != nullptr) {
+                json_access::destroy_erased_container(p, value_t::object);
+            }
+        }
+    } guard{obj};
+    yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+    yyjson_val* key = nullptr;
+    std::size_t rem = len;
+    if (known_unique) {
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            yyjson_val* cval = yyjson_obj_iter_get_val(key);
+            const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+            obj->emplace_back_unique_key(k, make_lazy_child(sdoc, cval, batch, rem));
+            --rem;
+        }
+    } else {
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            yyjson_val* cval = yyjson_obj_iter_get_val(key);
+            const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+            obj->emplace_or_assign_key(k, make_lazy_child(sdoc, cval, batch, rem));
+            --rem;
+        }
+    }
+    guard.p = nullptr;
+    return obj;
+}
+
+inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
+    auto* sdoc = new SharedYyDoc(doc_ref);
+    void* mem = nullptr;
+    try {
+        mem = pool_alloc(sizeof(LazyNode));
+    } catch (...) {
+        delete sdoc;
+        throw;
+    }
+    doc_ref = nullptr;
+    auto* node = new (mem) LazyNode(sdoc, root);
+    return json_access::make_lazy(
+        yyjson_is_arr(root) ? value_t::array : value_t::object, node);
+}
+
+} // namespace
+
+void lazy_release(LazyHeader* hdr, const value_t type) noexcept {
+    if (hdr == nullptr) {
+        return;
+    }
+    auto* node = static_cast<LazyNode*>(hdr);
+    if (node->refcount.load(std::memory_order_acquire) == 1u ||
+        node->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+        void* mat = node->materialized.load(std::memory_order_acquire);
+        SharedYyDoc* sdoc = node->doc;
+        node->~LazyNode();
+        pool_free(node, sizeof(LazyNode));
+        if (mat != nullptr) {
+            json_access::destroy_erased_container(mat, type);
+        }
+        shared_doc_release(sdoc);
+    }
+}
+
+const void* lazy_materialize_const(LazyHeader* hdr, const value_t type) {
+    auto* node = static_cast<LazyNode*>(hdr);
+    void* existing = node->materialized.load(std::memory_order_acquire);
+    if (existing != nullptr) {
+        return existing;
+    }
+    SpinGuard guard(node->init_lock);
+    existing = node->materialized.load(std::memory_order_relaxed);
+    if (existing == nullptr) {
+        const bool known_unique =
+            (type == value_t::object) &&
+            (node->dedup_state.load(std::memory_order_acquire) == 1u ||
+             node->doc->tree_unique_verified.load(std::memory_order_acquire));
+        existing = shallow_materialize(node->doc, node->val, known_unique);
+        node->materialized.store(existing, std::memory_order_release);
+    }
+    return existing;
+}
+
+void* lazy_detach_mutable(LazyHeader* hdr, const value_t type) {
+    auto* node = static_cast<LazyNode*>(hdr);
+    if (node->refcount.load(std::memory_order_acquire) == 1u) {
+        void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
+        if (mat == nullptr) {
+            const bool known_unique =
+                (type == value_t::object) &&
+                (node->dedup_state.load(std::memory_order_acquire) == 1u ||
+                 node->doc->tree_unique_verified.load(std::memory_order_acquire));
+            mat = shallow_materialize(node->doc, node->val, known_unique);
+        }
+        SharedYyDoc* sdoc = node->doc;
+        node->~LazyNode();
+        pool_free(node, sizeof(LazyNode));
+        shared_doc_release(sdoc);
+        return mat;
+    }
+    const void* shared = lazy_materialize_const(hdr, type);
+    void* copy = (type == value_t::array)
+                     ? static_cast<void*>(
+                           json_access::clone_array(static_cast<const json::array_t*>(shared)))
+                     : static_cast<void*>(
+                           json_access::clone_object(static_cast<const json::object_t*>(shared)));
+    if (node->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+        json_access::destroy_erased_container(copy, type);
+        void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
+        SharedYyDoc* sdoc = node->doc;
+        node->~LazyNode();
+        pool_free(node, sizeof(LazyNode));
+        shared_doc_release(sdoc);
+        return mat;
+    }
+    return copy;
+}
+
+std::size_t lazy_size(LazyHeader* hdr, const value_t type) noexcept {
+    auto* node = static_cast<LazyNode*>(hdr);
+    if (type == value_t::array) {
+        return node->raw_len;
+    }
+    void* mat = node->materialized.load(std::memory_order_acquire);
+    if (mat != nullptr) {
+        return static_cast<const json::object_t*>(mat)->size();
+    }
+    if (node->doc->tree_unique_verified.load(std::memory_order_acquire) ||
+        node->dedup_state.load(std::memory_order_acquire) == 1u) {
+        return node->raw_len;
+    }
+    try {
+        if (is_yyjson_object_unique(node->val)) {
+            node->dedup_state.store(1u, std::memory_order_release);
+            return node->raw_len;
+        }
+        node->dedup_state.store(2u, std::memory_order_release);
+        const auto* obj =
+            static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
+        return obj->size();
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+bool lazy_contains(LazyHeader* hdr, const std::string_view key) {
+    auto* node = static_cast<LazyNode*>(hdr);
+    void* mat = node->materialized.load(std::memory_order_acquire);
+    if (mat != nullptr) {
+        return static_cast<const json::object_t*>(mat)->contains(key);
+    }
+    const std::size_t len = node->raw_len;
+    if (len > 16u) {
+        const std::uint8_t prev = node->lookup_probes.load(std::memory_order_relaxed);
+        if (prev >= 3u ||
+            node->lookup_probes.fetch_add(1u, std::memory_order_relaxed) >= 2u) {
+            const auto* obj =
+                static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
+            return obj->contains(key);
+        }
+    }
+    yyjson_obj_iter iter = yyjson_obj_iter_with(node->val);
+    yyjson_val* k = nullptr;
+    while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+        const std::size_t klen = unsafe_yyjson_get_len(k);
+        if (klen == key.size() &&
+            (klen == 0u || std::memcmp(unsafe_yyjson_get_str(k), key.data(), klen) == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void* lazy_clear(LazyHeader* hdr, const value_t type) noexcept {
+    auto* node = static_cast<LazyNode*>(hdr);
+    if (node->refcount.load(std::memory_order_acquire) == 1u) {
+        if (void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel)) {
+            if (type == value_t::array) {
+                static_cast<json::array_t*>(mat)->clear();
+            } else {
+                static_cast<json::object_t*>(mat)->clear();
+            }
+            SharedYyDoc* sdoc = node->doc;
+            node->~LazyNode();
+            pool_free(node, sizeof(LazyNode));
+            shared_doc_release(sdoc);
+            return mat;
+        }
+    }
+    try {
+        void* empty = (type == value_t::array)
+                          ? static_cast<void*>(json_access::create_array_cap(0u))
+                          : static_cast<void*>(json_access::create_object_cap(0u));
+        lazy_release(hdr, type);
+        return empty;
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+bool lazy_equal(const json& lhs, const json& rhs) noexcept {
+    const auto lhs_type = json_access::type_of(lhs);
+    if (lhs_type != json_access::type_of(rhs)) {
+        return false;
+    }
+    if (json_access::is_lazy(lhs) && json_access::is_lazy(rhs) &&
+        json_access::lazy_node(lhs) == json_access::lazy_node(rhs)) {
+        return true;
+    }
+    try {
+        if (lhs.size() != rhs.size()) {
+            return false;
+        }
+        if (lhs_type == value_t::array) {
+            return *json_access::const_array_of(lhs) == *json_access::const_array_of(rhs);
+        }
+        if (lhs_type == value_t::object) {
+            return *json_access::const_object_of(lhs) == *json_access::const_object_of(rhs);
+        }
+        return false;
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+bool lazy_less(const json& lhs, const json& rhs) noexcept {
+    const auto lhs_type = json_access::type_of(lhs);
+    const auto rhs_type = json_access::type_of(rhs);
+    if (lhs_type != rhs_type) {
+        return operator<(lhs_type, rhs_type);
+    }
+    if (json_access::is_lazy(lhs) && json_access::is_lazy(rhs) &&
+        json_access::lazy_node(lhs) == json_access::lazy_node(rhs)) {
+        return false;
+    }
+    try {
+        if (lhs_type == value_t::array) {
+            return *json_access::const_array_of(lhs) < *json_access::const_array_of(rhs);
+        }
+        if (lhs_type == value_t::object) {
+            return *json_access::const_object_of(lhs) < *json_access::const_object_of(rhs);
+        }
+        return false;
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+void lazy_materialize_deep(json& root) {
+    if (!root.is_array() && !root.is_object()) {
+        return;
+    }
+    std::vector<json*> stack;
+    stack.push_back(&root);
+    while (!stack.empty()) {
+        json* cur = stack.back();
+        stack.pop_back();
+        if (cur->is_array()) {
+            auto* arr = json_access::detach_array(*cur);
+            for (auto& elem : *arr) {
+                if (elem.is_array() || elem.is_object()) {
+                    stack.push_back(&elem);
+                }
+            }
+        } else if (cur->is_object()) {
+            auto* obj = json_access::detach_object(*cur);
+            for (auto& kv : *obj) {
+                if (kv.second.is_array() || kv.second.is_object()) {
+                    stack.push_back(&kv.second);
+                }
+            }
+        }
+    }
+}
+
+void* lazy_steal_owned_materialized(LazyHeader* hdr, const value_t /*type*/) noexcept {
+    if (hdr == nullptr) {
+        return nullptr;
+    }
+    auto* node = static_cast<LazyNode*>(hdr);
+    void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
+    if (mat == nullptr) {
+        return nullptr;
+    }
+    SharedYyDoc* sdoc = node->doc;
+    node->~LazyNode();
+    pool_free(node, sizeof(LazyNode));
+    shared_doc_release(sdoc);
+    return mat;
+}
+
+namespace {
+
+void dump_compact_strict(DumpBuffer& out, const json& val);
+void dump_value(DumpBuffer& out, const json& val, bool pretty_print, bool ensure_ascii,
+                error_handler_t error_handler, unsigned int indent_step,
+                std::string& indent_string, unsigned int current_indent);
+json materialize_yyjson(yyjson_val* root, std::size_t max_depth, bool& depth_exceeded);
+
+NEOJSON_NOINLINE void dump_yyjson_dup_obj_compact_strict(DumpBuffer& out, yyjson_val* val) {
+    bool ignored = false;
+    json tmp = materialize_yyjson(val, (std::numeric_limits<std::size_t>::max)(), ignored);
+    dump_compact_strict(out, tmp);
+}
+
+NEOJSON_NOINLINE void dump_yyjson_dup_obj_value(
+    DumpBuffer& out, yyjson_val* val, const bool pretty_print, const bool ensure_ascii,
+    const error_handler_t error_handler, const unsigned int indent_step,
+    std::string& indent_string, const unsigned int current_indent) {
+    bool ignored = false;
+    json tmp = materialize_yyjson(val, (std::numeric_limits<std::size_t>::max)(), ignored);
+    dump_value(out, tmp, pretty_print, ensure_ascii, error_handler, indent_step, indent_string,
+               current_indent);
+}
+
+inline void dump_eager_array_compact_strict(DumpBuffer& out, const json::array_t& arr) {
+    if (arr.empty()) {
+        out.append("[]", 2);
+        return;
+    }
+    out.push('[');
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        if (i > 0) {
+            out.push(',');
+        }
+        dump_compact_strict(out, arr[i]);
+    }
+    out.push(']');
+}
+
+inline void dump_eager_object_compact_strict(DumpBuffer& out, const json::object_t& obj) {
+    if (obj.empty()) {
+        out.append("{}", 2);
+        return;
+    }
+    out.push('{');
+    for (std::size_t i = 0; i < obj.size(); ++i) {
+        if (i > 0) {
+            out.push(',');
+        }
+        utf8_impl::dump_key_colon_fast_strict(out, obj[i].first);
+        dump_compact_strict(out, obj[i].second);
+    }
+    out.push('}');
+}
+
+inline void dump_yyjson_string_compact_strict(DumpBuffer& out, yyjson_val* val) {
+    const char* sp = unsafe_yyjson_get_str(val);
+    const std::size_t sl = unsafe_yyjson_get_len(val);
+    if (unsafe_yyjson_get_subtype(val) == YYJSON_SUBTYPE_NOESC) {
+        out.reserve_extra(sl + 2u);
+        out.push_unchecked('"');
+        out.append_unchecked(sp, sl);
+        out.push_unchecked('"');
+    } else {
+        utf8_impl::dump_quoted_fast_strict(out, std::string_view(sp, sl));
+    }
+}
+
+inline void dump_yyjson_key_colon_compact_strict(DumpBuffer& out, yyjson_val* key) {
+    const char* kp = unsafe_yyjson_get_str(key);
+    const std::size_t kl = unsafe_yyjson_get_len(key);
+    if (unsafe_yyjson_get_subtype(key) == YYJSON_SUBTYPE_NOESC) {
+        out.reserve_extra(kl + 3u);
+        out.push_unchecked('"');
+        out.append_unchecked(kp, kl);
+        out.push_unchecked('"');
+        out.push_unchecked(':');
+    } else {
+        utf8_impl::dump_key_colon_fast_strict(out, std::string_view(kp, kl));
+    }
+}
+
+void dump_yyjson_val_compact_strict(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
+                                    bool& saw_dup, yyjson_val* preverified_obj = nullptr) {
+    switch (yyjson_get_tag(val)) {
+        case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+            out.append("null", 4);
+            return;
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+            out.append("true", 4);
+            return;
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+            out.append("false", 5);
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+            append_uint(out, static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+            append_int(out, static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+            dtoa_impl::append_float(out, static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
+            return;
+
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
+            dump_yyjson_string_compact_strict(out, val);
+            return;
+
+        case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
+            const std::size_t len = unsafe_yyjson_get_len(val);
+            if (len == 0u) {
+                out.append("[]", 2);
+                return;
+            }
+            out.push('[');
+            yyjson_val* cur = unsafe_yyjson_get_first(val);
+            for (std::size_t i = 0u; i < len; ++i) {
+                if (i > 0u) {
+                    out.push(',');
+                }
+                dump_yyjson_val_compact_strict(out, sdoc, cur, saw_dup, nullptr);
+                if (i + 1u < len) {
+                    cur = unsafe_yyjson_get_next(cur);
+                }
+            }
+            out.push(']');
+            return;
+        }
+
+        case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
+            const std::size_t len = unsafe_yyjson_get_len(val);
+            if (len == 0u) {
+                out.append("{}", 2);
+                return;
+            }
+            if (val != preverified_obj &&
+                !sdoc->tree_unique_verified.load(std::memory_order_acquire) &&
+                !is_yyjson_object_unique(val)) {
+                saw_dup = true;
+                dump_yyjson_dup_obj_compact_strict(out, val);
+                return;
+            }
+            out.push('{');
+            yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+            yyjson_val* key = nullptr;
+            bool first = true;
+            while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+                if (!first) {
+                    out.push(',');
+                }
+                first = false;
+                dump_yyjson_key_colon_compact_strict(out, key);
+                dump_yyjson_val_compact_strict(out, sdoc, yyjson_obj_iter_get_val(key), saw_dup,
+                                               nullptr);
+            }
+            out.push('}');
+            return;
+        }
+
+        default:
+            out.append("null", 4);
+            return;
+    }
+}
+
+void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const value_t type) {
+    void* mat = node->materialized.load(std::memory_order_acquire);
+    if (mat != nullptr) {
+        if (type == value_t::array) {
+            dump_eager_array_compact_strict(out, *static_cast<const json::array_t*>(mat));
+        } else {
+            dump_eager_object_compact_strict(out, *static_cast<const json::object_t*>(mat));
+        }
+        return;
+    }
+    if (type == value_t::object &&
+        !node->doc->tree_unique_verified.load(std::memory_order_acquire) &&
+        node->dedup_state.load(std::memory_order_acquire) != 1u &&
+        !is_yyjson_object_unique(node->val)) {
+        node->dedup_state.store(2u, std::memory_order_release);
+        const auto* obj = static_cast<const json::object_t*>(
+            lazy_materialize_const(node, value_t::object));
+        dump_eager_object_compact_strict(out, *obj);
+        return;
+    }
+    bool saw_dup = false;
+    dump_yyjson_val_compact_strict(out, node->doc, node->val, saw_dup,
+                                   type == value_t::object ? node->val : nullptr);
+    if (type == value_t::object) {
+        node->dedup_state.store(1u, std::memory_order_release);
+    }
+    if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
+        node->doc->tree_unique_verified.store(true, std::memory_order_release);
+    }
+}
+
+inline void dump_eager_array_value(DumpBuffer& out, const json::array_t& arr,
+                                   const bool pretty_print, const bool ensure_ascii,
+                                   const error_handler_t error_handler,
+                                   const unsigned int indent_step, std::string& indent_string,
+                                   const unsigned int current_indent) {
+    if (arr.empty()) {
+        out.append("[]", 2);
+        return;
+    }
+    if (pretty_print) {
+        out.append("[\n", 2);
+        const unsigned int new_indent = current_indent + indent_step;
+        if (indent_string.size() < new_indent) {
+            indent_string.resize(
+                (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
+        }
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            out.append(indent_string.data(), new_indent);
+            dump_value(out, arr[i], true, ensure_ascii, error_handler, indent_step, indent_string,
+                       new_indent);
+            if (i + 1 < arr.size()) {
+                out.append(",\n", 2);
+            } else {
+                out.push('\n');
+            }
+        }
+        out.append(indent_string.data(), current_indent);
+        out.push(']');
+    } else {
+        out.push('[');
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            if (i > 0) {
+                out.push(',');
+            }
+            dump_value(out, arr[i], false, ensure_ascii, error_handler, indent_step, indent_string,
+                       current_indent);
+        }
+        out.push(']');
+    }
+}
+
+inline void dump_eager_object_value(DumpBuffer& out, const json::object_t& obj,
+                                    const bool pretty_print, const bool ensure_ascii,
+                                    const error_handler_t error_handler,
+                                    const unsigned int indent_step, std::string& indent_string,
+                                    const unsigned int current_indent) {
+    if (obj.empty()) {
+        out.append("{}", 2);
+        return;
+    }
+    if (pretty_print) {
+        out.append("{\n", 2);
+        const unsigned int new_indent = current_indent + indent_step;
+        if (indent_string.size() < new_indent) {
+            indent_string.resize(
+                (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
+        }
+        for (std::size_t i = 0; i < obj.size(); ++i) {
+            out.append(indent_string.data(), new_indent);
+            out.push('"');
+            utf8_impl::dump_escaped(out, obj[i].first, ensure_ascii, error_handler);
+            out.append("\": ", 3);
+            dump_value(out, obj[i].second, true, ensure_ascii, error_handler, indent_step,
+                       indent_string, new_indent);
+            if (i + 1 < obj.size()) {
+                out.append(",\n", 2);
+            } else {
+                out.push('\n');
+            }
+        }
+        out.append(indent_string.data(), current_indent);
+        out.push('}');
+    } else {
+        out.push('{');
+        for (std::size_t i = 0; i < obj.size(); ++i) {
+            if (i > 0) {
+                out.push(',');
+            }
+            out.push('"');
+            utf8_impl::dump_escaped(out, obj[i].first, ensure_ascii, error_handler);
+            out.append("\":", 2);
+            dump_value(out, obj[i].second, false, ensure_ascii, error_handler, indent_step,
+                       indent_string, current_indent);
+        }
+        out.push('}');
+    }
+}
+
+void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
+                     const bool pretty_print, const bool ensure_ascii,
+                     const error_handler_t error_handler, const unsigned int indent_step,
+                     std::string& indent_string, const unsigned int current_indent, bool& saw_dup,
+                     yyjson_val* preverified_obj = nullptr) {
+    switch (yyjson_get_tag(val)) {
+        case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+            out.append("null", 4);
+            return;
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+            out.append("true", 4);
+            return;
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+            out.append("false", 5);
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+            append_uint(out, static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+            append_int(out, static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+            dtoa_impl::append_float(out, static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
+            return;
+
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
+            const char* sp = unsafe_yyjson_get_str(val);
+            const std::size_t sl = unsafe_yyjson_get_len(val);
+            if (!ensure_ascii && unsafe_yyjson_get_subtype(val) == YYJSON_SUBTYPE_NOESC) {
+                out.reserve_extra(sl + 2u);
+                out.push_unchecked('"');
+                out.append_unchecked(sp, sl);
+                out.push_unchecked('"');
+            } else {
+                out.push('"');
+                utf8_impl::dump_escaped(out, std::string_view(sp, sl), ensure_ascii, error_handler);
+                out.push('"');
+            }
+            return;
+        }
+
+        case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
+            const std::size_t len = unsafe_yyjson_get_len(val);
+            if (len == 0u) {
+                out.append("[]", 2);
+                return;
+            }
+            yyjson_val* cur = unsafe_yyjson_get_first(val);
+            if (pretty_print) {
+                out.append("[\n", 2);
+                const unsigned int new_indent = current_indent + indent_step;
+                if (indent_string.size() < new_indent) {
+                    indent_string.resize(
+                        (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)),
+                        ' ');
+                }
+                for (std::size_t i = 0u; i < len; ++i) {
+                    out.append(indent_string.data(), new_indent);
+                    dump_yyjson_val(out, sdoc, cur, true, ensure_ascii, error_handler, indent_step,
+                                    indent_string, new_indent, saw_dup, nullptr);
+                    if (i + 1u < len) {
+                        out.append(",\n", 2);
+                        cur = unsafe_yyjson_get_next(cur);
+                    } else {
+                        out.push('\n');
+                    }
+                }
+                out.append(indent_string.data(), current_indent);
+                out.push(']');
+            } else {
+                out.push('[');
+                for (std::size_t i = 0u; i < len; ++i) {
+                    if (i > 0u) {
+                        out.push(',');
+                    }
+                    dump_yyjson_val(out, sdoc, cur, false, ensure_ascii, error_handler,
+                                    indent_step, indent_string, current_indent, saw_dup, nullptr);
+                    if (i + 1u < len) {
+                        cur = unsafe_yyjson_get_next(cur);
+                    }
+                }
+                out.push(']');
+            }
+            return;
+        }
+
+        case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
+            const std::size_t len = unsafe_yyjson_get_len(val);
+            if (len == 0u) {
+                out.append("{}", 2);
+                return;
+            }
+            if (val != preverified_obj &&
+                !sdoc->tree_unique_verified.load(std::memory_order_acquire) &&
+                !is_yyjson_object_unique(val)) {
+                saw_dup = true;
+                dump_yyjson_dup_obj_value(out, val, pretty_print, ensure_ascii, error_handler,
+                                          indent_step, indent_string, current_indent);
+                return;
+            }
+            yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+            yyjson_val* key = nullptr;
+            if (pretty_print) {
+                out.append("{\n", 2);
+                const unsigned int new_indent = current_indent + indent_step;
+                if (indent_string.size() < new_indent) {
+                    indent_string.resize(
+                        (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)),
+                        ' ');
+                }
+                std::size_t idx = 0u;
+                while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+                    out.append(indent_string.data(), new_indent);
+                    const char* kp = unsafe_yyjson_get_str(key);
+                    const std::size_t kl = unsafe_yyjson_get_len(key);
+                    if (!ensure_ascii && unsafe_yyjson_get_subtype(key) == YYJSON_SUBTYPE_NOESC) {
+                        out.reserve_extra(kl + 4u);
+                        out.push_unchecked('"');
+                        out.append_unchecked(kp, kl);
+                        out.append_unchecked("\": ", 3);
+                    } else {
+                        out.push('"');
+                        utf8_impl::dump_escaped(out, std::string_view(kp, kl), ensure_ascii,
+                                                error_handler);
+                        out.append("\": ", 3);
+                    }
+                    dump_yyjson_val(out, sdoc, yyjson_obj_iter_get_val(key), true, ensure_ascii,
+                                    error_handler, indent_step, indent_string, new_indent,
+                                    saw_dup, nullptr);
+                    if (idx + 1u < len) {
+                        out.append(",\n", 2);
+                    } else {
+                        out.push('\n');
+                    }
+                    ++idx;
+                }
+                out.append(indent_string.data(), current_indent);
+                out.push('}');
+            } else {
+                out.push('{');
+                bool first = true;
+                while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+                    if (!first) {
+                        out.push(',');
+                    }
+                    first = false;
+                    const char* kp = unsafe_yyjson_get_str(key);
+                    const std::size_t kl = unsafe_yyjson_get_len(key);
+                    if (!ensure_ascii && unsafe_yyjson_get_subtype(key) == YYJSON_SUBTYPE_NOESC) {
+                        out.reserve_extra(kl + 3u);
+                        out.push_unchecked('"');
+                        out.append_unchecked(kp, kl);
+                        out.append_unchecked("\":", 2);
+                    } else {
+                        out.push('"');
+                        utf8_impl::dump_escaped(out, std::string_view(kp, kl), ensure_ascii,
+                                                error_handler);
+                        out.append("\":", 2);
+                    }
+                    dump_yyjson_val(out, sdoc, yyjson_obj_iter_get_val(key), false, ensure_ascii,
+                                    error_handler, indent_step, indent_string, current_indent,
+                                    saw_dup, nullptr);
+                }
+                out.push('}');
+            }
+            return;
+        }
+
+        default:
+            out.append("null", 4);
+            return;
+    }
+}
+
+void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
+                      const bool pretty_print, const bool ensure_ascii,
+                      const error_handler_t error_handler, const unsigned int indent_step,
+                      std::string& indent_string, const unsigned int current_indent) {
+    void* mat = node->materialized.load(std::memory_order_acquire);
+    if (mat != nullptr) {
+        if (type == value_t::array) {
+            dump_eager_array_value(out, *static_cast<const json::array_t*>(mat), pretty_print,
+                                   ensure_ascii, error_handler, indent_step, indent_string,
+                                   current_indent);
+        } else {
+            dump_eager_object_value(out, *static_cast<const json::object_t*>(mat), pretty_print,
+                                    ensure_ascii, error_handler, indent_step, indent_string,
+                                    current_indent);
+        }
+        return;
+    }
+    if (type == value_t::object &&
+        !node->doc->tree_unique_verified.load(std::memory_order_acquire) &&
+        node->dedup_state.load(std::memory_order_acquire) != 1u &&
+        !is_yyjson_object_unique(node->val)) {
+        node->dedup_state.store(2u, std::memory_order_release);
+        const auto* obj = static_cast<const json::object_t*>(
+            lazy_materialize_const(node, value_t::object));
+        dump_eager_object_value(out, *obj, pretty_print, ensure_ascii, error_handler, indent_step,
+                                indent_string, current_indent);
+        return;
+    }
+    bool saw_dup = false;
+    dump_yyjson_val(out, node->doc, node->val, pretty_print, ensure_ascii, error_handler,
+                    indent_step, indent_string, current_indent, saw_dup,
+                    type == value_t::object ? node->val : nullptr);
+    if (type == value_t::object) {
+        node->dedup_state.store(1u, std::memory_order_release);
+    }
+    if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
+        node->doc->tree_unique_verified.store(true, std::memory_order_release);
+    }
+}
 
 void dump_compact_strict(DumpBuffer& out, const json& val) {
     switch (json_access::type_of(val)) {
@@ -1758,40 +3002,23 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
             utf8_impl::dump_quoted_fast_strict(out, json_access::string_of(val));
             return;
 
-        case value_t::array: {
-            const auto& arr = json_access::array_of(val);
-            if (arr.empty()) {
-                out.append("[]", 2);
-                return;
+        case value_t::array:
+            if (json_access::is_lazy(val)) {
+                dump_yyjson_node_compact_strict(
+                    out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::array);
+            } else {
+                dump_eager_array_compact_strict(out, json_access::array_of(val));
             }
-            out.push('[');
-            for (std::size_t i = 0; i < arr.size(); ++i) {
-                if (i > 0) {
-                    out.push(',');
-                }
-                dump_compact_strict(out, arr[i]);
-            }
-            out.push(']');
             return;
-        }
 
-        case value_t::object: {
-            const auto& obj = json_access::object_of(val);
-            if (obj.empty()) {
-                out.append("{}", 2);
-                return;
+        case value_t::object:
+            if (json_access::is_lazy(val)) {
+                dump_yyjson_node_compact_strict(
+                    out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::object);
+            } else {
+                dump_eager_object_compact_strict(out, json_access::object_of(val));
             }
-            out.push('{');
-            for (std::size_t i = 0; i < obj.size(); ++i) {
-                if (i > 0) {
-                    out.push(',');
-                }
-                utf8_impl::dump_key_colon_fast_strict(out, obj[i].first);
-                dump_compact_strict(out, obj[i].second);
-            }
-            out.push('}');
             return;
-        }
 
         case value_t::discarded:
             out.append("<discarded>", 11);
@@ -1838,93 +3065,28 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
             out.push('"');
             return;
 
-        case value_t::array: {
-            const auto& arr = json_access::array_of(val);
-            if (arr.empty()) {
-                out.append("[]", 2);
-                return;
-            }
-
-            if (pretty_print) {
-                out.append("[\n", 2);
-                const unsigned int new_indent = current_indent + indent_step;
-                if (indent_string.size() < new_indent) {
-                    indent_string.resize(
-                        (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)),
-                        ' ');
-                }
-                for (std::size_t i = 0; i < arr.size(); ++i) {
-                    out.append(indent_string.data(), new_indent);
-                    dump_value(out, arr[i], true, ensure_ascii, error_handler, indent_step,
-                               indent_string, new_indent);
-                    if (i + 1 < arr.size()) {
-                        out.append(",\n", 2);
-                    } else {
-                        out.push('\n');
-                    }
-                }
-                out.append(indent_string.data(), current_indent);
-                out.push(']');
+        case value_t::array:
+            if (json_access::is_lazy(val)) {
+                dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
+                                 value_t::array, pretty_print, ensure_ascii, error_handler,
+                                 indent_step, indent_string, current_indent);
             } else {
-                out.push('[');
-                for (std::size_t i = 0; i < arr.size(); ++i) {
-                    if (i > 0) {
-                        out.push(',');
-                    }
-                    dump_value(out, arr[i], false, ensure_ascii, error_handler, indent_step,
-                               indent_string, current_indent);
-                }
-                out.push(']');
+                dump_eager_array_value(out, json_access::array_of(val), pretty_print, ensure_ascii,
+                                       error_handler, indent_step, indent_string, current_indent);
             }
             return;
-        }
 
-        case value_t::object: {
-            const auto& obj = json_access::object_of(val);
-            if (obj.empty()) {
-                out.append("{}", 2);
-                return;
-            }
-
-            if (pretty_print) {
-                out.append("{\n", 2);
-                const unsigned int new_indent = current_indent + indent_step;
-                if (indent_string.size() < new_indent) {
-                    indent_string.resize(
-                        (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)),
-                        ' ');
-                }
-                for (std::size_t i = 0; i < obj.size(); ++i) {
-                    out.append(indent_string.data(), new_indent);
-                    out.push('"');
-                    utf8_impl::dump_escaped(out, obj[i].first, ensure_ascii, error_handler);
-                    out.append("\": ", 3);
-                    dump_value(out, obj[i].second, true, ensure_ascii, error_handler, indent_step,
-                               indent_string, new_indent);
-                    if (i + 1 < obj.size()) {
-                        out.append(",\n", 2);
-                    } else {
-                        out.push('\n');
-                    }
-                }
-                out.append(indent_string.data(), current_indent);
-                out.push('}');
+        case value_t::object:
+            if (json_access::is_lazy(val)) {
+                dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
+                                 value_t::object, pretty_print, ensure_ascii, error_handler,
+                                 indent_step, indent_string, current_indent);
             } else {
-                out.push('{');
-                for (std::size_t i = 0; i < obj.size(); ++i) {
-                    if (i > 0) {
-                        out.push(',');
-                    }
-                    out.push('"');
-                    utf8_impl::dump_escaped(out, obj[i].first, ensure_ascii, error_handler);
-                    out.append("\":", 2);
-                    dump_value(out, obj[i].second, false, ensure_ascii, error_handler, indent_step,
-                               indent_string, current_indent);
-                }
-                out.push('}');
+                dump_eager_object_value(out, json_access::object_of(val), pretty_print,
+                                        ensure_ascii, error_handler, indent_step, indent_string,
+                                        current_indent);
             }
             return;
-        }
 
         case value_t::discarded:
             out.append("<discarded>", 11);
@@ -1980,42 +3142,6 @@ std::vector<std::size_t> first_occurrences_sorted(yyjson_val* val, const std::si
         run = end;
     }
     return first;
-}
-
-// A scalar as a node, or an empty array or object for a container (whose elements the caller adds).
-json make_node(yyjson_val* val) {
-    switch (yyjson_get_tag(val)) {
-        case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
-            return json(nullptr);
-
-        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
-            return json(true);
-
-        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
-            return json(false);
-
-        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
-            return json(static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
-
-        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
-            return json(static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
-
-        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
-            return json(static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
-
-        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
-        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
-            return json_access::make_string(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
-
-        case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
-            return json_access::make_array();
-
-        case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE:
-            return json_access::make_object();
-
-        default:
-            return json(nullptr);
-    }
 }
 
 // Builds the node tree of a parsed document in a single pass while enforcing `max_depth` (same semantics as
@@ -3582,9 +4708,6 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    // The document is valid but nested deeper than the limit: scan it again for the position of the first level
-    // past the limit and report it like a syntax error.
-    // Without exceptions the scan would only produce an error that nobody reads, so it is not run.
     auto fail_nesting = [&]() -> json {
         if (!allow_exceptions) {
             return json(value_t::discarded);
@@ -3595,7 +4718,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
                                   detail::nesting_limit_message(options.max_depth));
     };
 
-    auto finish_doc = [&](yyjson_doc* doc) -> json {
+    auto finish_doc = [&](yyjson_doc*& doc) -> json {
         yyjson_val* root = yyjson_doc_get_root(doc);
         if (cb) {
             if (!detail::within_depth(doc, root, options.max_depth)) {
@@ -3609,15 +4732,13 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
             }
             return result;
         }
-        bool depth_exceeded = false;
-        json result = detail::materialize_yyjson(root, options.max_depth, depth_exceeded);
-        if (depth_exceeded) {
-            return fail_nesting();
+        if (!yyjson_is_ctn(root) || unsafe_yyjson_get_len(root) == 0u) {
+            return detail::make_node(root);
         }
-        return result;
+        return detail::lazy_make_root(doc, root);
     };
 
-    if (s.find('\0') != std::string_view::npos) {
+    auto parse_with_nul_scan = [&]() -> json {
         detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         if (!diag.diagnose(allow_exceptions)) {
             if (allow_exceptions) {
@@ -3635,9 +4756,13 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
             std::replace(clean_prefix.begin(), clean_prefix.end(), '\0', '\n');
             data = clean_prefix.data();
         }
-        yyjson_doc* doc =
-            yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
+        yyjson_read_err err{};
+        yyjson_doc* doc = yyjson_read_opts_max_depth(
+            const_cast<char*>(data), size, flg, nullptr, options.max_depth, &err);
         if (doc == nullptr) {
+            if (err.code == YYJSON_READ_ERROR_DEPTH) {
+                return fail_nesting();
+            }
             if (allow_exceptions) {
                 throw other_error::create(
                     599, "internal error: diagnostic scanner and yyjson disagreed");
@@ -3646,15 +4771,32 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         }
         struct DocGuard {
             yyjson_doc* d;
-            ~DocGuard() { yyjson_doc_free(d); }
+            ~DocGuard() {
+                if (d != nullptr) {
+                    yyjson_doc_free(d);
+                }
+            }
         } guard{doc};
-        return finish_doc(doc);
+        return finish_doc(guard.d);
+    };
+
+    // Only pre-scan for NUL when comments are enabled (raw NUL inside comments would not fail yyjson).
+    if (ignore_comments && s.find('\0') != std::string_view::npos) {
+        return parse_with_nul_scan();
     }
 
-    // yyjson_read_opts does not mutate the input buffer when YYJSON_READ_INSITU is not set.
-    yyjson_doc* doc =
-        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
+    // yyjson_read_opts_max_depth does not mutate the input buffer when YYJSON_READ_INSITU is not set.
+    yyjson_read_err err{};
+    yyjson_doc* doc = yyjson_read_opts_max_depth(
+        const_cast<char*>(s.data()), s.size(), flg, nullptr, options.max_depth, &err);
     if (doc == nullptr) {
+        if (!ignore_comments && err.code != YYJSON_READ_ERROR_DEPTH &&
+            s.find('\0') != std::string_view::npos) {
+            return parse_with_nul_scan();
+        }
+        if (err.code == YYJSON_READ_ERROR_DEPTH) {
+            return fail_nesting();
+        }
         if (!allow_exceptions) {
             return json(value_t::discarded);
         }
@@ -3665,10 +4807,14 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
 
     struct DocGuard {
         yyjson_doc* d;
-        ~DocGuard() { yyjson_doc_free(d); }
+        ~DocGuard() {
+            if (d != nullptr) {
+                yyjson_doc_free(d);
+            }
+        }
     } guard{doc};
 
-    return finish_doc(doc);
+    return finish_doc(guard.d);
 }
 
 json json::parse(std::istream& i, parser_callback_t cb, const bool allow_exceptions,
@@ -3683,7 +4829,7 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
         flg |= YYJSON_READ_ALLOW_COMMENTS;
     }
 
-    if (s.find('\0') != std::string_view::npos) {
+    auto accept_with_nul_scan = [&]() -> bool {
         detail::diagnostic_parser diag(s, ignore_comments, options.max_depth);
         if (!diag.diagnose(false)) {
             return false;
@@ -3697,24 +4843,32 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
             std::replace(clean_prefix.begin(), clean_prefix.end(), '\0', '\n');
             data = clean_prefix.data();
         }
-        yyjson_doc* doc =
-            yyjson_read_opts(const_cast<char*>(data), size, flg, nullptr, nullptr);
+        yyjson_read_err err{};
+        yyjson_doc* doc = yyjson_read_opts_max_depth(
+            const_cast<char*>(data), size, flg, nullptr, options.max_depth, &err);
         if (doc == nullptr) {
             return false;
         }
-        const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
         yyjson_doc_free(doc);
-        return ok;
+        return true;
+    };
+
+    if (ignore_comments && s.find('\0') != std::string_view::npos) {
+        return accept_with_nul_scan();
     }
 
-    yyjson_doc* doc =
-        yyjson_read_opts(const_cast<char*>(s.data()), s.size(), flg, nullptr, nullptr);
+    yyjson_read_err err{};
+    yyjson_doc* doc = yyjson_read_opts_max_depth(
+        const_cast<char*>(s.data()), s.size(), flg, nullptr, options.max_depth, &err);
     if (doc == nullptr) {
+        if (!ignore_comments && err.code != YYJSON_READ_ERROR_DEPTH &&
+            s.find('\0') != std::string_view::npos) {
+            return accept_with_nul_scan();
+        }
         return false;
     }
-    const bool ok = detail::within_depth(doc, yyjson_doc_get_root(doc), options.max_depth);
     yyjson_doc_free(doc);
-    return ok;
+    return true;
 }
 
 bool json::accept(std::istream& i, const bool ignore_comments, const parse_options& options) {
