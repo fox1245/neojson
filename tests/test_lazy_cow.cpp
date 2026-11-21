@@ -991,4 +991,78 @@ TEST(LazyCow, ConstIteratorAndReverseEdgeCases) {
     EXPECT_THROW((void)*scalar.crend(), jk::invalid_iterator);
 }
 
+TEST(LazyCow, ThreadLargeCacheCrossThreadAndDumpReuse) {
+    // Build large (>120 KiB) and small payloads so parsing, accepting, direct dumping, and
+    // DumpBuffer growth reuse and outlive producer threads across size classes.
+    std::string big_raw = "[";
+    for (int i = 0; i < 2500; ++i) {
+        if (i > 0) {
+            big_raw.push_back(',');
+        }
+        big_raw += R"({"idx":)" + std::to_string(i) + R"(,"tag":"item_value_payload_)" +
+                   std::to_string(i) + R"(","coords":[)" + std::to_string(i * 0.25) + "," +
+                   std::to_string(-i * 0.5) + "]}";
+    }
+    big_raw.push_back(']');
+    ASSERT_GT(big_raw.size(), 120u * 1024u);
+
+    const std::string small_raw = R"({"small":1,"arr":[2,3,4],"label":"short"})";
+    std::string bad_raw = big_raw;
+    bad_raw.back() = '}';
+
+    const oj expected_big = oj::parse(big_raw);
+    const oj expected_small = oj::parse(small_raw);
+
+    std::vector<jk> transferred(6);
+    {
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 3; ++t) {
+            workers.emplace_back([&, t]() {
+                EXPECT_TRUE(jk::accept(big_raw));
+                EXPECT_TRUE(jk::accept(small_raw));
+                EXPECT_FALSE(jk::accept(bad_raw));
+
+                // Parse and destroy several docs on worker to populate and reuse its ThreadLargeCache.
+                for (int rep = 0; rep < 3; ++rep) {
+                    const jk tmp_big = jk::parse(big_raw);
+                    EXPECT_EQ(tmp_big.size(), 2500u);
+                    const jk tmp_small = jk::parse(small_raw);
+                    EXPECT_EQ(tmp_small.size(), 3u);
+                }
+
+                // Produce docs that outlive this worker thread.
+                transferred[static_cast<std::size_t>(t * 2)] = jk::parse(big_raw);
+                transferred[static_cast<std::size_t>(t * 2 + 1)] = jk::parse(small_raw);
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
+
+    // Worker threads and their ThreadLargeCache instances are gone. Verify, dump, mutate, and destroy
+    // the transferred documents on the calling thread.
+    const std::string expected_big_dump = expected_big.dump();
+    const std::string expected_small_dump = expected_small.dump();
+    for (int t = 0; t < 3; ++t) {
+        jk& b = transferred[static_cast<std::size_t>(t * 2)];
+        jk& s = transferred[static_cast<std::size_t>(t * 2 + 1)];
+
+        EXPECT_EQ(b.dump(), expected_big_dump);
+        EXPECT_EQ(s.dump(), expected_small_dump);
+        EXPECT_EQ(b[2499].at("idx").get<int>(), 2499);
+
+        // Mutate and force DumpBuffer path across large and small outputs to exercise cache reuse.
+        b[0]["extra"] = "mutated";
+        const std::string pretty_big = b.dump(2);
+        EXPECT_FALSE(pretty_big.empty());
+        const std::string ascii_small = s.dump(-1, ' ', true);
+        EXPECT_EQ(ascii_small, expected_small.dump(-1, ' ', true));
+        const jk reparsed_pretty = jk::parse(pretty_big);
+        EXPECT_EQ(reparsed_pretty[0].at("extra").get<std::string>(), "mutated");
+        EXPECT_EQ(reparsed_pretty.size(), expected_big.size());
+    }
+    transferred.clear();
+}
+
 } // namespace

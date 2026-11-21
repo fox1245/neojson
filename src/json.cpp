@@ -557,13 +557,244 @@ void pool_free(void* p, const std::size_t n) noexcept {
     remote_or_orphan_free(s, p);
 }
 
+namespace {
+
+struct alignas(16) LargeBufHeader {
+    std::size_t cap;
+    std::size_t pad;
+};
+static_assert(sizeof(LargeBufHeader) == 16u && alignof(LargeBufHeader) == 16u,
+              "LargeBufHeader must preserve 16-byte payload alignment");
+
+struct LargeCacheSlot {
+    LargeBufHeader* hdr;
+    std::size_t cap;
+};
+
+inline constexpr std::size_t kLargeCacheMaxSlots = 6u;
+inline constexpr std::size_t kLargeCacheMinBytes = 256u;
+inline constexpr std::size_t kLargeCacheMaxEntryBytes = 16u * 1024u * 1024u;
+inline constexpr std::size_t kLargeCacheMaxTotalBytes = 24u * 1024u * 1024u;
+
+struct ThreadLargeCache {
+    LargeCacheSlot slots[kLargeCacheMaxSlots];
+    std::size_t count;
+    std::size_t total_bytes;
+};
+
+struct ThreadLargeCacheGuard {
+    bool armed = false;
+    ~ThreadLargeCacheGuard() noexcept;
+};
+
+inline thread_local ThreadLargeCache t_large_cache{};
+inline thread_local bool t_large_dead = false;
+inline thread_local ThreadLargeCacheGuard t_large_guard{};
+
+ThreadLargeCacheGuard::~ThreadLargeCacheGuard() noexcept {
+    armed = false;
+    t_large_dead = true;
+    ThreadLargeCache& cache = t_large_cache;
+    for (std::size_t i = 0u; i < cache.count; ++i) {
+        LargeBufHeader* hdr = cache.slots[i].hdr;
+        const std::size_t cap = cache.slots[i].cap;
+#if defined(NEOJSON_HAS_ASAN)
+        ASAN_UNPOISON_MEMORY_REGION(hdr, sizeof(LargeBufHeader) + cap);
+#else
+        (void)cap;
+#endif
+        std::free(hdr);
+    }
+    cache.count = 0u;
+    cache.total_bytes = 0u;
+}
+
+inline std::size_t large_buf_cap(const void* ptr) noexcept {
+    const auto* hdr = reinterpret_cast<const LargeBufHeader*>(
+        static_cast<const char*>(ptr) - sizeof(LargeBufHeader));
+    return hdr->cap;
+}
+
+void* large_malloc_impl(const std::size_t size, const bool ephemeral) noexcept {
+    if (size > (std::numeric_limits<std::size_t>::max)() - sizeof(LargeBufHeader)) {
+        return nullptr;
+    }
+    const std::size_t req = (size == 0u) ? 1u : size;
+    if (!t_large_dead && t_large_cache.count > 0u &&
+        req >= kLargeCacheMinBytes && req <= kLargeCacheMaxEntryBytes) {
+        ThreadLargeCache& cache = t_large_cache;
+        std::size_t best_idx = kLargeCacheMaxSlots;
+        std::size_t best_cap = 0u;
+        for (std::size_t i = 0u; i < cache.count; ++i) {
+            const std::size_t c = cache.slots[i].cap;
+            if (c >= req && (ephemeral || (c - req) <= (req + 65536u))) {
+                if (best_idx == kLargeCacheMaxSlots ||
+                    (ephemeral ? (c > best_cap) : (c < best_cap))) {
+                    best_idx = i;
+                    best_cap = c;
+                }
+            }
+        }
+        if (best_idx < cache.count) {
+            LargeBufHeader* hdr = cache.slots[best_idx].hdr;
+            for (std::size_t i = best_idx + 1u; i < cache.count; ++i) {
+                cache.slots[i - 1u] = cache.slots[i];
+            }
+            --cache.count;
+            cache.total_bytes -= best_cap;
+            void* payload = static_cast<char*>(static_cast<void*>(hdr)) + sizeof(LargeBufHeader);
+#if defined(NEOJSON_HAS_ASAN)
+            ASAN_UNPOISON_MEMORY_REGION(payload, req);
+#endif
+            return payload;
+        }
+    }
+    void* raw = std::malloc(sizeof(LargeBufHeader) + req);
+    if (raw == nullptr) {
+        return nullptr;
+    }
+    auto* hdr = static_cast<LargeBufHeader*>(raw);
+    hdr->cap = req;
+    hdr->pad = 0u;
+    return static_cast<char*>(raw) + sizeof(LargeBufHeader);
+}
+
+void large_free(void* /*ctx*/, void* ptr) noexcept {
+    if (ptr == nullptr) {
+        return;
+    }
+    auto* hdr = reinterpret_cast<LargeBufHeader*>(
+        static_cast<char*>(ptr) - sizeof(LargeBufHeader));
+    const std::size_t cap = hdr->cap;
+    if (!t_large_dead && cap >= kLargeCacheMinBytes && cap <= kLargeCacheMaxEntryBytes) {
+        t_large_guard.armed = true;
+        ThreadLargeCache& cache = t_large_cache;
+        while (cache.count > 0u &&
+               (cache.count == kLargeCacheMaxSlots ||
+                cache.total_bytes + cap > kLargeCacheMaxTotalBytes)) {
+            LargeBufHeader* ev_hdr = cache.slots[0].hdr;
+            const std::size_t ev_cap = cache.slots[0].cap;
+            for (std::size_t i = 1u; i < cache.count; ++i) {
+                cache.slots[i - 1u] = cache.slots[i];
+            }
+            --cache.count;
+            cache.total_bytes -= ev_cap;
+#if defined(NEOJSON_HAS_ASAN)
+            ASAN_UNPOISON_MEMORY_REGION(ev_hdr, sizeof(LargeBufHeader) + ev_cap);
+#endif
+            std::free(ev_hdr);
+        }
+        if (cache.count < kLargeCacheMaxSlots &&
+            cache.total_bytes + cap <= kLargeCacheMaxTotalBytes) {
+#if defined(NEOJSON_HAS_ASAN)
+            ASAN_POISON_MEMORY_REGION(ptr, cap);
+#endif
+            cache.slots[cache.count++] = LargeCacheSlot{hdr, cap};
+            cache.total_bytes += cap;
+            return;
+        }
+    }
+#if defined(NEOJSON_HAS_ASAN)
+    ASAN_UNPOISON_MEMORY_REGION(hdr, sizeof(LargeBufHeader) + cap);
+#endif
+    std::free(hdr);
+}
+
+void* large_realloc_impl(void* ptr, const std::size_t old_size, const std::size_t new_size,
+                         const bool ephemeral) noexcept {
+    if (ptr == nullptr) {
+        return large_malloc_impl(new_size, ephemeral);
+    }
+    if (new_size == 0u) {
+        large_free(nullptr, ptr);
+        return nullptr;
+    }
+    const std::size_t cur_cap = large_buf_cap(ptr);
+    if (new_size <= cur_cap) {
+#if defined(NEOJSON_HAS_ASAN)
+        ASAN_UNPOISON_MEMORY_REGION(ptr, new_size);
+        if (new_size < cur_cap) {
+            ASAN_POISON_MEMORY_REGION(static_cast<char*>(ptr) + new_size, cur_cap - new_size);
+        }
+#endif
+        return ptr;
+    }
+    void* np = large_malloc_impl(new_size, ephemeral);
+    if (np == nullptr) {
+        return nullptr;
+    }
+    const std::size_t copy_bytes = std::min({old_size, new_size, cur_cap});
+    if (copy_bytes > 0u) {
+        std::memcpy(np, ptr, copy_bytes);
+    }
+    large_free(nullptr, ptr);
+    return np;
+}
+
+void* large_malloc_bounded(void* /*ctx*/, const std::size_t size) noexcept {
+    return large_malloc_impl(size, false);
+}
+
+void* large_realloc_bounded(void* /*ctx*/, void* ptr, const std::size_t old_size,
+                            const std::size_t new_size) noexcept {
+    return large_realloc_impl(ptr, old_size, new_size, false);
+}
+
+void* large_alloc_full_cap(const std::size_t min_cap, std::size_t& actual_cap) noexcept {
+    void* p = large_malloc_impl(min_cap, true);
+    if (p == nullptr) {
+        return nullptr;
+    }
+    actual_cap = large_buf_cap(p);
+#if defined(NEOJSON_HAS_ASAN)
+    if (actual_cap > min_cap) {
+        ASAN_UNPOISON_MEMORY_REGION(p, actual_cap);
+    }
+#endif
+    return p;
+}
+
+void* large_realloc_full_cap(void* old_ptr, const std::size_t old_size,
+                             const std::size_t min_cap, std::size_t& actual_cap) noexcept {
+    void* p = large_realloc_impl(old_ptr, old_size, min_cap, true);
+    if (p == nullptr) {
+        return nullptr;
+    }
+    actual_cap = large_buf_cap(p);
+#if defined(NEOJSON_HAS_ASAN)
+    ASAN_UNPOISON_MEMORY_REGION(p, actual_cap);
+#endif
+    return p;
+}
+
+const yyjson_alc& yyjson_parse_alc() noexcept {
+    static const yyjson_alc alc{&large_malloc_bounded, &large_realloc_bounded, &large_free, nullptr};
+    return alc;
+}
+
+void* large_malloc_ephemeral(void* /*ctx*/, const std::size_t size) noexcept {
+    return large_malloc_impl(size, true);
+}
+
+void* large_realloc_ephemeral(void* /*ctx*/, void* ptr, const std::size_t old_size,
+                              const std::size_t new_size) noexcept {
+    return large_realloc_impl(ptr, old_size, new_size, true);
+}
+
+const yyjson_alc& yyjson_ephemeral_alc() noexcept {
+    static const yyjson_alc alc{&large_malloc_ephemeral, &large_realloc_ephemeral, &large_free, nullptr};
+    return alc;
+}
+
+} // namespace
+
 class DumpBuffer {
 public:
     DumpBuffer() noexcept : data_(inline_buf_), size_(0), cap_(sizeof(inline_buf_)) {}
 
     ~DumpBuffer() noexcept {
         if (data_ != inline_buf_) {
-            std::free(data_);
+            large_free(nullptr, data_);
         }
     }
 
@@ -637,8 +868,9 @@ void DumpBuffer::grow(const std::size_t need) {
     if (new_cap < required) {
         new_cap = required;
     }
+    std::size_t actual_cap = new_cap;
     if (data_ == inline_buf_) {
-        auto* p = static_cast<char*>(std::malloc(new_cap));
+        auto* p = static_cast<char*>(large_alloc_full_cap(new_cap, actual_cap));
         if (p == nullptr) {
             throw std::bad_alloc();
         }
@@ -647,13 +879,13 @@ void DumpBuffer::grow(const std::size_t need) {
         }
         data_ = p;
     } else {
-        auto* p = static_cast<char*>(std::realloc(data_, new_cap));
+        auto* p = static_cast<char*>(large_realloc_full_cap(data_, size_, new_cap, actual_cap));
         if (p == nullptr) {
             throw std::bad_alloc();
         }
         data_ = p;
     }
-    cap_ = new_cap;
+    cap_ = actual_cap;
 }
 
 namespace {
@@ -1444,13 +1676,23 @@ struct SharedYyDoc {
 
     explicit SharedYyDoc(yyjson_doc* d) noexcept : doc(d) {}
 };
+static_assert(sizeof(SharedYyDoc) <= 32u, "SharedYyDoc should fit in small pooled slab");
+
+inline void destroy_shared_doc(SharedYyDoc* sdoc) noexcept {
+    if (sdoc == nullptr) {
+        return;
+    }
+    yyjson_doc* d = sdoc->doc;
+    sdoc->~SharedYyDoc();
+    pool_free(sdoc, sizeof(SharedYyDoc));
+    yyjson_doc_free(d);
+}
 
 inline void shared_doc_release(SharedYyDoc* sdoc) noexcept {
     if (sdoc != nullptr &&
         (sdoc->refcount.load(std::memory_order_acquire) == 1u ||
          sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u)) {
-        yyjson_doc_free(sdoc->doc);
-        delete sdoc;
+        destroy_shared_doc(sdoc);
     }
 }
 
@@ -1648,8 +1890,7 @@ struct DocRefBatch {
         if (credit > 0u) {
             const std::uint32_t sub = static_cast<std::uint32_t>(credit);
             if (sdoc->refcount.fetch_sub(sub, std::memory_order_acq_rel) == sub) {
-                yyjson_doc_free(sdoc->doc);
-                delete sdoc;
+                destroy_shared_doc(sdoc);
             }
         }
     }
@@ -1823,16 +2064,18 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool 
 }
 
 inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
-    auto* sdoc = new SharedYyDoc(doc_ref);
+    void* smem = pool_alloc(sizeof(SharedYyDoc));
+    auto* sdoc = ::new (smem) SharedYyDoc(doc_ref);
     void* mem = nullptr;
     try {
         mem = pool_alloc(sizeof(LazyNode));
     } catch (...) {
-        delete sdoc;
+        sdoc->~SharedYyDoc();
+        pool_free(sdoc, sizeof(SharedYyDoc));
         throw;
     }
     doc_ref = nullptr;
-    auto* node = new (mem) LazyNode(sdoc, root);
+    auto* node = ::new (mem) LazyNode(sdoc, root);
     return json_access::make_lazy(
         yyjson_is_arr(root) ? value_t::array : value_t::object, node);
 }
@@ -4323,45 +4566,6 @@ private:
     diag_token_type last_token_ = diag_token_type::uninitialized;
 };
 
-struct StringYyAlcCtx {
-    std::string* out = nullptr;
-    void* active_ptr = nullptr;
-    bool oom = false;
-};
-
-void* string_yy_malloc(void* vctx, const std::size_t size) {
-    auto* ctx = static_cast<StringYyAlcCtx*>(vctx);
-    try {
-        ctx->out->resize(size == 0u ? 1u : size);
-        ctx->active_ptr = ctx->out->data();
-        return ctx->active_ptr;
-    } catch (...) {
-        ctx->oom = true;
-        return nullptr;
-    }
-}
-
-void* string_yy_realloc(void* vctx, void* /*ptr*/, const std::size_t /*old_size*/,
-                        const std::size_t size) {
-    auto* ctx = static_cast<StringYyAlcCtx*>(vctx);
-    try {
-        ctx->out->resize(size == 0u ? 1u : size);
-        ctx->active_ptr = ctx->out->data();
-        return ctx->active_ptr;
-    } catch (...) {
-        ctx->oom = true;
-        return nullptr;
-    }
-}
-
-void string_yy_free(void* vctx, void* ptr) {
-    auto* ctx = static_cast<StringYyAlcCtx*>(vctx);
-    if (ptr != nullptr && ptr == ctx->active_ptr) {
-        ctx->out->clear();
-        ctx->active_ptr = nullptr;
-    }
-}
-
 bool try_dump_yyjson_direct(const json& val, std::string& out) {
     if (!json_access::is_lazy(val)) {
         return false;
@@ -4391,21 +4595,27 @@ bool try_dump_yyjson_direct(const json& val, std::string& out) {
             }
         }
     }
-    StringYyAlcCtx ctx{&out, nullptr, false};
-    const yyjson_alc alc{&string_yy_malloc, &string_yy_realloc, &string_yy_free, &ctx};
     const yyjson_write_flag flg =
         YYJSON_WRITE_NEOJSON_FP | YYJSON_WRITE_LOWERCASE_HEX | YYJSON_WRITE_INF_AND_NAN_AS_NULL;
     std::size_t out_len = 0u;
     yyjson_write_err err{};
-    char* raw = yyjson_val_write_opts(node->val, flg, &alc, &out_len, &err);
+    char* raw = yyjson_val_write_opts(node->val, flg, &yyjson_ephemeral_alc(), &out_len, &err);
     if (raw == nullptr) {
-        if (ctx.oom) {
+        if (err.code == YYJSON_WRITE_ERROR_MEMORY_ALLOCATION) {
             throw std::bad_alloc();
         }
         out.clear();
         return false;
     }
-    out.resize(out_len);
+    struct LargeBufGuard {
+        char* p;
+        ~LargeBufGuard() noexcept {
+            if (p != nullptr) {
+                large_free(nullptr, p);
+            }
+        }
+    } buf_guard{raw};
+    out.assign(raw, out_len);
     return true;
 }
 
@@ -4501,7 +4711,8 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         }
         yyjson_read_err err{};
         yyjson_doc* doc = yyjson_read_opts_max_depth(
-            const_cast<char*>(data), size, flg, nullptr, options.max_depth, &err);
+            const_cast<char*>(data), size, flg, &detail::yyjson_parse_alc(),
+            options.max_depth, &err);
         if (doc == nullptr) {
             if (err.code == YYJSON_READ_ERROR_DEPTH) {
                 return fail_nesting();
@@ -4531,7 +4742,8 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
     // yyjson_read_opts_max_depth does not mutate the input buffer when YYJSON_READ_INSITU is not set.
     yyjson_read_err err{};
     yyjson_doc* doc = yyjson_read_opts_max_depth(
-        const_cast<char*>(s.data()), s.size(), flg, nullptr, options.max_depth, &err);
+        const_cast<char*>(s.data()), s.size(), flg, &detail::yyjson_parse_alc(),
+        options.max_depth, &err);
     if (doc == nullptr) {
         if (!ignore_comments && err.code != YYJSON_READ_ERROR_DEPTH &&
             s.find('\0') != std::string_view::npos) {
@@ -4588,7 +4800,8 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
         }
         yyjson_read_err err{};
         yyjson_doc* doc = yyjson_read_opts_max_depth(
-            const_cast<char*>(data), size, flg, nullptr, options.max_depth, &err);
+            const_cast<char*>(data), size, flg, &detail::yyjson_parse_alc(),
+            options.max_depth, &err);
         if (doc == nullptr) {
             return false;
         }
@@ -4602,7 +4815,8 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
 
     yyjson_read_err err{};
     yyjson_doc* doc = yyjson_read_opts_max_depth(
-        const_cast<char*>(s.data()), s.size(), flg, nullptr, options.max_depth, &err);
+        const_cast<char*>(s.data()), s.size(), flg, &detail::yyjson_parse_alc(),
+        options.max_depth, &err);
     if (doc == nullptr) {
         if (!ignore_comments && err.code != YYJSON_READ_ERROR_DEPTH &&
             s.find('\0') != std::string_view::npos) {
