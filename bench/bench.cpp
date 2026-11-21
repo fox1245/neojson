@@ -299,7 +299,10 @@ struct Lib {
     static std::uint64_t lookup(const Doc& d, const LookupPath& p) {
         std::uint64_t sum = 0;
         const auto root = *d.as_object();
-        for (const auto& e : *root[p.array_key].as_array()) {
+        // Bound to a variable: in a range-for, a temporary inside the range expression (here the optional that
+        // as_array returns) is destroyed before the loop runs, until C++23.
+        const auto array = *root[p.array_key].as_array();
+        for (const auto& e : array) {
             const auto obj = *e.as_object();
             sum += (*obj[p.object_key].as_object())[p.string_key].as_string()->size();
             sum += *obj[p.int_key].as_uint();
@@ -421,7 +424,8 @@ struct Lib {
     }
     static std::string write(const Doc& d) {
         std::size_t len = 0;
-        return take(yyjson_write(d.get(), 0, &len), len);
+        char* p = yyjson_write(d.get(), 0, &len);  // len is set by the call, so it is read after it
+        return take(p, len);
     }
     static Built build(const Doc& d) {
         Built b(yyjson_mut_doc_new(nullptr));
@@ -430,7 +434,8 @@ struct Lib {
     }
     static std::string write_built(const Built& b) {
         std::size_t len = 0;
-        return take(yyjson_mut_write(b.get(), 0, &len), len);
+        char* p = yyjson_mut_write(b.get(), 0, &len);
+        return take(p, len);
     }
     static std::uint64_t touch(const Doc& d) { return yyjson_get_len(yyjson_doc_get_root(d.get())); }
     static std::uint64_t touch_built(const Built& b) { return yyjson_mut_get_len(yyjson_mut_doc_get_root(b.get())); }

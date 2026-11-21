@@ -50,8 +50,10 @@ def file_arguments(build_dirs):
 
 
 def run_json_lines(exe, args):
-    out = subprocess.run([str(exe), *args], check=True, capture_output=True, text=True).stdout
-    return [json.loads(line) for line in out.splitlines() if line.strip()]
+    proc = subprocess.run([str(exe), *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"run.py: {exe.name} exited with {proc.returncode}: {proc.stderr.strip()}")
+    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
 
 def close(a, b):
