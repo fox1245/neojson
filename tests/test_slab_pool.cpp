@@ -99,8 +99,8 @@ TEST(SlabPool, ProducerThreadExitReclaimsOrphanSlabsCleanly) {
 }
 
 TEST(SlabPool, EightThreadConcurrentCrossThreadFreeAndReuse) {
-    constexpr int kThreads = 8;
-    constexpr int kSlots = 64;
+    static constexpr int kThreads = 8;
+    static constexpr int kSlots = 64;
 
     struct SharedQueue {
         std::mutex mu;
