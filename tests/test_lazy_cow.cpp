@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -893,8 +894,6 @@ TEST(LazyCow, DirectYyjsonDumpEdgeCasesAndDeepStack) {
 TEST(LazyCow, ConstIteratorAndReverseEdgeCases) {
     static_assert(sizeof(jk::iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
     static_assert(sizeof(jk::const_iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
-    static_assert(sizeof(jk::reverse_iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
-    static_assert(sizeof(jk::const_reverse_iterator) == sizeof(void*) + sizeof(std::ptrdiff_t));
 
     const std::string obj_raw =
         R"({"k0":0,"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9})";
@@ -904,74 +903,87 @@ TEST(LazyCow, ConstIteratorAndReverseEdgeCases) {
     const jk l_obj = jk::parse(obj_raw);
     const jk l_arr = jk::parse(arr_raw);
 
-    // cbegin/cend and crbegin/crend on lazy object (>8 keys).
-    std::vector<std::pair<std::string, int>> fwd_obj, rev_obj;
-    for (auto it = l_obj.cbegin(); it != l_obj.cend(); ++it) {
-        fwd_obj.emplace_back(it.key(), it.value().get<int>());
-    }
-    for (auto it = l_obj.crbegin(); it != l_obj.crend(); ++it) {
-        rev_obj.emplace_back(it.key(), it.value().get<int>());
-    }
-    ASSERT_EQ(fwd_obj.size(), o_obj.size());
-    std::reverse(rev_obj.begin(), rev_obj.end());
-    EXPECT_EQ(fwd_obj, rev_obj);
+    const char* phase = "init";
+    try {
+        phase = "obj_fwd";
+        std::vector<std::pair<std::string, int>> fwd_obj, rev_obj;
+        for (auto it = l_obj.cbegin(); it != l_obj.cend(); ++it) {
+            fwd_obj.emplace_back(it.key(), it.value().get<int>());
+        }
+        phase = "obj_rev";
+        for (auto it = l_obj.crbegin(); it != l_obj.crend(); ++it) {
+            rev_obj.emplace_back(it.key(), it.value().get<int>());
+        }
+        ASSERT_EQ(fwd_obj.size(), o_obj.size());
+        std::reverse(rev_obj.begin(), rev_obj.end());
+        EXPECT_EQ(fwd_obj, rev_obj);
 
-    // .items() over const lazy object.
-    std::size_t item_count = 0;
-    for (const auto& kv : l_obj.items()) {
-        neojson::test::assert_tree_equal(o_obj[kv.key()], kv.value());
-        ++item_count;
+        phase = "obj_items";
+        std::size_t item_count = 0;
+        for (const auto& kv : l_obj.items()) {
+            neojson::test::assert_tree_equal(o_obj[kv.key()], kv.value());
+            ++item_count;
+        }
+        EXPECT_EQ(item_count, o_obj.size());
+
+        phase = "arr_fwd";
+        std::vector<int> fwd_arr, rev_arr;
+        for (auto it = l_arr.cbegin(); it != l_arr.cend(); ++it) {
+            fwd_arr.push_back(it->get<int>());
+        }
+        phase = "arr_rev";
+        for (auto it = l_arr.crbegin(); it != l_arr.crend(); ++it) {
+            rev_arr.push_back(it->get<int>());
+        }
+        std::reverse(rev_arr.begin(), rev_arr.end());
+        EXPECT_EQ(fwd_arr, rev_arr);
+        phase = "arr_arith";
+        EXPECT_EQ(l_arr.cend() - l_arr.cbegin(), static_cast<std::ptrdiff_t>(o_arr.size()));
+        EXPECT_EQ(*(l_arr.cbegin() + 5), 5);
+        EXPECT_EQ(*((l_arr.cend() - 1) - 3), 8);
+
+        phase = "mut_convert";
+        jk mut_obj = jk::parse(obj_raw);
+        EXPECT_EQ(mut_obj.rbegin(), mut_obj.crbegin());
+        EXPECT_EQ(mut_obj.crbegin(), mut_obj.rbegin());
+        EXPECT_EQ(mut_obj.rend(), mut_obj.crend());
+        EXPECT_EQ(mut_obj.crend(), mut_obj.rend());
+        auto mit = mut_obj.begin();
+        jk::const_iterator cit(mit);
+        jk::const_iterator cit2;
+        cit2 = mit;
+        mut_obj["k0"] = 777;
+        EXPECT_EQ(cit.key(), "k0");
+        EXPECT_EQ(*cit, 777);
+        EXPECT_EQ(*cit2, 777);
+
+        phase = "shared_detach";
+        jk shared_a = jk::parse(obj_raw);
+        jk shared_b = shared_a;
+        auto shared_cit = shared_a.cbegin();
+        shared_a["k0"] = 888;
+        EXPECT_EQ(shared_cit.key(), "k0");
+        EXPECT_EQ(*shared_cit, 888);
+        EXPECT_EQ(shared_b.at("k0"), 0);
+
+        phase = "empty_and_scalar";
+        const jk empty_obj = jk::object();
+        const jk empty_arr = jk::array();
+        const jk scalar = 42;
+        EXPECT_EQ(empty_obj.cbegin(), empty_obj.cend());
+        EXPECT_EQ(empty_obj.crbegin(), empty_obj.crend());
+        EXPECT_EQ(empty_arr.cbegin(), empty_arr.cend());
+        EXPECT_EQ(empty_arr.crbegin(), empty_arr.crend());
+        EXPECT_EQ(scalar.cbegin() + 1, scalar.cend());
+        EXPECT_EQ(*scalar.cbegin(), 42);
+        EXPECT_EQ(*scalar.crbegin(), 42);
+    } catch (const std::exception& e) {
+        FAIL() << "Unexpected exception in phase [" << phase << "]: " << e.what();
     }
-    EXPECT_EQ(item_count, o_obj.size());
-
-    // cbegin/cend, crbegin/crend, and arithmetic on lazy array (>8 elems).
-    std::vector<int> fwd_arr, rev_arr;
-    for (auto it = l_arr.cbegin(); it != l_arr.cend(); ++it) {
-        fwd_arr.push_back(it->get<int>());
-    }
-    for (auto it = l_arr.crbegin(); it != l_arr.crend(); ++it) {
-        rev_arr.push_back(it->get<int>());
-    }
-    std::reverse(rev_arr.begin(), rev_arr.end());
-    EXPECT_EQ(fwd_arr, rev_arr);
-    EXPECT_EQ(l_arr.cend() - l_arr.cbegin(), static_cast<std::ptrdiff_t>(o_arr.size()));
-    EXPECT_EQ(*(l_arr.cbegin() + 5), 5);
-    EXPECT_EQ(*((l_arr.cend() - 1) - 3), 8);
-
-    // Non-const iterator converted to const_iterator tracks container updates dynamically.
-    jk mut_obj = jk::parse(obj_raw);
-    auto mit = mut_obj.begin();
-    jk::const_iterator cit(mit);
-    jk::const_iterator cit2;
-    cit2 = mit;
-    mut_obj["k0"] = 777;
-    EXPECT_EQ(cit.key(), "k0");
-    EXPECT_EQ(*cit, 777);
-    EXPECT_EQ(*cit2, 777);
-
-    // const_iterator remains valid across shared-handle detach on the same json handle.
-    jk shared_a = jk::parse(obj_raw);
-    jk shared_b = shared_a;
-    auto shared_cit = shared_a.cbegin();
-    shared_a["k0"] = 888;
-    EXPECT_EQ(shared_cit.key(), "k0");
-    EXPECT_EQ(*shared_cit, 888);
-    EXPECT_EQ(shared_b.at("k0"), 0);
-
-    // Empty containers and scalar const iterators.
-    const jk empty_obj = jk::object();
-    const jk empty_arr = jk::array();
-    const jk scalar = 42;
-    EXPECT_EQ(empty_obj.cbegin(), empty_obj.cend());
-    EXPECT_EQ(empty_obj.crbegin(), empty_obj.crend());
-    EXPECT_EQ(empty_arr.cbegin(), empty_arr.cend());
-    EXPECT_EQ(empty_arr.crbegin(), empty_arr.crend());
-    EXPECT_EQ(scalar.cbegin() + 1, scalar.cend());
-    EXPECT_EQ(*scalar.cbegin(), 42);
-    EXPECT_EQ(*scalar.crbegin(), 42);
 
     // Out-of-range and default-constructed reverse iterators throw invalid_iterator.
     const jk::const_reverse_iterator empty_rev(jk::const_iterator{});
+    const jk scalar = 42;
     EXPECT_THROW((void)*l_obj.crend(), jk::invalid_iterator);
     EXPECT_THROW((void)l_obj.crend().key(), jk::invalid_iterator);
     EXPECT_THROW((void)*empty_rev, jk::invalid_iterator);

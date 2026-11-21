@@ -1295,10 +1295,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator==(const IterImpl& other) const {
-        if (m_object != other.m_object) {
-            throw invalid_iterator::create(212, "cannot compare iterators of different containers");
-        }
-        return idx_ == other.idx_;
+        return equal_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     template <typename IterImpl,
@@ -1306,7 +1303,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator!=(const IterImpl& other) const {
-        return !operator==(other);
+        return !equal_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     template <typename IterImpl,
@@ -1314,13 +1311,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator<(const IterImpl& other) const {
-        if (m_object != other.m_object) {
-            throw invalid_iterator::create(212, "cannot compare iterators of different containers");
-        }
-        if (m_object != nullptr && m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(213, "cannot compare order of object iterators");
-        }
-        return idx_ < other.idx_;
+        return less_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     template <typename IterImpl,
@@ -1328,7 +1319,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator<=(const IterImpl& other) const {
-        return !other.operator<(*this);
+        return !less_at(other.m_object, other.idx_, m_object, idx_);
     }
 
     template <typename IterImpl,
@@ -1336,7 +1327,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator>(const IterImpl& other) const {
-        return !operator<=(other);
+        return less_at(other.m_object, other.idx_, m_object, idx_);
     }
 
     template <typename IterImpl,
@@ -1344,7 +1335,7 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     bool operator>=(const IterImpl& other) const {
-        return !operator<(other);
+        return !less_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     iter_impl& operator+=(difference_type i) {
@@ -1352,7 +1343,7 @@ public:
             return *this;
         }
         if (m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(209, "cannot use offsets with object iterators");
+            throw_invalid_iterator(209, "cannot use offsets with object iterators");
         }
         idx_ += i;
         return *this;
@@ -1385,23 +1376,14 @@ public:
                                    std::is_same<IterImpl, other_iter_impl>::value,
                                int> = 0>
     difference_type operator-(const IterImpl& other) const {
-        if (m_object != other.m_object) {
-            throw invalid_iterator::create(209, "cannot use offsets with object iterators");
-        }
-        if (m_object == nullptr || m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(209, "cannot use offsets with object iterators");
-        }
-        return idx_ - other.idx_;
+        return diff_at(m_object, idx_, other.m_object, other.idx_);
     }
 
     reference operator[](difference_type n) const {
-        if (m_object == nullptr) {
-            throw invalid_iterator::create(208, "cannot use operator[] for object iterators");
+        if (m_object == nullptr || m_object->m_type == value_t::object) {
+            throw_invalid_iterator(208, "cannot use operator[] for object iterators");
         }
-        if (m_object->m_type == value_t::object) {
-            throw invalid_iterator::create(208, "cannot use operator[] for object iterators");
-        }
-        return *(*this + n);
+        return element_at(m_object, idx_ + n);
     }
 
     const typename BasicJsonType::object_t::key_type& key() const {
@@ -1413,6 +1395,34 @@ public:
     }
 
 private:
+    using const_json_pointer = const typename std::remove_const<BasicJsonType>::type*;
+
+    static bool equal_at(const void* lhs_obj, difference_type lhs_idx,
+                         const void* rhs_obj, difference_type rhs_idx) {
+        if (lhs_obj != rhs_obj) {
+            throw_invalid_iterator(212, "cannot compare iterators of different containers");
+        }
+        return lhs_idx == rhs_idx;
+    }
+
+    static bool less_at(const_json_pointer lhs_obj, difference_type lhs_idx,
+                        const_json_pointer rhs_obj, difference_type rhs_idx) {
+        if (lhs_obj != rhs_obj) {
+            throw_invalid_iterator(212, "cannot compare iterators of different containers");
+        }
+        if (lhs_obj != nullptr && lhs_obj->m_type == value_t::object) {
+            throw_invalid_iterator(213, "cannot compare order of object iterators");
+        }
+        return lhs_idx < rhs_idx;
+    }
+
+    static difference_type diff_at(const_json_pointer lhs_obj, difference_type lhs_idx,
+                                   const_json_pointer rhs_obj, difference_type rhs_idx) {
+        if (lhs_obj != rhs_obj || lhs_obj == nullptr || lhs_obj->m_type == value_t::object) {
+            throw_invalid_iterator(209, "cannot use offsets with object iterators");
+        }
+        return lhs_idx - rhs_idx;
+    }
     // The checked accessors take the container and the index by value, not the iterator, and iter_impl stays at
     // two words (pointer + difference_type, 16 bytes on 64-bit) so ARM64 AAPCS64 passes and returns iterators in
     // registers instead of spilling them to stack memory. Written as member functions that the optimiser did not
@@ -1499,7 +1509,8 @@ public:
     }
 
     json_reverse_iterator& operator++() {
-        return static_cast<json_reverse_iterator&>(base_iterator::operator++());
+        --this->current;
+        return *this;
     }
 
     json_reverse_iterator operator--(int) {
@@ -1507,7 +1518,8 @@ public:
     }
 
     json_reverse_iterator& operator--() {
-        return static_cast<json_reverse_iterator&>(base_iterator::operator--());
+        ++this->current;
+        return *this;
     }
 
     json_reverse_iterator& operator+=(difference_type i) {
@@ -1524,6 +1536,16 @@ public:
 
     difference_type operator-(const json_reverse_iterator& other) const {
         return base_iterator(*this) - base_iterator(other);
+    }
+
+    friend bool operator==(const json_reverse_iterator& lhs,
+                           const json_reverse_iterator& rhs) {
+        return equal_rev(lhs, rhs);
+    }
+
+    friend bool operator!=(const json_reverse_iterator& lhs,
+                           const json_reverse_iterator& rhs) {
+        return !equal_rev(lhs, rhs);
     }
 
     reference operator*() const {
@@ -1544,6 +1566,13 @@ public:
 
     reference value() const {
         return Base::element_at(this->current.m_object, this->current.idx_ - 1);
+    }
+
+private:
+    static bool equal_rev(const json_reverse_iterator& lhs,
+                          const json_reverse_iterator& rhs) {
+        return Base::equal_at(lhs.current.m_object, lhs.current.idx_,
+                              rhs.current.m_object, rhs.current.idx_);
     }
 };
 
