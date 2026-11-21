@@ -1185,6 +1185,10 @@ inline bool has_non_verbatim_valid_utf8_8(const std::uint64_t w) noexcept {
     return (has_ctrl | has_quote | has_bs) != 0;
 }
 
+#if defined(YYJSON_DISABLE_UTF8_VALIDATION) && YYJSON_DISABLE_UTF8_VALIDATION
+#error "neojson requires yyjson UTF-8 validation (YYJSON_DISABLE_UTF8_VALIDATION must be 0)"
+#endif
+
 inline void dump_valid_utf8_escaped_strict(DumpBuffer& out, const char* p, const std::size_t len,
                                            const bool with_colon) {
     const std::size_t extra = with_colon ? 3u : 2u;
@@ -1834,9 +1838,11 @@ inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
 }
 
 inline void mark_own_unique(LazyHeader* hdr) noexcept {
-    std::uint8_t expected = 0u;
-    hdr->dedup_state.compare_exchange_strong(expected, 1u, std::memory_order_acq_rel,
-                                             std::memory_order_relaxed);
+    hdr->dedup_state.fetch_or(1u, std::memory_order_acq_rel);
+}
+
+inline void mark_own_dup(LazyHeader* hdr) noexcept {
+    hdr->dedup_state.fetch_or(2u | 8u, std::memory_order_release);
 }
 
 inline bool is_yyjson_tree_unique(yyjson_val* root) {
@@ -1945,7 +1951,7 @@ std::size_t lazy_size(LazyHeader* hdr, const value_t type) noexcept {
             mark_own_unique(node);
             return node->raw_len;
         }
-        node->dedup_state.store(2u, std::memory_order_release);
+        mark_own_dup(node);
         const auto* obj =
             static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
         return obj->size();
@@ -2293,7 +2299,7 @@ void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const valu
         !node->doc->tree_unique_verified.load(std::memory_order_acquire) &&
         (node->dedup_state.load(std::memory_order_acquire) & 1u) == 0u &&
         !is_yyjson_object_unique(node->val)) {
-        node->dedup_state.store(2u, std::memory_order_release);
+        mark_own_dup(node);
         const auto* obj = static_cast<const json::object_t*>(
             lazy_materialize_const(node, value_t::object));
         dump_eager_object_compact_strict(out, *obj);
@@ -2599,7 +2605,7 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
         !node->doc->tree_unique_verified.load(std::memory_order_acquire) &&
         (node->dedup_state.load(std::memory_order_acquire) & 1u) == 0u &&
         !is_yyjson_object_unique(node->val)) {
-        node->dedup_state.store(2u, std::memory_order_release);
+        mark_own_dup(node);
         const auto* obj = static_cast<const json::object_t*>(
             lazy_materialize_const(node, value_t::object));
         dump_eager_object_value(out, *obj, pretty_print, ensure_ascii, error_handler, indent_step,
@@ -4370,14 +4376,16 @@ bool try_dump_yyjson_direct(const json& val, std::string& out) {
     }
     if (!node->doc->tree_unique_verified.load(std::memory_order_acquire)) {
         const std::uint8_t state = node->dedup_state.load(std::memory_order_acquire);
-        if (state == 2u) {
+        if ((state & (2u | 8u)) != 0u) {
             return false;
         }
-        if (state != 3u) {
+        if ((state & 4u) == 0u) {
             if (!is_yyjson_tree_unique(node->val)) {
+                node->dedup_state.fetch_or(8u, std::memory_order_release);
                 return false;
             }
-            node->dedup_state.store(3u, std::memory_order_release);
+            const std::uint8_t bits = (type == value_t::object) ? (1u | 4u) : 4u;
+            node->dedup_state.fetch_or(bits, std::memory_order_release);
             if (node->val == yyjson_doc_get_root(node->doc->doc)) {
                 node->doc->tree_unique_verified.store(true, std::memory_order_release);
             }

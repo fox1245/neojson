@@ -8494,6 +8494,10 @@ static_inline u8 *write_num(u8 *cur, yyjson_val *val, yyjson_write_flag flg) {
     }
 }
 
+#if YYJSON_DISABLE_FAST_FP_CONV
+#error "neojson requires vendored yyjson fast FP conversion (YYJSON_DISABLE_FAST_FP_CONV must be 0)"
+#endif
+
 size_t yyjson_write_f64_neojson(char *buf, double val) {
     u8 *end;
     if (unlikely(!buf)) return 0;

@@ -865,8 +865,10 @@ TEST(LazyCow, DirectYyjsonDumpEdgeCasesAndDeepStack) {
         R"({"a":1,"sub":{"d":10,"d":20,"e":30},"leaf":{"x":true,"y":"str"}})";
     const oj o_nested_dup = oj::parse(nested_dup_raw);
     const jk l_nested_dup = jk::parse(nested_dup_raw);
-    EXPECT_EQ(l_nested_dup.size(), o_nested_dup.size());
-    EXPECT_EQ(l_nested_dup.dump(), o_nested_dup.dump());
+    for (int iter = 0; iter < 3; ++iter) {
+        EXPECT_EQ(l_nested_dup.size(), o_nested_dup.size());
+        EXPECT_EQ(l_nested_dup.dump(), o_nested_dup.dump());
+    }
     EXPECT_EQ(std::as_const(l_nested_dup)["leaf"].dump(), o_nested_dup["leaf"].dump());
 
     // Direct iterative dump at depth 1100 on a 512 KiB stack must not stack overflow.

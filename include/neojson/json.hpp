@@ -188,7 +188,8 @@ struct LazyHeader {
     std::atomic<void*> materialized{nullptr};
     std::size_t raw_len = 0;
     std::atomic<std::uint32_t> refcount{1u};
-    // 0 = unknown, 1 = own-level unique, 2 = has duplicate keys, 3 = entire subtree unique
+    // Bitmask: 0 = unknown, 1 = own-level unique, 2 = own-level has duplicate keys,
+    // 4 = entire subtree unique, 8 = subtree has duplicate keys
     std::atomic<std::uint8_t> dedup_state{0u};
 };
 
