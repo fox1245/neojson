@@ -35,6 +35,8 @@
 namespace neojson {
 namespace detail {
 
+namespace {
+
 std::uint64_t hash_seed_init() noexcept {
     std::uint64_t s = static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
@@ -45,6 +47,13 @@ std::uint64_t hash_seed_init() noexcept {
     }
     s ^= reinterpret_cast<std::uintptr_t>(&hash_seed_init);
     return fmix64(s) | 1ULL;
+}
+
+} // namespace
+
+std::uint64_t hash_seed() noexcept {
+    static const std::uint64_t seed = hash_seed_init();
+    return seed;
 }
 
 namespace {
@@ -453,8 +462,7 @@ inline void* alloc_standalone_slab(const std::uint32_t cls) {
 inline void remote_or_orphan_free(SlabHeader* s, void* p) noexcept {
     s->lock_remote();
     if (s->owner.load(std::memory_order_acquire) != nullptr) {
-        auto* node = static_cast<FreeNode*>(p);
-        node->next = s->remote_free;
+        auto* node = ::new (p) FreeNode{s->remote_free};
         poison_slot_tail(p, s->slot_size);
         s->remote_free = node;
         const std::uint32_t rc = s->remote_count.load(std::memory_order_relaxed);
@@ -508,8 +516,7 @@ void pool_free(void* p, const std::size_t n) noexcept {
     SlabHeader* s = slab_from_ptr(p);
     ThreadPool* const cur = t_pool;
     if (cur != nullptr && s->owner.load(std::memory_order_relaxed) == cur) {
-        auto* node = static_cast<FreeNode*>(p);
-        node->next = s->local_free;
+        auto* node = ::new (p) FreeNode{s->local_free};
         poison_slot_tail(p, s->slot_size);
         s->local_free = node;
         --s->local_used;

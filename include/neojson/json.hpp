@@ -114,6 +114,8 @@ public:
     pool_allocator(const pool_allocator<U>&) noexcept {}
 
     T* allocate(const std::size_t n) {
+        static_assert(alignof(T) <= alignof(std::max_align_t),
+                      "pool_allocator supports up to max_align_t alignment");
         if (n == 0) {
             return nullptr;
         }
@@ -285,7 +287,7 @@ struct is_InputIt
 // Member count above which ordered_map maintains a flat open-addressed hash index for O(1) lookup.
 inline constexpr std::size_t kOrderedMapHashThreshold = 16;
 
-std::uint64_t hash_seed_init() noexcept;
+std::uint64_t hash_seed() noexcept;
 
 inline std::uint64_t rotl64(const std::uint64_t x, const unsigned r) noexcept {
     return (x << r) | (x >> (64u - r));
@@ -301,7 +303,7 @@ inline std::uint64_t fmix64(std::uint64_t k) noexcept {
 }
 
 inline std::uint64_t hash_bytes(const char* data, const std::size_t len) noexcept {
-    static const std::uint64_t seed = hash_seed_init();
+    static const std::uint64_t seed = hash_seed();
     std::uint64_t h = seed ^ (static_cast<std::uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
     const auto* p = reinterpret_cast<const unsigned char*>(data);
     if (len <= 16) {
@@ -709,6 +711,47 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         }
     }
 
+    void resize(const size_type count) {
+        m_index.reset();
+        Container::resize(count);
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
+
+    void resize(const size_type count, const value_type& value) {
+        m_index.reset();
+        Container::resize(count, value);
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
+
+    void assign(const size_type count, const value_type& value) {
+        m_index.reset();
+        Container::assign(count, value);
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
+
+    template <class InputIt, std::enable_if_t<detail::is_InputIt<InputIt>::value, int> = 0>
+    void assign(InputIt first, InputIt last) {
+        m_index.reset();
+        Container::assign(first, last);
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
+
+    void assign(std::initializer_list<value_type> ilist) {
+        m_index.reset();
+        Container::assign(ilist);
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
+
     friend bool operator==(const ordered_map& lhs, const ordered_map& rhs) {
         return static_cast<const Container&>(lhs) == static_cast<const Container&>(rhs);
     }
@@ -746,27 +789,28 @@ private:
     using IndexPtr = std::unique_ptr<HashIndex, HashIndexDeleter>;
 
     static IndexPtr make_index(const std::size_t c) {
-        auto* h = static_cast<HashIndex*>(detail::pool_alloc(sizeof(HashIndex)));
-        h->cap = 0;
-        h->slots = nullptr;
+        auto* h = ::new (detail::pool_alloc(sizeof(HashIndex))) HashIndex{0, nullptr};
         IndexPtr ptr(h);
         const std::size_t bytes = c * sizeof(Slot);
         auto* s = static_cast<Slot*>(detail::pool_alloc(bytes));
-        std::memset(s, 0, bytes);
+        for (std::size_t i = 0; i < c; ++i) {
+            ::new (s + i) Slot{0u, 0u};
+        }
         h->cap = c;
         h->slots = s;
         return ptr;
     }
 
     static IndexPtr copy_index(const HashIndex& other) {
-        auto* h = static_cast<HashIndex*>(detail::pool_alloc(sizeof(HashIndex)));
-        h->cap = 0;
-        h->slots = nullptr;
+        auto* h = ::new (detail::pool_alloc(sizeof(HashIndex))) HashIndex{0, nullptr};
         IndexPtr ptr(h);
-        const std::size_t bytes = other.cap * sizeof(Slot);
+        const std::size_t c = other.cap;
+        const std::size_t bytes = c * sizeof(Slot);
         auto* s = static_cast<Slot*>(detail::pool_alloc(bytes));
-        std::memcpy(s, other.slots, bytes);
-        h->cap = other.cap;
+        for (std::size_t i = 0; i < c; ++i) {
+            ::new (s + i) Slot{other.slots[i].idx_plus_one, other.slots[i].hash32};
+        }
+        h->cap = c;
         h->slots = s;
         return ptr;
     }
@@ -780,8 +824,9 @@ private:
     }
 
     static std::size_t next_pow2(const std::size_t v) noexcept {
+        constexpr std::size_t kMaxCap = ((std::numeric_limits<std::size_t>::max)() >> 2u) + 1u;
         std::size_t cap = 64;
-        while (cap < v && cap <= (std::size_t{1} << 62u)) {
+        while (cap < v && cap < kMaxCap) {
             cap <<= 1u;
         }
         return cap;
