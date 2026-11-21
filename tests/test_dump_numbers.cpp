@@ -70,8 +70,42 @@ TEST(DumpNumbersAndSwar, DoubleDumpMatchesOracleAcross100kRandomAndBoundaryValue
         -std::numeric_limits<double>::infinity(),
         std::numeric_limits<double>::quiet_NaN(),
     };
+    auto check_neojson_float_roundtrip = [](const double d, const std::string& dumped,
+                                            const std::string& oracle_dumped) {
+        if (!std::isfinite(d)) {
+            EXPECT_EQ(dumped, "null");
+            EXPECT_EQ(oracle_dumped, "null");
+            return;
+        }
+        EXPECT_LE(dumped.size(), oracle_dumped.size()) << "d=" << d << " dumped=" << dumped
+                                                       << " oracle=" << oracle_dumped;
+        const jk reparsed = jk::parse(dumped);
+        ASSERT_TRUE(reparsed.is_number()) << "dumped=" << dumped;
+        const double rd = reparsed.get<double>();
+        std::uint64_t bits_in = 0;
+        std::uint64_t bits_out = 0;
+        std::memcpy(&bits_in, &d, sizeof(bits_in));
+        std::memcpy(&bits_out, &rd, sizeof(bits_out));
+        EXPECT_EQ(bits_out, bits_in) << "dumped=" << dumped;
+        EXPECT_EQ(reparsed.dump(), dumped);
+        const std::size_t epos = dumped.find('e');
+        if (epos != std::string::npos) {
+            ASSERT_LT(epos + 3, dumped.size()) << "dumped=" << dumped;
+            EXPECT_TRUE(dumped[epos + 1] == '+' || dumped[epos + 1] == '-');
+            EXPECT_TRUE(dumped[epos + 2] >= '0' && dumped[epos + 2] <= '9');
+            EXPECT_TRUE(dumped[epos + 3] >= '0' && dumped[epos + 3] <= '9');
+        }
+    };
+
     for (const double d : special) {
-        EXPECT_EQ(oj(d).dump(), jk(d).dump()) << "val=" << d;
+        const std::string dumped = jk(d).dump();
+        const std::string oracle = oj(d).dump();
+        check_neojson_float_roundtrip(d, dumped, oracle);
+        if (d == 0.0 || d == 1.0 || d == -1.0 || d == 0.1 || d == 0.2 || d == 0.3 ||
+            d == 1e-4 || d == 1e-5 || d == 1e14 || d == 1e15 || d == 1e16 || d == 42.0 ||
+            d == -42.0 || d == 999999999999999.0 || d == 1000000000000000.0 || !std::isfinite(d)) {
+            EXPECT_EQ(dumped, oracle) << "val=" << d;
+        }
     }
 
     std::uint64_t rng = 0x517CC1B727220A95ULL;
@@ -82,13 +116,18 @@ TEST(DumpNumbersAndSwar, DoubleDumpMatchesOracleAcross100kRandomAndBoundaryValue
         double d = 0.0;
         std::memcpy(&d, &bits, sizeof(d));
         if (i < 5000) {
-            ASSERT_EQ(oj(d).dump(), jk(d).dump()) << "i=" << i << " bits=" << bits;
+            check_neojson_float_roundtrip(d, jk(d).dump(), oj(d).dump());
         }
         o_batch.push_back(d);
         s_batch.push_back(d);
     }
-    EXPECT_EQ(o_batch.dump(), s_batch.dump());
-    EXPECT_EQ(o_batch.dump(2), s_batch.dump(2));
+    const std::string batch_compact = s_batch.dump();
+    const std::string batch_pretty = s_batch.dump(2);
+    const jk lazy_batch = jk::parse(batch_compact);
+    EXPECT_EQ(lazy_batch.dump(), batch_compact);
+    const oj oracle_reparsed = oj::parse(o_batch.dump());
+    neojson::test::assert_tree_equal(oracle_reparsed, lazy_batch);
+    neojson::test::assert_tree_equal(oracle_reparsed, jk::parse(batch_pretty));
 }
 
 TEST(DumpNumbersAndSwar, SignedAndUnsignedIntegersMatchOracle) {

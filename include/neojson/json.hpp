@@ -188,6 +188,7 @@ struct LazyHeader {
     std::atomic<void*> materialized{nullptr};
     std::size_t raw_len = 0;
     std::atomic<std::uint32_t> refcount{1u};
+    // 0 = unknown, 1 = own-level unique, 2 = has duplicate keys, 3 = entire subtree unique
     std::atomic<std::uint8_t> dedup_state{0u};
 };
 
@@ -3757,7 +3758,7 @@ public:
                     if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                         return static_cast<const object_t*>(mat)->size();
                     }
-                    if (m_value.lazy->dedup_state.load(std::memory_order_acquire) == 1u) {
+                    if ((m_value.lazy->dedup_state.load(std::memory_order_acquire) & 1u) != 0u) {
                         return m_value.lazy->raw_len;
                     }
                     return detail::lazy_size(m_value.lazy, m_type);
