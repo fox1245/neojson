@@ -633,6 +633,62 @@ void DumpBuffer::grow(const std::size_t need) {
     cap_ = new_cap;
 }
 
+namespace {
+
+inline void append_uint(DumpBuffer& out, std::uint64_t v) {
+    static constexpr char kDigits100[201] =
+        "0001020304050607080910111213141516171819"
+        "2021222324252627282930313233343536373839"
+        "4041424344454647484950515253545556575859"
+        "6061626364656667686970717273747576777879"
+        "8081828384858687888990919293949596979899";
+    if (v < 100u) {
+        out.reserve_extra(2);
+        char* p = out.write_ptr();
+        if (v < 10u) {
+            *p++ = static_cast<char>('0' + v);
+        } else {
+            const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
+            p[0] = d[0];
+            p[1] = d[1];
+            p += 2;
+        }
+        out.advance_to(p);
+        return;
+    }
+    char buf[24];
+    char* p = buf + sizeof(buf);
+    while (v >= 100u) {
+        const auto q = v / 100u;
+        const auto r = static_cast<std::size_t>((v - q * 100u) * 2u);
+        v = q;
+        p -= 2;
+        p[0] = kDigits100[r];
+        p[1] = kDigits100[r + 1];
+    }
+    if (v >= 10u) {
+        const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
+        p -= 2;
+        p[0] = d[0];
+        p[1] = d[1];
+    } else {
+        *--p = static_cast<char>('0' + v);
+    }
+    out.append(p, static_cast<std::size_t>((buf + sizeof(buf)) - p));
+}
+
+inline void append_int(DumpBuffer& out, const std::int64_t v) {
+    if (v < 0) {
+        out.push('-');
+        const auto u = static_cast<std::uint64_t>(-(v + 1)) + 1u;
+        append_uint(out, u);
+    } else {
+        append_uint(out, static_cast<std::uint64_t>(v));
+    }
+}
+
+} // namespace
+
 namespace dtoa_impl {
 
 template <typename Target, typename Source>
@@ -821,45 +877,61 @@ inline cached_power get_cached_power_for_binary_exponent(int e) {
     return kCachedPowers[static_cast<std::size_t>(index)];
 }
 
-inline int find_largest_pow10(const std::uint32_t n, std::uint32_t& pow10) {
-    if (n >= 1000000000) {
-        pow10 = 1000000000;
-        return 10;
+inline int count_leading_zeros_u32(const std::uint32_t x) noexcept {
+    assert(x != 0u);
+#if (defined(__GNUC__) || defined(__clang__)) && (UINT_MAX == 0xFFFFFFFFU)
+    return __builtin_clz(x);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64) || defined(_M_IX86))
+    unsigned long idx = 0;
+    _BitScanReverse(&idx, x);
+    return 31 - static_cast<int>(idx);
+#else
+    int c = 0;
+    std::uint32_t v = x;
+    while ((v >> 31u) == 0u) {
+        v <<= 1u;
+        ++c;
     }
-    if (n >= 100000000) {
-        pow10 = 100000000;
-        return 9;
+    return c;
+#endif
+}
+
+inline int count_trailing_zeros_u64(const std::uint64_t x) noexcept {
+    assert(x != 0u);
+#if (defined(__GNUC__) || defined(__clang__)) && (ULLONG_MAX == 0xFFFFFFFFFFFFFFFFULL)
+    return __builtin_ctzll(static_cast<unsigned long long>(x));
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long idx = 0;
+    _BitScanForward64(&idx, x);
+    return static_cast<int>(idx);
+#else
+    int c = 0;
+    std::uint64_t v = x;
+    while ((v & 1u) == 0u) {
+        v >>= 1u;
+        ++c;
     }
-    if (n >= 10000000) {
-        pow10 = 10000000;
-        return 8;
+    return c;
+#endif
+}
+
+inline int find_largest_pow10(const std::uint32_t n) noexcept {
+    if (n == 0u) {
+        return 1;
     }
-    if (n >= 1000000) {
-        pow10 = 1000000;
-        return 7;
+    static constexpr std::array<std::uint8_t, 33> kMaxDigitsForBits = {{
+        1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5,
+        6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10
+    }};
+    static constexpr std::array<std::uint32_t, 10> kPow10 = {{
+        1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u
+    }};
+    const int bits = 32 - count_leading_zeros_u32(n);
+    int k = static_cast<int>(kMaxDigitsForBits[static_cast<std::size_t>(bits)]);
+    if (n < kPow10[static_cast<std::size_t>(k - 1)]) {
+        --k;
     }
-    if (n >= 100000) {
-        pow10 = 100000;
-        return 6;
-    }
-    if (n >= 10000) {
-        pow10 = 10000;
-        return 5;
-    }
-    if (n >= 1000) {
-        pow10 = 1000;
-        return 4;
-    }
-    if (n >= 100) {
-        pow10 = 100;
-        return 3;
-    }
-    if (n >= 10) {
-        pow10 = 10;
-        return 2;
-    }
-    pow10 = 1;
-    return 1;
+    return k;
 }
 
 inline void grisu2_round(char* buf, int len, std::uint64_t dist, std::uint64_t delta,
@@ -895,31 +967,60 @@ inline void grisu2_digit_gen(char* buffer, int& length, int& decimal_exponent, d
     auto p1 = static_cast<std::uint32_t>(M_plus.f >> -one.e);
     std::uint64_t p2 = M_plus.f & (one.f - 1);
 
-    static constexpr std::uint32_t kPow10[10] = {
-        1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u};
-    std::uint32_t pow10 = 0;
-    const int k = find_largest_pow10(p1, pow10);
+    const int k = find_largest_pow10(p1);
 
-    int n = k;
-    while (n > 0) {
-        const std::uint32_t d = p1 / pow10;
-        const std::uint32_t r = p1 - d * pow10;
-
-        assert(d <= 9);
-        buffer[length++] = static_cast<char>('0' + d);
-
-        const std::uint64_t rest = (static_cast<std::uint64_t>(r) << -one.e) + p2;
-        if (rest <= delta) {
-            decimal_exponent += n - 1;
-            grisu2_round(buffer, length, dist, delta, rest,
-                         static_cast<std::uint64_t>(pow10) << -one.e);
-            return;
-        }
-
-        p1 = r;
-        --n;
-        pow10 = (n > 0) ? kPow10[static_cast<std::size_t>(n - 1)] : 0u;
+#define NEOJSON_GRISU2_STEP(N, POW10)                                              \
+    case (N): {                                                                    \
+        const std::uint32_t d = p1 / (POW10);                                      \
+        const std::uint32_t r = p1 - d * (POW10);                                  \
+        assert(d <= 9);                                                            \
+        buffer[length++] = static_cast<char>('0' + d);                             \
+        const std::uint64_t rest = (static_cast<std::uint64_t>(r) << -one.e) + p2; \
+        if (rest <= delta) {                                                       \
+            decimal_exponent += (N) - 1;                                           \
+            grisu2_round(buffer, length, dist, delta, rest,                        \
+                         static_cast<std::uint64_t>(POW10) << -one.e);             \
+            return;                                                                \
+        }                                                                          \
+        p1 = r;                                                                    \
     }
+
+    switch (k) {
+        NEOJSON_GRISU2_STEP(10, 1000000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(9, 100000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(8, 10000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(7, 1000000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(6, 100000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(5, 10000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(4, 1000u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(3, 100u)
+        [[fallthrough]];
+        NEOJSON_GRISU2_STEP(2, 10u)
+        [[fallthrough]];
+        case 1: {
+            const std::uint32_t d = p1;
+            assert(d <= 9);
+            buffer[length++] = static_cast<char>('0' + d);
+            if (p2 <= delta) {
+                grisu2_round(buffer, length, dist, delta, p2, one.f);
+                return;
+            }
+            p1 = 0;
+            break;
+        }
+        default:
+            assert(false);
+            break;
+    }
+
+#undef NEOJSON_GRISU2_STEP
 
     assert(p1 == 0);
     int m = 0;
@@ -999,6 +1100,8 @@ inline char* append_exponent(char* buf, int e) {
     return buf;
 }
 
+// Formats the `len` digits written by `grisu2` at `buf + 1` into `buf`, shifting only the short
+// integer prefix left by 1 on the common fixed-point decimal path (`0 < n <= max_exp`).
 inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp, int max_exp) {
     assert(min_exp < 0);
     assert(max_exp > 0);
@@ -1007,6 +1110,7 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
     const int n = len + k;
 
     if (k >= 0 && n <= max_exp) {
+        std::memmove(buf, buf + 1, static_cast<std::size_t>(len));
         std::fill_n(buf + len, k, '0');
         buf[n] = '.';
         buf[n + 1] = '0';
@@ -1015,14 +1119,14 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
 
     if (0 < n && n <= max_exp) {
         assert(k < 0);
-        std::memmove(buf + (static_cast<std::size_t>(n) + 1), buf + n,
-                     static_cast<std::size_t>(len - n));
+        std::memmove(buf, buf + 1, static_cast<std::size_t>(n));
         buf[n] = '.';
         return buf + (static_cast<std::size_t>(len) + 1U);
     }
 
     if (min_exp < n && n <= 0) {
-        std::memmove(buf + (2 + static_cast<std::size_t>(-n)), buf, static_cast<std::size_t>(len));
+        std::memmove(buf + (2 + static_cast<std::size_t>(-n)), buf + 1,
+                     static_cast<std::size_t>(len));
         buf[0] = '0';
         buf[1] = '.';
         std::fill_n(buf + 2, -n, '0');
@@ -1030,10 +1134,11 @@ inline char* format_buffer(char* buf, int len, int decimal_exponent, int min_exp
     }
 
     if (len > 1) {
-        std::memmove(buf + 2, buf + 1, static_cast<std::size_t>(len - 1));
+        buf[0] = buf[1];
         buf[1] = '.';
         buf += len + 1;
     } else {
+        buf[0] = buf[1];
         buf += 1;
     }
 
@@ -1061,6 +1166,27 @@ inline void append_float(DumpBuffer& out, double val) {
         return;
     }
 
+    const std::uint64_t raw = reinterpret_bits<std::uint64_t>(val);
+    const std::uint64_t exp_raw = (raw >> 52u) & 0x7FFu;
+    if (exp_raw != 0u) {
+        const int exp_bin = static_cast<int>(exp_raw) - 1023 - 52;
+        if (exp_bin >= -52 && exp_bin <= 0) {
+            const std::uint64_t sig_bin =
+                (raw & ((std::uint64_t{1} << 52u) - 1u)) | (std::uint64_t{1} << 52u);
+            if (count_trailing_zeros_u64(sig_bin) >= -exp_bin) {
+                const std::uint64_t sig_dec = sig_bin >> static_cast<unsigned>(-exp_bin);
+                if (sig_dec < 1000000000000000ULL) {
+                    if (is_negative) {
+                        out.push('-');
+                    }
+                    append_uint(out, sig_dec);
+                    out.append(".0", 2);
+                    return;
+                }
+            }
+        }
+    }
+
     out.reserve_extra(64);
     char* p = out.write_ptr();
     if (is_negative) {
@@ -1069,7 +1195,7 @@ inline void append_float(DumpBuffer& out, double val) {
 
     int length = 0;
     int decimal_exponent = 0;
-    grisu2(p, length, decimal_exponent, val);
+    grisu2(p + 1, length, decimal_exponent, val);
 
     constexpr int kMinExp = -4;
     constexpr int kMaxExp = std::numeric_limits<double>::digits10;
@@ -1590,58 +1716,6 @@ struct json_access {
 };
 
 namespace {
-
-inline void append_uint(DumpBuffer& out, std::uint64_t v) {
-    static constexpr char kDigits100[201] =
-        "0001020304050607080910111213141516171819"
-        "2021222324252627282930313233343536373839"
-        "4041424344454647484950515253545556575859"
-        "6061626364656667686970717273747576777879"
-        "8081828384858687888990919293949596979899";
-    if (v < 100u) {
-        out.reserve_extra(2);
-        char* p = out.write_ptr();
-        if (v < 10u) {
-            *p++ = static_cast<char>('0' + v);
-        } else {
-            const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
-            p[0] = d[0];
-            p[1] = d[1];
-            p += 2;
-        }
-        out.advance_to(p);
-        return;
-    }
-    char buf[24];
-    char* p = buf + sizeof(buf);
-    while (v >= 100u) {
-        const auto q = v / 100u;
-        const auto r = static_cast<std::size_t>((v - q * 100u) * 2u);
-        v = q;
-        p -= 2;
-        p[0] = kDigits100[r];
-        p[1] = kDigits100[r + 1];
-    }
-    if (v >= 10u) {
-        const char* d = kDigits100 + static_cast<std::size_t>(v) * 2u;
-        p -= 2;
-        p[0] = d[0];
-        p[1] = d[1];
-    } else {
-        *--p = static_cast<char>('0' + v);
-    }
-    out.append(p, static_cast<std::size_t>((buf + sizeof(buf)) - p));
-}
-
-inline void append_int(DumpBuffer& out, const std::int64_t v) {
-    if (v < 0) {
-        out.push('-');
-        const auto u = static_cast<std::uint64_t>(-(v + 1)) + 1u;
-        append_uint(out, u);
-    } else {
-        append_uint(out, static_cast<std::uint64_t>(v));
-    }
-}
 
 void dump_compact_strict(DumpBuffer& out, const json& val) {
     switch (json_access::type_of(val)) {
