@@ -192,6 +192,16 @@ struct LazyHeader {
     std::atomic<std::uint8_t> dedup_state{0u};
 };
 
+struct SharedString {
+    // 0u = unshareable (pinned because caller obtained mutable string_t* / string_t&)
+    std::atomic<std::uint32_t> refcount{1u};
+    std::string value;
+
+    template <typename... Args>
+    explicit SharedString(Args&&... args) : value(std::forward<Args>(args)...) {}
+};
+static_assert(sizeof(SharedString) <= 48u, "SharedString should fit in small pooled slab");
+
 void lazy_release(LazyHeader* node, value_t type) noexcept;
 const void* lazy_materialize_const(LazyHeader* node, value_t type);
 void* lazy_detach_mutable(LazyHeader* node, value_t type);
@@ -3194,21 +3204,71 @@ public:
 
 private:
     template <typename... Args>
-    static string_t* create_string(Args&&... args) {
-        void* mem = detail::pool_alloc(sizeof(string_t));
+    static detail::SharedString* create_string(Args&&... args) {
+        void* mem = detail::pool_alloc(sizeof(detail::SharedString));
         try {
-            return ::new (mem) string_t(std::forward<Args>(args)...);
+            return ::new (mem) detail::SharedString(std::forward<Args>(args)...);
         } catch (...) {
-            detail::pool_free(mem, sizeof(string_t));
+            detail::pool_free(mem, sizeof(detail::SharedString));
             throw;
         }
     }
 
-    static void destroy_string(string_t* s) noexcept {
+    static void release_string(detail::SharedString* s) noexcept {
         if (s != nullptr) {
-            s->~string_t();
-            detail::pool_free(s, sizeof(string_t));
+            const std::uint32_t rc = s->refcount.load(std::memory_order_acquire);
+            if (rc <= 1u || s->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+                s->~SharedString();
+                detail::pool_free(s, sizeof(detail::SharedString));
+            }
         }
+    }
+
+    static detail::SharedString* share_or_clone_string(detail::SharedString* src) {
+        std::uint32_t rc = src->refcount.load(std::memory_order_acquire);
+        while (rc != 0u && rc != (std::numeric_limits<std::uint32_t>::max)()) {
+            if (src->refcount.compare_exchange_weak(rc, rc + 1u, std::memory_order_relaxed,
+                                                    std::memory_order_relaxed)) {
+                return src;
+            }
+        }
+        return create_string(src->value);
+    }
+
+    string_t* mutable_string_unique() {
+        detail::SharedString* s = m_value.string;
+        if (s->refcount.load(std::memory_order_acquire) <= 1u) {
+            return &s->value;
+        }
+        detail::SharedString* fresh = create_string(s->value);
+        m_value.string = fresh;
+        release_string(s);
+        return &fresh->value;
+    }
+
+    string_t* mutable_string_pin() {
+        detail::SharedString* s = m_value.string;
+        const std::uint32_t rc = s->refcount.load(std::memory_order_acquire);
+        if (rc == 0u) {
+            return &s->value;
+        }
+        if (rc == 1u) {
+            s->refcount.store(0u, std::memory_order_relaxed);
+            return &s->value;
+        }
+        detail::SharedString* fresh = create_string(s->value);
+        fresh->refcount.store(0u, std::memory_order_relaxed);
+        m_value.string = fresh;
+        release_string(s);
+        return &fresh->value;
+    }
+
+    static string_t extract_string_key(json& key_json) {
+        detail::SharedString* s = key_json.m_value.string;
+        if (s->refcount.load(std::memory_order_acquire) <= 1u) {
+            return std::move(s->value);
+        }
+        return s->value;
     }
 
     template <typename... Args>
@@ -3250,7 +3310,7 @@ private:
     union json_value {
         object_t* object;
         array_t* array;
-        string_t* string;
+        detail::SharedString* string;
         detail::LazyHeader* lazy;
         boolean_t boolean;
         number_integer_t number_integer;
@@ -3406,7 +3466,7 @@ private:
                     destroy_container(array);
                     break;
                 case value_t::string:
-                    destroy_string(string);
+                    release_string(string);
                     string = nullptr;
                     break;
                 default:
@@ -3445,7 +3505,7 @@ private:
                 m_value.array = create_array(*(other.m_value.array));
                 break;
             case value_t::string:
-                m_value.string = create_string(*(other.m_value.string));
+                m_value.string = share_or_clone_string(other.m_value.string);
                 break;
             default:
                 break;
@@ -3559,7 +3619,7 @@ public:
                 auto element = element_ref.moved_or_copied();
                 auto* pair_arr = element.mutable_array();
                 m_value.object->emplace(
-                    std::move(*((*pair_arr)[0].m_value.string)),
+                    extract_string_key((*pair_arr)[0]),
                     std::move((*pair_arr)[1]));
             }
         } else {
@@ -3601,7 +3661,7 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (m_type == value_t::string) {
-                    m_value.string = create_string(*(first.m_object->m_value.string));
+                    m_value.string = share_or_clone_string(first.m_object->m_value.string);
                 } else {
                     m_value = first.m_object->m_value;
                 }
@@ -4295,7 +4355,14 @@ public:
                 m_value.boolean = false;
                 break;
             case value_t::string:
-                m_value.string->clear();
+                if (m_value.string->refcount.load(std::memory_order_acquire) <= 1u) {
+                    m_value.string->value.clear();
+                } else {
+                    detail::SharedString* fresh = create_string();
+                    detail::SharedString* old = m_value.string;
+                    m_value.string = fresh;
+                    release_string(old);
+                }
                 break;
             case value_t::array:
                 if (m_storage != 0u) {
@@ -4373,7 +4440,7 @@ public:
         if (is_object() && init.size() == 2 && (*init.begin())->is_string()) {
             json key = init.begin()->moved_or_copied();
             push_back(typename object_t::value_type(
-                std::move(*(key.m_value.string)), (init.begin() + 1)->moved_or_copied()));
+                extract_string_key(key), (init.begin() + 1)->moved_or_copied()));
         } else {
             push_back(json(init));
         }
@@ -4628,7 +4695,7 @@ public:
                     throw invalid_iterator::create(205, "iterator out of range");
                 }
                 if (is_string()) {
-                    destroy_string(m_value.string);
+                    release_string(m_value.string);
                     m_value.string = nullptr;
                 }
                 m_type = value_t::null;
@@ -4674,7 +4741,7 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (is_string()) {
-                    destroy_string(m_value.string);
+                    release_string(m_value.string);
                     m_value.string = nullptr;
                 }
                 m_type = value_t::null;
@@ -4730,7 +4797,7 @@ public:
 
     void swap(string_t& other) {
         if (is_string()) {
-            std::swap(*(m_value.string), other);
+            std::swap(*mutable_string_unique(), other);
         } else {
             throw type_error::create(
                 310, std::string("cannot use swap(string_t&) with ") + type_name());
@@ -4770,7 +4837,8 @@ public:
                 case value_t::null:
                     return true;
                 case value_t::string:
-                    return *lhs.m_value.string == *rhs.m_value.string;
+                    return lhs.m_value.string == rhs.m_value.string ||
+                           lhs.m_value.string->value == rhs.m_value.string->value;
                 case value_t::boolean:
                     return lhs.m_value.boolean == rhs.m_value.boolean;
                 case value_t::number_integer:
@@ -4885,7 +4953,8 @@ public:
                 case value_t::null:
                     return false;
                 case value_t::string:
-                    return *lhs.m_value.string < *rhs.m_value.string;
+                    return lhs.m_value.string != rhs.m_value.string &&
+                           lhs.m_value.string->value < rhs.m_value.string->value;
                 case value_t::boolean:
                     return lhs.m_value.boolean < rhs.m_value.boolean;
                 case value_t::number_integer:
@@ -5147,10 +5216,10 @@ private:
         return is_array() ? const_array() : nullptr;
     }
     string_t* get_impl_ptr(string_t* /*unused*/) noexcept {
-        return is_string() ? m_value.string : nullptr;
+        return is_string() ? mutable_string_pin() : nullptr;
     }
     constexpr const string_t* get_impl_ptr(const string_t* /*unused*/) const noexcept {
-        return is_string() ? m_value.string : nullptr;
+        return is_string() ? &m_value.string->value : nullptr;
     }
     boolean_t* get_impl_ptr(boolean_t* /*unused*/) noexcept {
         return is_boolean() ? &m_value.boolean : nullptr;
@@ -5487,8 +5556,8 @@ inline void json::patch_inplace(const json& json_patch) {
             return it->second;
         };
 
-        const std::string op = *get_member("op", "op", true).m_value.string;
-        const std::string path = *get_member(op, "path", true).m_value.string;
+        const std::string op = get_member("op", "op", true).m_value.string->value;
+        const std::string path = get_member(op, "path", true).m_value.string->value;
         json_pointer ptr(path);
 
         switch (get_op(op)) {
@@ -5508,7 +5577,7 @@ inline void json::patch_inplace(const json& json_patch) {
             }
 
             case patch_operations::move: {
-                const std::string from_path = *get_member("move", "from", true).m_value.string;
+                const std::string from_path = get_member("move", "from", true).m_value.string->value;
                 json_pointer from_ptr(from_path);
 
                 json v = result.at(from_ptr);
@@ -5519,7 +5588,7 @@ inline void json::patch_inplace(const json& json_patch) {
             }
 
             case patch_operations::copy: {
-                const std::string from_path = *get_member("copy", "from", true).m_value.string;
+                const std::string from_path = get_member("copy", "from", true).m_value.string->value;
                 const json_pointer from_ptr(from_path);
 
                 json v = result.at(from_ptr);

@@ -3,10 +3,12 @@
 #include "differential.hpp"
 #include "small_stack.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -697,6 +699,260 @@ TEST(LazyCow, NestedDuplicateOuterUniqueCachingAndLargeKeys) {
         EXPECT_EQ(l_flood.size(), o_flood.size());
         EXPECT_EQ(l_flood.dump(), o_flood.dump());
     }
+}
+
+TEST(LazyCow, SharedStringCowPinSwapClearAndMaterialize) {
+    const std::string base_text(128, 'x');
+    jk s1 = base_text;
+    jk s2 = s1;
+    const auto* ptr1 = std::as_const(s1).get_ptr<const jk::string_t*>();
+    const auto* ptr2 = std::as_const(s2).get_ptr<const jk::string_t*>();
+    ASSERT_NE(ptr1, nullptr);
+    EXPECT_EQ(ptr1, ptr2);
+    EXPECT_EQ(s1, s2);
+    EXPECT_FALSE(s1 < s2);
+    EXPECT_FALSE(s2 < s1);
+
+    // Pinning via mutable get_ptr detaches from shared siblings and disables future sharing.
+    jk::string_t* mut_ptr = s1.get_ptr<jk::string_t*>();
+    ASSERT_NE(mut_ptr, nullptr);
+    EXPECT_NE(mut_ptr, ptr2);
+    *mut_ptr += "_pinned";
+    EXPECT_EQ(s2.get<std::string>(), base_text);
+    EXPECT_EQ(s1.get<std::string>(), base_text + "_pinned");
+
+    jk s3 = s1;
+    EXPECT_NE(std::as_const(s3).get_ptr<const jk::string_t*>(), mut_ptr);
+    *mut_ptr += "_again";
+    EXPECT_EQ(s3.get<std::string>(), base_text + "_pinned");
+    EXPECT_EQ(s1.get<std::string>(), base_text + "_pinned_again");
+
+    // Mutable get_ref also pins a sole-owner string against future copy sharing.
+    jk solo = std::string(96, 'r');
+    jk::string_t& solo_ref = solo.get_ref<jk::string_t&>();
+    jk solo_copy = solo;
+    EXPECT_NE(std::as_const(solo_copy).get_ptr<const jk::string_t*>(), &solo_ref);
+    solo_ref += "_solo";
+    EXPECT_EQ(solo_copy.get<std::string>(), std::string(96, 'r'));
+
+    // swap(string_t&) detaches without mutating shared sibling.
+    jk sw1 = std::string(80, 'k');
+    jk sw2 = sw1;
+    std::string external = "swapped_value";
+    sw1.swap(external);
+    EXPECT_EQ(sw1, "swapped_value");
+    EXPECT_EQ(external, std::string(80, 'k'));
+    EXPECT_EQ(sw2, std::string(80, 'k'));
+
+    // clear() on shared string allocates fresh empty string without affecting sibling.
+    jk cl1 = std::string(80, 'q');
+    jk cl2 = cl1;
+    cl1.clear();
+    EXPECT_EQ(cl1, "");
+    EXPECT_EQ(cl2, std::string(80, 'q'));
+    cl2.clear();
+    EXPECT_EQ(cl2, "");
+
+    // Initializer-list key construction and push_back must not move-from shared string keys.
+    jk shared_k1 = std::string(72, 'a');
+    jk shared_k2 = std::string(72, 'b');
+    jk obj = {{shared_k1, 42}};
+    obj.push_back({shared_k2, 99});
+    EXPECT_EQ(shared_k1, std::string(72, 'a'));
+    EXPECT_EQ(shared_k2, std::string(72, 'b'));
+    EXPECT_EQ(obj[shared_k1.get<std::string>()], 42);
+    EXPECT_EQ(obj[shared_k2.get<std::string>()], 99);
+
+    // materialize() detaches shared strings inside containers as well as root strings.
+    jk root_str = std::string(90, 'm');
+    jk root_str_copy = root_str;
+    root_str.materialize();
+    EXPECT_NE(std::as_const(root_str).get_ptr<const jk::string_t*>(),
+              std::as_const(root_str_copy).get_ptr<const jk::string_t*>());
+    EXPECT_EQ(root_str, root_str_copy);
+
+    jk tree = {{"txt", std::string(90, 't')}, {"arr", {std::string(90, 'u'), 2}}};
+    jk tree_copy = tree;
+    EXPECT_EQ(std::as_const(tree)["txt"].get_ptr<const jk::string_t*>(),
+              std::as_const(tree_copy)["txt"].get_ptr<const jk::string_t*>());
+    tree_copy.materialize();
+    EXPECT_NE(std::as_const(tree)["txt"].get_ptr<const jk::string_t*>(),
+              std::as_const(tree_copy)["txt"].get_ptr<const jk::string_t*>());
+    EXPECT_NE(std::as_const(tree)["arr"][0].get_ptr<const jk::string_t*>(),
+              std::as_const(tree_copy)["arr"][0].get_ptr<const jk::string_t*>());
+    EXPECT_EQ(tree, tree_copy);
+}
+
+TEST(LazyCow, ConcurrentSharedStringCopyAndMutateStress) {
+    const std::string p1(96, 'p');
+    const std::string p2(96, 'q');
+    const jk shared_doc = {{"s1", p1}, {"s2", p2}};
+
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    for (int tid = 0; tid < 4; ++tid) {
+        workers.emplace_back([&, tid]() {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            for (int iter = 0; iter < 1500; ++iter) {
+                jk local = shared_doc;
+                const jk& c_local = local;
+                const jk& cs1 = c_local["s1"];
+                const jk& cs2 = c_local["s2"];
+                ASSERT_EQ(cs1.get<std::string>(), p1);
+                ASSERT_TRUE(cs1 < cs2);
+
+                jk dup = cs1;
+                if ((iter + tid) % 4 == 0) {
+                    auto* mp = dup.get_ptr<jk::string_t*>();
+                    ASSERT_NE(mp, nullptr);
+                    *mp += "_x";
+                    ASSERT_EQ(dup.get<std::string>(), p1 + "_x");
+                } else if ((iter + tid) % 4 == 1) {
+                    dup.clear();
+                    ASSERT_EQ(dup.get<std::string>(), "");
+                } else if ((iter + tid) % 4 == 2) {
+                    std::string tmp = "alt";
+                    dup.swap(tmp);
+                    ASSERT_EQ(dup.get<std::string>(), "alt");
+                    ASSERT_EQ(tmp, p1);
+                } else {
+                    dup = "reassigned";
+                    ASSERT_EQ(dup.get<std::string>(), "reassigned");
+                }
+                ASSERT_EQ(cs1.get<std::string>(), p1);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& t : workers) {
+        t.join();
+    }
+    EXPECT_EQ(shared_doc["s1"].get<std::string>(), p1);
+    EXPECT_EQ(shared_doc["s2"].get<std::string>(), p2);
+}
+
+TEST(LazyCow, DirectYyjsonDumpEdgeCasesAndDeepStack) {
+    // Control escapes (lowercase hex), 0x7F DEL verbatim, UTF-8, -0.0, and scientific bounds.
+    std::string raw_edges = R"({"ctrl":")";
+    raw_edges += R"(\b\t\n\f\r\"\\/\u0001\u001f)";
+    raw_edges.push_back(static_cast<char>(0x7F));
+    raw_edges += "\",\"utf8\":\"\xED\x95\x9C\xEA\xB5\xAD\xEC\x96\xB4\xF0\x9F\x8E\x89\"";
+    raw_edges += R"(,"neg_zero":-0.0,"small":1e-5,"fixed":1e-4,"big":1e15})";
+    const oj o_edges = oj::parse(raw_edges);
+    const jk l_edges = jk::parse(raw_edges);
+    EXPECT_EQ(l_edges.dump(), o_edges.dump());
+    EXPECT_EQ(l_edges.dump(2), o_edges.dump(2));
+
+    // Subtree direct dump and NaN/Inf mapped to null cleanly.
+    jk with_nan = l_edges;
+    with_nan["nan_v"] = std::numeric_limits<double>::quiet_NaN();
+    with_nan["inf_v"] = std::numeric_limits<double>::infinity();
+    const jk round_nan = jk::parse(with_nan.dump());
+    EXPECT_TRUE(round_nan["nan_v"].is_null());
+    EXPECT_TRUE(round_nan["inf_v"].is_null());
+    EXPECT_EQ(round_nan["utf8"].dump(), o_edges["utf8"].dump());
+
+    // Duplicate keys at root vs nested duplicate only (outer unique -> size() sets bit 0, then
+    // direct dump must detect nested dup and fall back accurately).
+    const std::string root_dup_raw = R"({"k":1,"k":2,"arr":[1,2,3]})";
+    const oj o_root_dup = oj::parse(root_dup_raw);
+    const jk l_root_dup = jk::parse(root_dup_raw);
+    EXPECT_EQ(l_root_dup.size(), o_root_dup.size());
+    EXPECT_EQ(l_root_dup.dump(), o_root_dup.dump());
+
+    const std::string nested_dup_raw =
+        R"({"a":1,"sub":{"d":10,"d":20,"e":30},"leaf":{"x":true,"y":"str"}})";
+    const oj o_nested_dup = oj::parse(nested_dup_raw);
+    const jk l_nested_dup = jk::parse(nested_dup_raw);
+    EXPECT_EQ(l_nested_dup.size(), o_nested_dup.size());
+    EXPECT_EQ(l_nested_dup.dump(), o_nested_dup.dump());
+    EXPECT_EQ(std::as_const(l_nested_dup)["leaf"].dump(), o_nested_dup["leaf"].dump());
+
+    // Direct iterative dump at depth 1100 on a 512 KiB stack must not stack overflow.
+    constexpr std::size_t kDepth = 1100u;
+    std::string deep_raw;
+    for (std::size_t i = 0; i < kDepth; ++i) {
+        deep_raw += (i % 2u == 0u) ? "[" : R"({"n":)";
+    }
+    deep_raw += "7";
+    for (std::size_t i = kDepth; i > 0; --i) {
+        deep_raw += ((i - 1u) % 2u == 0u) ? "]" : "}";
+    }
+    jk::parse_options opts;
+    opts.max_depth = kDepth + 16u;
+    const std::string err = neojson::test::run_with_stack(512u * 1024u, [&]() {
+        const jk doc = jk::parse(deep_raw, nullptr, true, false, opts);
+        EXPECT_EQ(doc.dump(), deep_raw);
+    });
+    ASSERT_TRUE(err.empty()) << err;
+}
+
+TEST(LazyCow, ConstIteratorCachingAndReverseEdgeCases) {
+    const std::string obj_raw =
+        R"({"k0":0,"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9})";
+    const std::string arr_raw = "[0,1,2,3,4,5,6,7,8,9,10,11]";
+    const oj o_obj = oj::parse(obj_raw);
+    const oj o_arr = oj::parse(arr_raw);
+    const jk l_obj = jk::parse(obj_raw);
+    const jk l_arr = jk::parse(arr_raw);
+
+    // cbegin/cend and crbegin/crend on lazy object (>8 keys).
+    std::vector<std::pair<std::string, int>> fwd_obj, rev_obj;
+    for (auto it = l_obj.cbegin(); it != l_obj.cend(); ++it) {
+        fwd_obj.emplace_back(it.key(), it.value().get<int>());
+    }
+    for (auto it = l_obj.crbegin(); it != l_obj.crend(); ++it) {
+        rev_obj.emplace_back(it.key(), it.value().get<int>());
+    }
+    ASSERT_EQ(fwd_obj.size(), o_obj.size());
+    std::reverse(rev_obj.begin(), rev_obj.end());
+    EXPECT_EQ(fwd_obj, rev_obj);
+
+    // .items() over const lazy object.
+    std::size_t item_count = 0;
+    for (const auto& kv : l_obj.items()) {
+        neojson::test::assert_tree_equal(o_obj[kv.key()], kv.value());
+        ++item_count;
+    }
+    EXPECT_EQ(item_count, o_obj.size());
+
+    // cbegin/cend, crbegin/crend, and arithmetic on lazy array (>8 elems).
+    std::vector<int> fwd_arr, rev_arr;
+    for (auto it = l_arr.cbegin(); it != l_arr.cend(); ++it) {
+        fwd_arr.push_back(it->get<int>());
+    }
+    for (auto it = l_arr.crbegin(); it != l_arr.crend(); ++it) {
+        rev_arr.push_back(it->get<int>());
+    }
+    std::reverse(rev_arr.begin(), rev_arr.end());
+    EXPECT_EQ(fwd_arr, rev_arr);
+    EXPECT_EQ(l_arr.cend() - l_arr.cbegin(), static_cast<std::ptrdiff_t>(o_arr.size()));
+    EXPECT_EQ(*(l_arr.cbegin() + 5), 5);
+    EXPECT_EQ(*((l_arr.cend() - 1) - 3), 8);
+
+    // Non-const iterator converted to const_iterator must not carry a cached container pointer.
+    jk mut_obj = jk::parse(obj_raw);
+    auto mit = mut_obj.begin();
+    jk::const_iterator cit(mit);
+    jk::const_iterator cit2;
+    cit2 = mit;
+    mut_obj["k0"] = 777;
+    EXPECT_EQ(cit.key(), "k0");
+    EXPECT_EQ(*cit, 777);
+    EXPECT_EQ(*cit2, 777);
+
+    // Empty containers and scalar const iterators.
+    const jk empty_obj = jk::object();
+    const jk empty_arr = jk::array();
+    const jk scalar = 42;
+    EXPECT_EQ(empty_obj.cbegin(), empty_obj.cend());
+    EXPECT_EQ(empty_obj.crbegin(), empty_obj.crend());
+    EXPECT_EQ(empty_arr.cbegin(), empty_arr.cend());
+    EXPECT_EQ(empty_arr.crbegin(), empty_arr.crend());
+    EXPECT_EQ(scalar.cbegin() + 1, scalar.cend());
+    EXPECT_EQ(*scalar.cbegin(), 42);
+    EXPECT_EQ(*scalar.crbegin(), 42);
 }
 
 } // namespace

@@ -1286,7 +1286,7 @@ inline void dump_valid_utf8_escaped_strict(DumpBuffer& out, const char* p, const
 
 struct json_access {
     static json make_string(const char* s, const std::size_t len) {
-        json::string_t* ptr = json::create_string(s, len);
+        detail::SharedString* ptr = json::create_string(s, len);
         json j;
         j.m_type = json::value_t::string;
         j.m_value.string = ptr;
@@ -1330,7 +1330,13 @@ struct json_access {
     }
 
     static const json::string_t& string_of(const json& j) noexcept {
-        return *j.m_value.string;
+        return j.m_value.string->value;
+    }
+
+    static void detach_shared_string(json& j) {
+        if (j.m_type == json::value_t::string) {
+            (void)j.mutable_string_unique();
+        }
     }
 
     static const json::array_t& array_of(const json& j) noexcept {
@@ -2052,6 +2058,10 @@ bool lazy_less(const json& lhs, const json& rhs) noexcept {
 }
 
 void lazy_materialize_deep(json& root) {
+    if (root.is_string()) {
+        json_access::detach_shared_string(root);
+        return;
+    }
     if (!root.is_array() && !root.is_object()) {
         return;
     }
@@ -2063,14 +2073,18 @@ void lazy_materialize_deep(json& root) {
         if (cur->is_array()) {
             auto* arr = json_access::detach_array(*cur);
             for (auto& elem : *arr) {
-                if (elem.is_array() || elem.is_object()) {
+                if (elem.is_string()) {
+                    json_access::detach_shared_string(elem);
+                } else if (elem.is_array() || elem.is_object()) {
                     stack.push_back(&elem);
                 }
             }
         } else if (cur->is_object()) {
             auto* obj = json_access::detach_object(*cur);
             for (auto& kv : *obj) {
-                if (kv.second.is_array() || kv.second.is_object()) {
+                if (kv.second.is_string()) {
+                    json_access::detach_shared_string(kv.second);
+                } else if (kv.second.is_array() || kv.second.is_object()) {
                     stack.push_back(&kv.second);
                 }
             }
