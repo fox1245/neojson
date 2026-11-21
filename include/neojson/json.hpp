@@ -173,6 +173,22 @@ inline bool operator<(const value_t lhs, const value_t rhs) noexcept {
     return l_index < order.size() && r_index < order.size() && order[l_index] < order[r_index];
 }
 
+struct LazyNode;
+
+void lazy_retain(LazyNode* node) noexcept;
+void lazy_release(LazyNode* node, value_t type) noexcept;
+const void* lazy_materialize_const(LazyNode* node, value_t type);
+void* lazy_detach_mutable(LazyNode* node, value_t type);
+std::size_t lazy_size(LazyNode* node, value_t type) noexcept;
+bool lazy_empty(LazyNode* node, value_t type) noexcept;
+bool lazy_contains(LazyNode* node, std::string_view key);
+void* lazy_clear(LazyNode* node, value_t type) noexcept;
+bool lazy_equal(const json& lhs, const json& rhs) noexcept;
+bool lazy_less(const json& lhs, const json& rhs) noexcept;
+void lazy_materialize_deep(json& j);
+bool lazy_is_owned_materialized(const LazyNode* node) noexcept;
+void* lazy_steal_owned_materialized(LazyNode* node, value_t type) noexcept;
+
 enum class error_handler_t {
     strict,
     replace,
@@ -1366,16 +1382,34 @@ private:
         }
         switch (object->m_type) {
             case value_t::object: {
-                if (idx < 0 || static_cast<std::size_t>(idx) >= object->m_value.object->size()) {
-                    throw invalid_iterator::create(214, "cannot get value");
+                if constexpr (std::is_const<BasicJsonType>::value) {
+                    const auto* obj = object->const_object();
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                        throw invalid_iterator::create(214, "cannot get value");
+                    }
+                    return (*obj)[static_cast<std::size_t>(idx)].second;
+                } else {
+                    auto* obj = object->mutable_object();
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                        throw invalid_iterator::create(214, "cannot get value");
+                    }
+                    return (*obj)[static_cast<std::size_t>(idx)].second;
                 }
-                return (*object->m_value.object)[static_cast<std::size_t>(idx)].second;
             }
             case value_t::array: {
-                if (idx < 0 || static_cast<std::size_t>(idx) >= object->m_value.array->size()) {
-                    throw invalid_iterator::create(214, "cannot get value");
+                if constexpr (std::is_const<BasicJsonType>::value) {
+                    const auto* arr = object->const_array();
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                        throw invalid_iterator::create(214, "cannot get value");
+                    }
+                    return (*arr)[static_cast<std::size_t>(idx)];
+                } else {
+                    auto* arr = object->mutable_array();
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                        throw invalid_iterator::create(214, "cannot get value");
+                    }
+                    return (*arr)[static_cast<std::size_t>(idx)];
                 }
-                return (*object->m_value.array)[static_cast<std::size_t>(idx)];
             }
             case value_t::null:
                 throw invalid_iterator::create(214, "cannot get value");
@@ -1391,10 +1425,11 @@ private:
         if (object == nullptr || object->m_type != value_t::object) {
             throw invalid_iterator::create(207, "cannot use key() for non-object iterators");
         }
-        if (idx < 0 || static_cast<std::size_t>(idx) >= object->m_value.object->size()) {
+        const auto* obj = object->const_object();
+        if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
             throw invalid_iterator::create(214, "cannot get value");
         }
-        return (*object->m_value.object)[static_cast<std::size_t>(idx)].first;
+        return (*obj)[static_cast<std::size_t>(idx)].first;
     }
 
     pointer m_object = nullptr;
@@ -1921,7 +1956,7 @@ template <>
 struct external_constructor<value_t::boolean> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::boolean_t b) noexcept {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_type = value_t::boolean;
         j.m_value.boolean = b;
     }
@@ -1931,14 +1966,14 @@ template <>
 struct external_constructor<value_t::string> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::string_t& s) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.string = BasicJsonType::create_string(s);
         j.m_type = value_t::string;
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::string_t&& s) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.string = BasicJsonType::create_string(std::move(s));
         j.m_type = value_t::string;
     }
@@ -1948,7 +1983,7 @@ struct external_constructor<value_t::string> {
                                         typename BasicJsonType::string_t>::value,
                           int> = 0>
     static void construct(BasicJsonType& j, const CompatibleStringType& str) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.string = BasicJsonType::create_string(str);
         j.m_type = value_t::string;
     }
@@ -1958,7 +1993,7 @@ template <>
 struct external_constructor<value_t::number_float> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::number_float_t val) noexcept {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_type = value_t::number_float;
         j.m_value.number_float = val;
     }
@@ -1969,7 +2004,7 @@ struct external_constructor<value_t::number_unsigned> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j,
                           typename BasicJsonType::number_unsigned_t val) noexcept {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_type = value_t::number_unsigned;
         j.m_value.number_unsigned = val;
     }
@@ -1980,7 +2015,7 @@ struct external_constructor<value_t::number_integer> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j,
                           typename BasicJsonType::number_integer_t val) noexcept {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_type = value_t::number_integer;
         j.m_value.number_integer = val;
     }
@@ -1990,14 +2025,14 @@ template <>
 struct external_constructor<value_t::array> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::array_t& arr) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.array = BasicJsonType::create_array(arr);
         j.m_type = value_t::array;
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::array_t&& arr) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.array = BasicJsonType::create_array(std::move(arr));
         j.m_type = value_t::array;
     }
@@ -2009,14 +2044,14 @@ struct external_constructor<value_t::array> {
     static void construct(BasicJsonType& j, const CompatibleArrayType& arr) {
         using std::begin;
         using std::end;
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.array = BasicJsonType::create_array(begin(arr), end(arr));
         j.m_type = value_t::array;
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const std::vector<bool>& b) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         auto* arr = BasicJsonType::create_array();
         j.m_value.array = arr;
         j.m_type = value_t::array;
@@ -2029,7 +2064,7 @@ struct external_constructor<value_t::array> {
     template <typename BasicJsonType, typename T,
               enable_if_t<std::is_convertible<T, BasicJsonType>::value, int> = 0>
     static void construct(BasicJsonType& j, const std::valarray<T>& arr) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.array = BasicJsonType::create_array(std::begin(arr), std::end(arr));
         j.m_type = value_t::array;
     }
@@ -2039,14 +2074,14 @@ template <>
 struct external_constructor<value_t::object> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::object_t& obj) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.object = BasicJsonType::create_object(obj);
         j.m_type = value_t::object;
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::object_t&& obj) {
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         j.m_value.object = BasicJsonType::create_object(std::move(obj));
         j.m_type = value_t::object;
     }
@@ -2058,7 +2093,7 @@ struct external_constructor<value_t::object> {
     static void construct(BasicJsonType& j, const CompatibleObjectType& obj) {
         using std::begin;
         using std::end;
-        j.m_value.destroy(j.m_type);
+        j.destroy_value();
         auto* o = BasicJsonType::create_object();
         j.m_value.object = o;
         j.m_type = value_t::object;
@@ -3172,6 +3207,7 @@ private:
         object_t* object;
         array_t* array;
         string_t* string;
+        detail::LazyNode* lazy;
         boolean_t boolean;
         number_integer_t number_integer;
         number_unsigned_t number_unsigned;
@@ -3215,6 +3251,9 @@ private:
         }
 
         static bool is_container(const json& j) noexcept {
+            if (j.m_storage != 0u) {
+                return detail::lazy_is_owned_materialized(j.m_value.lazy);
+            }
             return j.m_type == value_t::array || j.m_type == value_t::object;
         }
 
@@ -3260,7 +3299,20 @@ private:
                 while (!stack.empty()) {
                     json current(std::move(stack.back()));
                     stack.pop_back();
-                    if (current.m_type == value_t::array) {
+                    if (current.m_storage != 0u) {
+                        void* mat = detail::lazy_steal_owned_materialized(
+                            current.m_value.lazy, current.m_type);
+                        if (mat != nullptr) {
+                            current.m_storage = 0u;
+                            if (current.m_type == value_t::array) {
+                                current.m_value.array = static_cast<array_t*>(mat);
+                                take_containers(*current.m_value.array, stack);
+                            } else {
+                                current.m_value.object = static_cast<object_t*>(mat);
+                                take_containers(*current.m_value.object, stack);
+                            }
+                        }
+                    } else if (current.m_type == value_t::array) {
                         take_containers(*current.m_value.array, stack);
                     } else {
                         take_containers(*current.m_value.object, stack);
@@ -3315,6 +3367,51 @@ private:
             }
         }
     };
+
+    void destroy_value() noexcept {
+        if (m_storage != 0u) {
+            detail::lazy_release(m_value.lazy, m_type);
+            m_value.lazy = nullptr;
+            m_storage = 0u;
+        } else {
+            m_value.destroy(m_type);
+        }
+        m_type = value_t::null;
+    }
+
+    object_t* mutable_object() {
+        if (m_storage != 0u) {
+            m_value.object = static_cast<object_t*>(
+                detail::lazy_detach_mutable(m_value.lazy, m_type));
+            m_storage = 0u;
+        }
+        return m_value.object;
+    }
+
+    array_t* mutable_array() {
+        if (m_storage != 0u) {
+            m_value.array = static_cast<array_t*>(
+                detail::lazy_detach_mutable(m_value.lazy, m_type));
+            m_storage = 0u;
+        }
+        return m_value.array;
+    }
+
+    const object_t* const_object() const {
+        if (m_storage != 0u) {
+            return static_cast<const object_t*>(
+                detail::lazy_materialize_const(m_value.lazy, m_type));
+        }
+        return m_value.object;
+    }
+
+    const array_t* const_array() const {
+        if (m_storage != 0u) {
+            return static_cast<const array_t*>(
+                detail::lazy_materialize_const(m_value.lazy, m_type));
+        }
+        return m_value.array;
+    }
 
 public:
     // ==================== Construction & Assignment ====================
@@ -3372,9 +3469,10 @@ public:
             m_value.object->reserve(init.size());
             for (auto& element_ref : init) {
                 auto element = element_ref.moved_or_copied();
+                auto* pair_arr = element.mutable_array();
                 m_value.object->emplace(
-                    std::move(*((*element.m_value.array)[0].m_value.string)),
-                    std::move((*element.m_value.array)[1]));
+                    std::move(*((*pair_arr)[0].m_value.string)),
+                    std::move((*pair_arr)[1]));
             }
         } else {
             m_value.array = create_array();
@@ -3422,26 +3520,23 @@ public:
                 break;
             }
             case value_t::array: {
-                const auto sz = static_cast<difference_type>(first.m_object->m_value.array->size());
+                const auto* arr = first.m_object->const_array();
+                const auto sz = static_cast<difference_type>(arr->size());
                 if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
                     m_type = value_t::null;
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.array = create_array(
-                    first.m_object->m_value.array->begin() + first.idx_,
-                    first.m_object->m_value.array->begin() + last.idx_);
+                m_value.array = create_array(arr->begin() + first.idx_, arr->begin() + last.idx_);
                 break;
             }
             case value_t::object: {
-                const auto sz =
-                    static_cast<difference_type>(first.m_object->m_value.object->size());
+                const auto* obj = first.m_object->const_object();
+                const auto sz = static_cast<difference_type>(obj->size());
                 if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
                     m_type = value_t::null;
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.object = create_object(
-                    first.m_object->m_value.object->begin() + first.idx_,
-                    first.m_object->m_value.object->begin() + last.idx_);
+                m_value.object = create_object(obj->begin() + first.idx_, obj->begin() + last.idx_);
                 break;
             }
             case value_t::null:
@@ -3463,7 +3558,12 @@ public:
         return json(init, false, value_t::array);
     }
 
-    json(const json& other) : m_type(other.m_type) {
+    json(const json& other) : m_type(other.m_type), m_storage(other.m_storage) {
+        if (m_storage != 0u) {
+            detail::lazy_retain(other.m_value.lazy);
+            m_value.lazy = other.m_value.lazy;
+            return;
+        }
         switch (m_type) {
             case value_t::object:
                 m_value.object = create_object(*(other.m_value.object));
@@ -3497,10 +3597,15 @@ public:
 
     json(json&& other) noexcept
         : m_type(std::exchange(other.m_type, value_t::null)),
+          m_storage(std::exchange(other.m_storage, static_cast<std::uint8_t>(0u))),
           m_value(std::exchange(other.m_value, json_value{})) {}
 
     ~json() noexcept {
-        m_value.destroy(m_type);
+        if (m_storage != 0u) {
+            detail::lazy_release(m_value.lazy, m_type);
+        } else {
+            m_value.destroy(m_type);
+        }
     }
 
     json& operator=(const json& other) {
@@ -3514,7 +3619,9 @@ public:
     json& operator=(json&& other) noexcept {
         if (this != &other) {
             if (m_type == value_t::null) {
+                assert(m_storage == 0u);
                 m_type = std::exchange(other.m_type, value_t::null);
+                m_storage = std::exchange(other.m_storage, static_cast<std::uint8_t>(0u));
                 m_value = std::exchange(other.m_value, json_value{});
                 return *this;
             }
@@ -3588,9 +3695,11 @@ public:
             case value_t::null:
                 return true;
             case value_t::array:
-                return m_value.array->empty();
+                return m_storage != 0u ? detail::lazy_empty(m_value.lazy, m_type)
+                                       : m_value.array->empty();
             case value_t::object:
-                return m_value.object->empty();
+                return m_storage != 0u ? detail::lazy_empty(m_value.lazy, m_type)
+                                       : m_value.object->empty();
             default:
                 return false;
         }
@@ -3601,9 +3710,11 @@ public:
             case value_t::null:
                 return 0;
             case value_t::array:
-                return m_value.array->size();
+                return m_storage != 0u ? detail::lazy_size(m_value.lazy, m_type)
+                                       : m_value.array->size();
             case value_t::object:
-                return m_value.object->size();
+                return m_storage != 0u ? detail::lazy_size(m_value.lazy, m_type)
+                                       : m_value.object->size();
             default:
                 return 1;
         }
@@ -3612,9 +3723,9 @@ public:
     size_type max_size() const noexcept {
         switch (m_type) {
             case value_t::array:
-                return m_value.array->max_size();
+                return array_t{}.max_size();
             case value_t::object:
-                return m_value.object->max_size();
+                return object_t{}.max_size();
             default:
                 return size();
         }
@@ -3624,30 +3735,33 @@ public:
 
     reference at(size_type idx) {
         if (is_array()) {
-            if (idx >= m_value.array->size()) {
+            auto* arr = mutable_array();
+            if (idx >= arr->size()) {
                 throw out_of_range::create(
                     401, "array index " + std::to_string(idx) + " is out of range");
             }
-            return (*m_value.array)[idx];
+            return (*arr)[idx];
         }
         throw type_error::create(304, std::string("cannot use at() with ") + type_name());
     }
 
     const_reference at(size_type idx) const {
         if (is_array()) {
-            if (idx >= m_value.array->size()) {
+            const auto* arr = const_array();
+            if (idx >= arr->size()) {
                 throw out_of_range::create(
                     401, "array index " + std::to_string(idx) + " is out of range");
             }
-            return (*m_value.array)[idx];
+            return (*arr)[idx];
         }
         throw type_error::create(304, std::string("cannot use at() with ") + type_name());
     }
 
     reference at(const typename object_t::key_type& key) {
         if (is_object()) {
-            auto it = m_value.object->find(key);
-            if (it == m_value.object->end()) {
+            auto* obj = mutable_object();
+            auto it = obj->find(key);
+            if (it == obj->end()) {
                 throw out_of_range::create(403, "key '" + key + "' not found");
             }
             return it->second;
@@ -3657,8 +3771,9 @@ public:
 
     const_reference at(const typename object_t::key_type& key) const {
         if (is_object()) {
-            auto it = m_value.object->find(key);
-            if (it == m_value.object->end()) {
+            const auto* obj = const_object();
+            auto it = obj->find(key);
+            if (it == obj->end()) {
                 throw out_of_range::create(403, "key '" + key + "' not found");
             }
             return it->second;
@@ -3689,8 +3804,9 @@ public:
     reference at(const KeyType& key) {
         if (is_object()) {
             std::string_view sv(key);
-            auto it = m_value.object->find(sv);
-            if (it == m_value.object->end()) {
+            auto* obj = mutable_object();
+            auto it = obj->find(sv);
+            if (it == obj->end()) {
                 throw out_of_range::create(403, "key '" + std::string(sv) + "' not found");
             }
             return it->second;
@@ -3709,8 +3825,9 @@ public:
     const_reference at(const KeyType& key) const {
         if (is_object()) {
             std::string_view sv(key);
-            auto it = m_value.object->find(sv);
-            if (it == m_value.object->end()) {
+            const auto* obj = const_object();
+            auto it = obj->find(sv);
+            if (it == obj->end()) {
                 throw out_of_range::create(403, "key '" + std::string(sv) + "' not found");
             }
             return it->second;
@@ -3732,10 +3849,11 @@ public:
             m_type = value_t::array;
         }
         if (is_array()) {
-            if (idx >= m_value.array->size()) {
-                m_value.array->resize(idx + 1);
+            auto* arr = mutable_array();
+            if (idx >= arr->size()) {
+                arr->resize(idx + 1);
             }
-            return (*m_value.array)[idx];
+            return (*arr)[idx];
         }
         throw type_error::create(
             305, std::string("cannot use operator[] with a numeric argument with ") + type_name());
@@ -3743,7 +3861,7 @@ public:
 
     const_reference operator[](size_type idx) const {
         if (is_array()) {
-            return (*m_value.array)[idx];
+            return (*const_array())[idx];
         }
         throw type_error::create(
             305, std::string("cannot use operator[] with a numeric argument with ") + type_name());
@@ -3755,7 +3873,7 @@ public:
             m_type = value_t::object;
         }
         if (is_object()) {
-            return (*m_value.object)[key];
+            return (*mutable_object())[key];
         }
         throw type_error::create(
             305, std::string("cannot use operator[] with a string argument with ") + type_name());
@@ -3763,8 +3881,9 @@ public:
 
     const_reference operator[](const typename object_t::key_type& key) const {
         if (is_object()) {
-            auto it = m_value.object->find(key);
-            assert(it != m_value.object->end());
+            const auto* obj = const_object();
+            auto it = obj->find(key);
+            assert(it != obj->end());
             return it->second;
         }
         throw type_error::create(
@@ -3779,7 +3898,7 @@ public:
             m_type = value_t::object;
         }
         if (is_object()) {
-            return (*m_value.object)[std::string_view(key)];
+            return (*mutable_object())[std::string_view(key)];
         }
         throw type_error::create(
             305, std::string("cannot use operator[] with a string argument with ") + type_name());
@@ -3789,8 +3908,9 @@ public:
               std::enable_if_t<std::is_same<std::remove_cv_t<CharT>, char>::value, int> = 0>
     const_reference operator[](CharT* key) const {
         if (is_object()) {
-            auto it = m_value.object->find(std::string_view(key));
-            assert(it != m_value.object->end());
+            const auto* obj = const_object();
+            auto it = obj->find(std::string_view(key));
+            assert(it != obj->end());
             return it->second;
         }
         throw type_error::create(
@@ -3811,7 +3931,7 @@ public:
             m_type = value_t::object;
         }
         if (is_object()) {
-            return (*m_value.object)[std::string_view(key)];
+            return (*mutable_object())[std::string_view(key)];
         }
         throw type_error::create(
             305, std::string("cannot use operator[] with a string argument with ") + type_name());
@@ -3827,8 +3947,9 @@ public:
                   int> = 0>
     const_reference operator[](const KeyType& key) const {
         if (is_object()) {
-            auto it = m_value.object->find(std::string_view(key));
-            assert(it != m_value.object->end());
+            const auto* obj = const_object();
+            auto it = obj->find(std::string_view(key));
+            assert(it != obj->end());
             return it->second;
         }
         throw type_error::create(
@@ -3931,18 +4052,19 @@ public:
 
     iterator find(const typename object_t::key_type& key) {
         if (is_object()) {
-            auto it = m_value.object->find(key);
-            return iterator(
-                this, static_cast<difference_type>(std::distance(m_value.object->begin(), it)));
+            const auto* obj = const_object();
+            auto it = obj->find(key);
+            return iterator(this, static_cast<difference_type>(std::distance(obj->begin(), it)));
         }
         return end();
     }
 
     const_iterator find(const typename object_t::key_type& key) const {
         if (is_object()) {
-            auto it = m_value.object->find(key);
+            const auto* obj = const_object();
+            auto it = obj->find(key);
             return const_iterator(
-                this, static_cast<difference_type>(std::distance(m_value.object->begin(), it)));
+                this, static_cast<difference_type>(std::distance(obj->begin(), it)));
         }
         return cend();
     }
@@ -3955,9 +4077,9 @@ public:
                   int> = 0>
     iterator find(KeyType&& key) {
         if (is_object()) {
-            auto it = m_value.object->find(std::string_view(key));
-            return iterator(
-                this, static_cast<difference_type>(std::distance(m_value.object->begin(), it)));
+            const auto* obj = const_object();
+            auto it = obj->find(std::string_view(key));
+            return iterator(this, static_cast<difference_type>(std::distance(obj->begin(), it)));
         }
         return end();
     }
@@ -3970,15 +4092,16 @@ public:
                   int> = 0>
     const_iterator find(KeyType&& key) const {
         if (is_object()) {
-            auto it = m_value.object->find(std::string_view(key));
+            const auto* obj = const_object();
+            auto it = obj->find(std::string_view(key));
             return const_iterator(
-                this, static_cast<difference_type>(std::distance(m_value.object->begin(), it)));
+                this, static_cast<difference_type>(std::distance(obj->begin(), it)));
         }
         return cend();
     }
 
     size_type count(const typename object_t::key_type& key) const {
-        return is_object() ? m_value.object->count(key) : 0;
+        return contains(std::string_view(key)) ? 1u : 0u;
     }
 
     template <class KeyType,
@@ -3988,11 +4111,15 @@ public:
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     size_type count(KeyType&& key) const {
-        return is_object() ? m_value.object->count(std::string_view(key)) : 0;
+        return contains(std::string_view(key)) ? 1u : 0u;
     }
 
     bool contains(const typename object_t::key_type& key) const {
-        return is_object() && m_value.object->contains(key);
+        if (!is_object()) {
+            return false;
+        }
+        return m_storage != 0u ? detail::lazy_contains(m_value.lazy, std::string_view(key))
+                               : m_value.object->contains(key);
     }
 
     template <class KeyType,
@@ -4002,7 +4129,11 @@ public:
                       !std::is_same<std::decay_t<KeyType>, typename object_t::key_type>::value,
                   int> = 0>
     bool contains(KeyType&& key) const {
-        return is_object() && m_value.object->contains(std::string_view(key));
+        if (!is_object()) {
+            return false;
+        }
+        return m_storage != 0u ? detail::lazy_contains(m_value.lazy, std::string_view(key))
+                               : m_value.object->contains(std::string_view(key));
     }
 
     bool contains(const json_pointer& ptr) const {
@@ -4026,9 +4157,8 @@ public:
             case value_t::null:
                 return iterator(this, 0);
             case value_t::object:
-                return iterator(this, static_cast<difference_type>(m_value.object->size()));
             case value_t::array:
-                return iterator(this, static_cast<difference_type>(m_value.array->size()));
+                return iterator(this, static_cast<difference_type>(size()));
             default:
                 return iterator(this, 1);
         }
@@ -4041,9 +4171,8 @@ public:
             case value_t::null:
                 return const_iterator(this, 0);
             case value_t::object:
-                return const_iterator(this, static_cast<difference_type>(m_value.object->size()));
             case value_t::array:
-                return const_iterator(this, static_cast<difference_type>(m_value.array->size()));
+                return const_iterator(this, static_cast<difference_type>(size()));
             default:
                 return const_iterator(this, 1);
         }
@@ -4085,10 +4214,22 @@ public:
                 m_value.string->clear();
                 break;
             case value_t::array:
-                m_value.array->clear();
+                if (m_storage != 0u) {
+                    m_value.array = static_cast<array_t*>(
+                        detail::lazy_clear(m_value.lazy, m_type));
+                    m_storage = 0u;
+                } else {
+                    m_value.array->clear();
+                }
                 break;
             case value_t::object:
-                m_value.object->clear();
+                if (m_storage != 0u) {
+                    m_value.object = static_cast<object_t*>(
+                        detail::lazy_clear(m_value.lazy, m_type));
+                    m_storage = 0u;
+                } else {
+                    m_value.object->clear();
+                }
                 break;
             default:
                 break;
@@ -4104,7 +4245,7 @@ public:
             m_type = value_t::array;
         }
         json tmp(std::move(val));
-        m_value.array->push_back(std::move(tmp));
+        mutable_array()->push_back(std::move(tmp));
     }
 
     void push_back(const json& val) {
@@ -4116,7 +4257,7 @@ public:
             m_type = value_t::array;
         }
         json tmp(val);
-        m_value.array->push_back(std::move(tmp));
+        mutable_array()->push_back(std::move(tmp));
     }
 
     void push_back(const typename object_t::value_type& val) {
@@ -4128,7 +4269,7 @@ public:
             m_type = value_t::object;
         }
         typename object_t::value_type tmp(val);
-        m_value.object->insert(std::move(tmp));
+        mutable_object()->insert(std::move(tmp));
     }
 
     void push_back(initializer_list_t init) {
@@ -4172,8 +4313,9 @@ public:
             m_type = value_t::array;
         }
         json tmp(std::forward<Args>(args)...);
-        m_value.array->emplace_back(std::move(tmp));
-        return m_value.array->back();
+        auto* arr = mutable_array();
+        arr->emplace_back(std::move(tmp));
+        return arr->back();
     }
 
     template <class... Args>
@@ -4185,9 +4327,10 @@ public:
             m_value.object = create_object();
             m_type = value_t::object;
         }
-        auto res = m_value.object->emplace(std::forward<Args>(args)...);
+        auto* obj = mutable_object();
+        auto res = obj->emplace(std::forward<Args>(args)...);
         const auto idx =
-            static_cast<difference_type>(std::distance(m_value.object->begin(), res.first));
+            static_cast<difference_type>(std::distance(obj->begin(), res.first));
         return {iterator(this, idx), res.second};
     }
 
@@ -4197,7 +4340,8 @@ public:
                 throw invalid_iterator::create(202, "iterator does not fit current value");
             }
             json tmp(val);
-            m_value.array->insert(m_value.array->begin() + pos.idx_, std::move(tmp));
+            auto* arr = mutable_array();
+            arr->insert(arr->begin() + pos.idx_, std::move(tmp));
             return iterator(this, pos.idx_);
         }
         throw type_error::create(309, std::string("cannot use insert() with ") + type_name());
@@ -4213,7 +4357,8 @@ public:
                 throw invalid_iterator::create(202, "iterator does not fit current value");
             }
             json tmp(val);
-            m_value.array->insert(m_value.array->begin() + pos.idx_, cnt, tmp);
+            auto* arr = mutable_array();
+            arr->insert(arr->begin() + pos.idx_, cnt, tmp);
             return iterator(this, pos.idx_);
         }
         throw type_error::create(309, std::string("cannot use insert() with ") + type_name());
@@ -4232,14 +4377,17 @@ public:
         if (first.m_object == this) {
             throw invalid_iterator::create(211, "passed iterators may not belong to container");
         }
-        if (first.m_object == nullptr || !first.m_object->is_array() || first.idx_ < 0 ||
-            last.idx_ < first.idx_ ||
-            static_cast<std::size_t>(last.idx_) > first.m_object->m_value.array->size()) {
+        if (first.m_object == nullptr || !first.m_object->is_array()) {
             throw invalid_iterator::create(204, "iterators out of range");
         }
-        m_value.array->insert(m_value.array->begin() + pos.idx_,
-                              first.m_object->m_value.array->begin() + first.idx_,
-                              first.m_object->m_value.array->begin() + last.idx_);
+        const auto* src_arr = first.m_object->const_array();
+        if (first.idx_ < 0 || last.idx_ < first.idx_ ||
+            static_cast<std::size_t>(last.idx_) > src_arr->size()) {
+            throw invalid_iterator::create(204, "iterators out of range");
+        }
+        auto* arr = mutable_array();
+        arr->insert(arr->begin() + pos.idx_, src_arr->begin() + first.idx_,
+                    src_arr->begin() + last.idx_);
         return iterator(this, pos.idx_);
     }
 
@@ -4250,9 +4398,10 @@ public:
         if (pos.m_object != this) {
             throw invalid_iterator::create(202, "iterator does not fit current value");
         }
+        auto* arr = mutable_array();
         auto offset = pos.idx_;
         for (const auto& elem : ilist) {
-            m_value.array->insert(m_value.array->begin() + offset, elem.moved_or_copied());
+            arr->insert(arr->begin() + offset, elem.moved_or_copied());
             ++offset;
         }
         return iterator(this, pos.idx_);
@@ -4268,12 +4417,14 @@ public:
         if (first.m_object == nullptr || first.m_object->m_type != value_t::object) {
             throw invalid_iterator::create(202, "iterators first and last must point to objects");
         }
+        const auto* src_obj = first.m_object->const_object();
         if (first.idx_ < 0 || last.idx_ < first.idx_ ||
-            static_cast<std::size_t>(last.idx_) > first.m_object->m_value.object->size()) {
+            static_cast<std::size_t>(last.idx_) > src_obj->size()) {
             throw invalid_iterator::create(204, "iterators out of range");
         }
+        auto* obj = mutable_object();
         for (auto it = first; it != last; ++it) {
-            m_value.object->insert(std::make_pair(it.key(), *it));
+            obj->insert(std::make_pair(it.key(), *it));
         }
     }
 
@@ -4297,32 +4448,35 @@ public:
                 312, std::string("cannot use update() with ") +
                          (first.m_object ? first.m_object->type_name() : "null"));
         }
+        const auto* src_obj = first.m_object->const_object();
         if (first.idx_ < 0 || last.idx_ < first.idx_ ||
-            static_cast<std::size_t>(last.idx_) > first.m_object->m_value.object->size()) {
+            static_cast<std::size_t>(last.idx_) > src_obj->size()) {
             throw invalid_iterator::create(204, "iterators out of range");
         }
         if (first.m_object == this) {
             return;
         }
+        auto* obj = mutable_object();
         for (auto it = first; it != last; ++it) {
             if (merge_objects && it.value().is_object()) {
-                auto existing = m_value.object->find(it.key());
-                if (existing != m_value.object->end()) {
+                auto existing = obj->find(it.key());
+                if (existing != obj->end()) {
                     existing->second.update(it.value(), true);
                     continue;
                 }
             }
-            (*m_value.object)[it.key()] = it.value();
+            (*obj)[it.key()] = it.value();
         }
     }
 
     void erase(const size_type idx) {
         if (is_array()) {
-            if (idx >= size()) {
+            auto* arr = mutable_array();
+            if (idx >= arr->size()) {
                 throw out_of_range::create(
                     401, "array index " + std::to_string(idx) + " is out of range");
             }
-            m_value.array->erase(m_value.array->begin() + static_cast<difference_type>(idx));
+            arr->erase(arr->begin() + static_cast<difference_type>(idx));
         } else {
             throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
         }
@@ -4330,7 +4484,7 @@ public:
 
     size_type erase(const typename object_t::key_type& key) {
         if (is_object()) {
-            return m_value.object->erase(key);
+            return mutable_object()->erase(key);
         }
         throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
     }
@@ -4339,7 +4493,7 @@ public:
               std::enable_if_t<std::is_same<std::remove_cv_t<CharT>, char>::value, int> = 0>
     size_type erase(CharT* key) {
         if (is_object()) {
-            return m_value.object->erase(std::string_view(key));
+            return mutable_object()->erase(std::string_view(key));
         }
         throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
     }
@@ -4354,7 +4508,7 @@ public:
                   int> = 0>
     size_type erase(const KeyType& key) {
         if (is_object()) {
-            return m_value.object->erase(std::string_view(key));
+            return mutable_object()->erase(std::string_view(key));
         }
         throw type_error::create(307, std::string("cannot use erase() with ") + type_name());
     }
@@ -4384,19 +4538,19 @@ public:
                 return IteratorType(this, 0);
             }
             case value_t::object: {
-                if (pos.idx_ < 0 ||
-                    static_cast<std::size_t>(pos.idx_) >= m_value.object->size()) {
+                auto* obj = mutable_object();
+                if (pos.idx_ < 0 || static_cast<std::size_t>(pos.idx_) >= obj->size()) {
                     throw invalid_iterator::create(205, "iterator out of range");
                 }
-                m_value.object->erase(m_value.object->begin() + pos.idx_);
+                obj->erase(obj->begin() + pos.idx_);
                 return IteratorType(this, pos.idx_);
             }
             case value_t::array: {
-                if (pos.idx_ < 0 ||
-                    static_cast<std::size_t>(pos.idx_) >= m_value.array->size()) {
+                auto* arr = mutable_array();
+                if (pos.idx_ < 0 || static_cast<std::size_t>(pos.idx_) >= arr->size()) {
                     throw invalid_iterator::create(205, "iterator out of range");
                 }
-                m_value.array->erase(m_value.array->begin() + pos.idx_);
+                arr->erase(arr->begin() + pos.idx_);
                 return IteratorType(this, pos.idx_);
             }
             default:
@@ -4430,21 +4584,21 @@ public:
                 return IteratorType(this, 0);
             }
             case value_t::object: {
-                const auto sz = static_cast<difference_type>(m_value.object->size());
+                auto* obj = mutable_object();
+                const auto sz = static_cast<difference_type>(obj->size());
                 if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.object->erase(m_value.object->begin() + first.idx_,
-                                      m_value.object->begin() + last.idx_);
+                obj->erase(obj->begin() + first.idx_, obj->begin() + last.idx_);
                 return IteratorType(this, first.idx_);
             }
             case value_t::array: {
-                const auto sz = static_cast<difference_type>(m_value.array->size());
+                auto* arr = mutable_array();
+                const auto sz = static_cast<difference_type>(arr->size());
                 if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.array->erase(m_value.array->begin() + first.idx_,
-                                     m_value.array->begin() + last.idx_);
+                arr->erase(arr->begin() + first.idx_, arr->begin() + last.idx_);
                 return IteratorType(this, first.idx_);
             }
             default:
@@ -4455,12 +4609,13 @@ public:
 
     void swap(reference other) noexcept {
         std::swap(m_type, other.m_type);
+        std::swap(m_storage, other.m_storage);
         std::swap(m_value, other.m_value);
     }
 
     void swap(array_t& other) {
         if (is_array()) {
-            std::swap(*(m_value.array), other);
+            std::swap(*mutable_array(), other);
         } else {
             throw type_error::create(
                 310, std::string("cannot use swap(array_t&) with ") + type_name());
@@ -4469,7 +4624,7 @@ public:
 
     void swap(object_t& other) {
         if (is_object()) {
-            std::swap(*(m_value.object), other);
+            std::swap(*mutable_object(), other);
         } else {
             throw type_error::create(
                 310, std::string("cannot use swap(object_t&) with ") + type_name());
@@ -4504,6 +4659,9 @@ public:
     }
 
     friend bool operator==(const json& lhs, const json& rhs) noexcept {
+        if (lhs.m_storage != 0u || rhs.m_storage != 0u) {
+            return detail::lazy_equal(lhs, rhs);
+        }
         const auto lhs_type = lhs.type();
         const auto rhs_type = rhs.type();
         if (lhs_type == rhs_type) {
@@ -4616,6 +4774,9 @@ public:
     }
 
     friend bool operator<(const json& lhs, const json& rhs) noexcept {
+        if (lhs.m_storage != 0u || rhs.m_storage != 0u) {
+            return detail::lazy_less(lhs, rhs);
+        }
         const auto lhs_type = lhs.type();
         const auto rhs_type = rhs.type();
         if (lhs_type == rhs_type) {
@@ -4791,6 +4952,8 @@ public:
 
     // ==================== Dump & Stream Output ====================
 
+    void materialize() { detail::lazy_materialize_deep(*this); }
+
     string_t dump(int indent = -1, char indent_char = ' ', bool ensure_ascii = false,
                   error_handler_t error_handler = error_handler_t::strict) const;
 
@@ -4875,16 +5038,16 @@ public:
 
 private:
     object_t* get_impl_ptr(object_t* /*unused*/) noexcept {
-        return is_object() ? m_value.object : nullptr;
+        return is_object() ? mutable_object() : nullptr;
     }
-    constexpr const object_t* get_impl_ptr(const object_t* /*unused*/) const noexcept {
-        return is_object() ? m_value.object : nullptr;
+    const object_t* get_impl_ptr(const object_t* /*unused*/) const noexcept {
+        return is_object() ? const_object() : nullptr;
     }
     array_t* get_impl_ptr(array_t* /*unused*/) noexcept {
-        return is_array() ? m_value.array : nullptr;
+        return is_array() ? mutable_array() : nullptr;
     }
-    constexpr const array_t* get_impl_ptr(const array_t* /*unused*/) const noexcept {
-        return is_array() ? m_value.array : nullptr;
+    const array_t* get_impl_ptr(const array_t* /*unused*/) const noexcept {
+        return is_array() ? const_array() : nullptr;
     }
     string_t* get_impl_ptr(string_t* /*unused*/) noexcept {
         return is_string() ? m_value.string : nullptr;
@@ -4932,7 +5095,7 @@ public:
                   std::is_pointer<PointerType>::value &&
                       std::is_const<typename std::remove_pointer<PointerType>::type>::value,
                   int>::type = 0>
-    constexpr auto get_ptr() const noexcept
+    auto get_ptr() const noexcept
         -> decltype(std::declval<const json&>().get_impl_ptr(std::declval<PointerType>())) {
         return get_impl_ptr(static_cast<PointerType>(nullptr));
     }
@@ -5083,6 +5246,7 @@ public:
 
 private:
     value_t m_type = value_t::null;
+    std::uint8_t m_storage = 0u;
     json_value m_value{};
 };
 
@@ -5209,10 +5373,11 @@ inline void json::patch_inplace(const json& json_patch) {
 
         const auto get_member = [&val](const std::string& op, const std::string& member,
                                        bool string_type) -> const json& {
-            auto it = val.m_value.object->find(member);
+            const auto* val_obj = val.const_object();
+            auto it = val_obj->find(member);
             const std::string error_msg =
                 (op == "op") ? "operation" : ("operation '" + op + "'");
-            if (it == val.m_value.object->end()) {
+            if (it == val_obj->end()) {
                 throw parse_error::create(
                     105, 0, error_msg + " must have member '" + member + "'");
             }
