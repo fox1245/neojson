@@ -344,8 +344,8 @@ inline std::uint64_t hash_bytes(const char* data, const std::size_t len) noexcep
             std::uint64_t b = 0;
             std::memcpy(&a, p, 8);
             std::memcpy(&b, p + len - 8, 8);
-            h ^= a * 0xbf58476d1ce4e5b9ULL;
-            h = rotl64(h, 27u) ^ (b * 0x94d049bb133111ebULL);
+            h = (h ^ a) * 0xbf58476d1ce4e5b9ULL;
+            h = (rotl64(h, 27u) ^ b) * 0x94d049bb133111ebULL;
             return fmix64(h);
         }
         if (len >= 4) {

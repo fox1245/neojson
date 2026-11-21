@@ -1821,6 +1821,8 @@ struct json_access {
     }
 };
 
+namespace {
+
 struct SharedYyDoc {
     std::atomic<std::uint32_t> refcount{1u};
     std::atomic<bool> tree_unique_verified{false};
@@ -1841,7 +1843,11 @@ inline void shared_doc_release(SharedYyDoc* sdoc) noexcept {
 struct LazyNode : LazyHeader {
     SharedYyDoc* doc;
     yyjson_val* val;
+#if __cplusplus >= 202002L || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
+    std::atomic_flag init_lock{};
+#else
     std::atomic_flag init_lock = ATOMIC_FLAG_INIT;
+#endif
     std::atomic<std::uint8_t> lookup_probes{0u};
 
     LazyNode(SharedYyDoc* d, yyjson_val* v) noexcept
@@ -1854,8 +1860,13 @@ static_assert(sizeof(LazyNode) <= 48u, "LazyNode should fit in small pooled slab
 struct SpinGuard {
     std::atomic_flag& flag;
     explicit SpinGuard(std::atomic_flag& f) noexcept : flag(f) {
+        std::uint32_t spins = 0u;
         while (flag.test_and_set(std::memory_order_acquire)) {
-            cpu_relax();
+            if (++spins < 64u) {
+                cpu_relax();
+            } else {
+                std::this_thread::yield();
+            }
         }
     }
     ~SpinGuard() {
@@ -1864,6 +1875,23 @@ struct SpinGuard {
     SpinGuard(const SpinGuard&) = delete;
     SpinGuard& operator=(const SpinGuard&) = delete;
 };
+
+NEOJSON_NOINLINE bool check_large_object_unique_sorted(yyjson_val* obj, const std::size_t len) {
+    std::vector<std::string_view> keys;
+    keys.reserve(len);
+    yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
+    yyjson_val* key = nullptr;
+    while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+        keys.emplace_back(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+    }
+    std::sort(keys.begin(), keys.end());
+    for (std::size_t i = 1u; i < keys.size(); ++i) {
+        if (keys[i - 1u] == keys[i]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct DupProbeEntry {
     std::size_t hash = 0;
@@ -1904,6 +1932,7 @@ struct DupProbeTable {
             const std::size_t klen = unsafe_yyjson_get_len(key);
             const std::size_t h = hash_bytes(kptr, klen);
             std::size_t pos = h & mask;
+            std::size_t probes = 0u;
             for (;;) {
                 auto& e = slots[pos];
                 if (e.stamp != stamp) {
@@ -1913,6 +1942,9 @@ struct DupProbeTable {
                 if (e.hash == h && e.len == klen &&
                     (klen == 0u || std::memcmp(e.ptr, kptr, klen) == 0)) {
                     return false;
+                }
+                if (++probes >= 64u) {
+                    return check_large_object_unique_sorted(obj, len);
                 }
                 pos = (pos + 1u) & mask;
             }
@@ -2183,6 +2215,8 @@ inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
         yyjson_is_arr(root) ? value_t::array : value_t::object, node);
 }
 
+} // namespace
+
 void lazy_release(LazyHeader* hdr, const value_t type) noexcept {
     if (hdr == nullptr) {
         return;
@@ -2243,7 +2277,15 @@ void* lazy_detach_mutable(LazyHeader* hdr, const value_t type) {
                            json_access::clone_array(static_cast<const json::array_t*>(shared)))
                      : static_cast<void*>(
                            json_access::clone_object(static_cast<const json::object_t*>(shared)));
-    lazy_release(hdr, type);
+    if (node->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+        json_access::destroy_erased_container(copy, type);
+        void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
+        SharedYyDoc* sdoc = node->doc;
+        node->~LazyNode();
+        pool_free(node, sizeof(LazyNode));
+        shared_doc_release(sdoc);
+        return mat;
+    }
     return copy;
 }
 
@@ -2303,6 +2345,21 @@ bool lazy_contains(LazyHeader* hdr, const std::string_view key) {
 }
 
 void* lazy_clear(LazyHeader* hdr, const value_t type) noexcept {
+    auto* node = static_cast<LazyNode*>(hdr);
+    if (node->refcount.load(std::memory_order_acquire) == 1u) {
+        if (void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel)) {
+            if (type == value_t::array) {
+                static_cast<json::array_t*>(mat)->clear();
+            } else {
+                static_cast<json::object_t*>(mat)->clear();
+            }
+            SharedYyDoc* sdoc = node->doc;
+            node->~LazyNode();
+            pool_free(node, sizeof(LazyNode));
+            shared_doc_release(sdoc);
+            return mat;
+        }
+    }
     try {
         void* empty = (type == value_t::array)
                           ? static_cast<void*>(json_access::create_array_cap(0u))
@@ -2599,13 +2656,11 @@ void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const valu
     bool saw_dup = false;
     dump_yyjson_val_compact_strict(out, node->doc, node->val, saw_dup,
                                    type == value_t::object ? node->val : nullptr);
-    if (!saw_dup) {
-        if (type == value_t::object) {
-            node->dedup_state.store(1u, std::memory_order_release);
-        }
-        if (node->val == yyjson_doc_get_root(node->doc->doc)) {
-            node->doc->tree_unique_verified.store(true, std::memory_order_release);
-        }
+    if (type == value_t::object) {
+        node->dedup_state.store(1u, std::memory_order_release);
+    }
+    if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
+        node->doc->tree_unique_verified.store(true, std::memory_order_release);
     }
 }
 
@@ -2909,13 +2964,11 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
     dump_yyjson_val(out, node->doc, node->val, pretty_print, ensure_ascii, error_handler,
                     indent_step, indent_string, current_indent, saw_dup,
                     type == value_t::object ? node->val : nullptr);
-    if (!saw_dup) {
-        if (type == value_t::object) {
-            node->dedup_state.store(1u, std::memory_order_release);
-        }
-        if (node->val == yyjson_doc_get_root(node->doc->doc)) {
-            node->doc->tree_unique_verified.store(true, std::memory_order_release);
-        }
+    if (type == value_t::object) {
+        node->dedup_state.store(1u, std::memory_order_release);
+    }
+    if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
+        node->doc->tree_unique_verified.store(true, std::memory_order_release);
     }
 }
 

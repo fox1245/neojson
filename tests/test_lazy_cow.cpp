@@ -4,7 +4,9 @@
 #include "small_stack.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -547,6 +549,153 @@ TEST(LazyCow, PointerPatchDiffFlattenAndConversionsOnLazy) {
         jk j = jk::parse(lazy_container);
         j = std::map<std::string, int>{{"m", 7}};
         EXPECT_EQ(j["m"], 7);
+    }
+}
+
+TEST(LazyCow, ClearInPlaceStealAndSharedIsolation) {
+    const std::string obj_raw = R"({"k0":1,"k1":2,"k2":[10,20,30,40,50],"dup":1,"dup":2})";
+    jk l_obj = jk::parse(obj_raw);
+    const jk::object_t* obj_ptr_before = std::as_const(l_obj).get_ptr<const jk::object_t*>();
+    ASSERT_NE(obj_ptr_before, nullptr);
+    l_obj.clear();
+    EXPECT_TRUE(l_obj.is_object());
+    EXPECT_TRUE(l_obj.empty());
+    EXPECT_EQ(l_obj.size(), 0u);
+    EXPECT_EQ(l_obj.dump(), "{}");
+    EXPECT_EQ(l_obj.get_ptr<jk::object_t*>(), obj_ptr_before);
+
+    const std::string arr_raw = R"([1,2,3,4,5,[6,7,8,9,10]])";
+    jk l_arr = jk::parse(arr_raw);
+    const jk::array_t* arr_ptr_before = std::as_const(l_arr).get_ptr<const jk::array_t*>();
+    ASSERT_NE(arr_ptr_before, nullptr);
+    l_arr.clear();
+    EXPECT_TRUE(l_arr.is_array());
+    EXPECT_TRUE(l_arr.empty());
+    EXPECT_EQ(l_arr.size(), 0u);
+    EXPECT_EQ(l_arr.dump(), "[]");
+    EXPECT_EQ(l_arr.get_ptr<jk::array_t*>(), arr_ptr_before);
+
+    // Clearing a shared lazy object leaves sibling copy untouched.
+    const oj o_obj = oj::parse(obj_raw);
+    jk s1 = jk::parse(obj_raw);
+    jk s2 = s1;
+    s1.clear();
+    EXPECT_TRUE(s1.empty());
+    EXPECT_EQ(s1.dump(), "{}");
+    neojson::test::assert_equivalent(o_obj, s2);
+
+    // Clearing an unmaterialized sole-owner lazy array/object also empties cleanly.
+    jk u_obj = jk::parse(obj_raw);
+    u_obj.clear();
+    EXPECT_TRUE(u_obj.is_object());
+    EXPECT_EQ(u_obj.dump(), "{}");
+    jk u_arr = jk::parse(arr_raw);
+    u_arr.clear();
+    EXPECT_TRUE(u_arr.is_array());
+    EXPECT_EQ(u_arr.dump(), "[]");
+}
+
+TEST(LazyCow, ConcurrentDetachWhileSiblingReleases) {
+    const std::string raw = R"({
+        "a": [1, 2, 3, 4, 5],
+        "b": {"x": 10, "y": [100, 200, 300, 400, 500], "z": "hello"},
+        "k0": 0, "k1": 1, "k2": 2, "k3": 3, "k4": 4, "k5": 5
+    })";
+    const oj o_base = oj::parse(raw);
+
+    for (int iter = 0; iter < 64; ++iter) {
+        jk j = jk::parse(raw);
+        jk k = j;
+        if ((iter & 1) != 0) {
+            EXPECT_TRUE(std::as_const(j).contains("b"));
+            EXPECT_EQ(std::as_const(j)["b"]["y"][2], 300);
+        }
+        std::atomic<bool> go{false};
+        std::thread detacher([&]() {
+            while (!go.load(std::memory_order_acquire)) {
+            }
+            const jk rhs = std::as_const(j)["b"];
+            j["a"] = rhs;
+            j["z"] = iter;
+        });
+        std::thread releaser([&]() {
+            while (!go.load(std::memory_order_acquire)) {
+            }
+            jk doomed = std::move(k);
+        });
+        go.store(true, std::memory_order_release);
+        detacher.join();
+        releaser.join();
+
+        oj o_expected = o_base;
+        o_expected["a"] = o_expected["b"];
+        o_expected["z"] = iter;
+        neojson::test::assert_equivalent(o_expected, j);
+    }
+
+    // Sole-owner const-materialized self-assignment steals backing storage in place.
+    jk sole = jk::parse(raw);
+    const jk::object_t* sole_ptr_before = std::as_const(sole).get_ptr<const jk::object_t*>();
+    ASSERT_NE(sole_ptr_before, nullptr);
+    sole["a"] = std::as_const(sole)["b"];
+    EXPECT_EQ(sole.get_ptr<jk::object_t*>(), sole_ptr_before);
+    oj o_expected = o_base;
+    o_expected["a"] = o_expected["b"];
+    neojson::test::assert_equivalent(o_expected, sole);
+}
+
+TEST(LazyCow, NestedDuplicateOuterUniqueCachingAndLargeKeys) {
+    // Outer object is unique while nested object contains duplicate keys.
+    const std::string nested_dup = R"({
+        "outer_a": {"d": 1, "d": 2, "e": 3},
+        "outer_b": [1, 2, 3, 4, 5],
+        "outer_c": {"x": 10, "y": {"k": 1, "k": 2, "m": 9}}
+    })";
+    const oj o_nested = oj::parse(nested_dup);
+    const jk l_nested = jk::parse(nested_dup);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(l_nested.size(), o_nested.size());
+        EXPECT_EQ(l_nested.dump(), o_nested.dump());
+        EXPECT_EQ(l_nested.dump(2), o_nested.dump(2));
+    }
+    jk detached = l_nested;
+    detached.materialize();
+    neojson::test::assert_equivalent(o_nested, detached);
+
+    // 130 distinct 16-byte keys intentionally colliding in bucket 0 (cap <= 512) to exercise
+    // DupProbeTable's >=64-probe O(n log n) sorted fallback on both unique and duplicate inputs.
+    std::vector<std::string> flood_keys;
+    flood_keys.reserve(130);
+    for (std::uint64_t idx = 0; flood_keys.size() < 130; ++idx) {
+        std::string key(16, 'a');
+        std::uint64_t t = idx;
+        for (unsigned pos = 0; pos < 16 && t > 0; ++pos) {
+            key[pos] = static_cast<char>('a' + (t % 26ULL));
+            t /= 26ULL;
+        }
+        if ((neojson::detail::hash_bytes(key.data(), key.size()) & 511u) == 0u) {
+            flood_keys.push_back(std::move(key));
+        }
+    }
+    ASSERT_EQ(flood_keys.size(), 130u);
+
+    std::string flood_unique_json = "{";
+    for (std::size_t i = 0; i < flood_keys.size(); ++i) {
+        if (i > 0) {
+            flood_unique_json.push_back(',');
+        }
+        flood_unique_json.push_back('"');
+        flood_unique_json += flood_keys[i];
+        flood_unique_json += "\":" + std::to_string(i);
+    }
+    std::string flood_dup_json = flood_unique_json + ",\"" + flood_keys[0] + "\":99999}";
+    flood_unique_json.push_back('}');
+
+    for (const std::string& json_text : {flood_unique_json, flood_dup_json}) {
+        const oj o_flood = oj::parse(json_text);
+        const jk l_flood = jk::parse(json_text);
+        EXPECT_EQ(l_flood.size(), o_flood.size());
+        EXPECT_EQ(l_flood.dump(), o_flood.dump());
     }
 }
 
