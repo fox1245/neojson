@@ -20,10 +20,10 @@ namespace {
 using jk = neojson::json;
 
 TEST(SlabPool, AllSizeClassesAndLargeFallbackAreAligned) {
-    const std::array<std::size_t, 24> sizes = {{
-        0,   1,   8,   16,  17,  32,  33,  48,
-        49,  64,  65,  96,  97,  128, 129, 192,
-        193, 256, 257, 384, 385, 512, 513, 2048,
+    const std::array<std::size_t, 36> sizes = {{
+        0,    1,    8,    16,   17,   32,   33,   48,   49,   64,   65,   96,
+        97,   128,  129,  192,  193,  256,  257,  384,  385,  512,  513,  768,
+        769,  1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 8192,
     }};
 
     struct AllocRecord {
