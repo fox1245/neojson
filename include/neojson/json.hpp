@@ -511,10 +511,37 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         return this->back().second;
     }
 
+    template <class KeyType,
+              std::enable_if_t<std::is_convertible<const KeyType&, std::string_view>::value, int> = 0>
+    T& emplace_default_key(KeyType&& key) {
+        const std::string_view sv(key);
+        std::uint64_t h = 0;
+        const std::size_t found = find_pos_with_hash(sv, h);
+        if (found != kNpos) {
+            return (*this)[found].second;
+        }
+        const bool had_index = (m_index != nullptr);
+        ensure_index_for_next();
+        if (m_index != nullptr && !had_index) {
+            h = detail::hash_bytes(sv.data(), sv.size());
+        }
+        if (this->capacity() == 0) {
+            Container::reserve(4);
+        }
+        Container::emplace_back(
+            std::piecewise_construct,
+            std::forward_as_tuple(std::forward<KeyType>(key)),
+            std::forward_as_tuple());
+        if (m_index != nullptr) {
+            insert_index_entry(this->size() - 1, h);
+        }
+        return this->back().second;
+    }
+
     using Container::operator[];
 
     T& operator[](const key_type& key) {
-        return emplace(key, T{}).first->second;
+        return emplace_default_key(key);
     }
 
     template <class KeyType,
@@ -523,7 +550,7 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
                                    !std::is_integral<std::decay_t<KeyType>>::value,
                                int> = 0>
     T& operator[](KeyType&& key) {
-        return emplace(std::forward<KeyType>(key), T{}).first->second;
+        return emplace_default_key(std::forward<KeyType>(key));
     }
 
     const T& operator[](const key_type& key) const {
@@ -3315,6 +3342,16 @@ public:
 
     json(initializer_list_t init, bool type_deduction = true,
          value_t manual_type = value_t::array) {
+        if (init.size() == 0) {
+            if (!type_deduction && manual_type == value_t::array) {
+                m_value.array = create_array();
+                m_type = value_t::array;
+            } else {
+                m_value.object = create_object();
+                m_type = value_t::object;
+            }
+            return;
+        }
         bool is_an_object = std::all_of(
             init.begin(), init.end(), [](const detail::json_ref<json>& element_ref) {
                 return element_ref->is_array() && element_ref->size() == 2 &&
@@ -3476,6 +3513,11 @@ public:
 
     json& operator=(json&& other) noexcept {
         if (this != &other) {
+            if (m_type == value_t::null) {
+                m_type = std::exchange(other.m_type, value_t::null);
+                m_value = std::exchange(other.m_value, json_value{});
+                return *this;
+            }
             json tmp(std::move(other));
             swap(tmp);
         }
