@@ -56,6 +56,14 @@ std::uint64_t hash_seed() noexcept {
     return seed;
 }
 
+[[noreturn]] void throw_invalid_iterator(const int id, const char* msg) {
+    throw invalid_iterator::create(id, msg);
+}
+
+[[noreturn]] void throw_type_error(const int id, const char* prefix, const char* type_name) {
+    throw type_error::create(id, std::string(prefix) + type_name);
+}
+
 namespace {
 
 inline constexpr std::size_t kSlabSize = 65536;
@@ -1729,7 +1737,7 @@ struct json_access {
         return *j.m_value.object;
     }
 
-    static json make_lazy(const json::value_t type, LazyNode* node) noexcept {
+    static json make_lazy(const json::value_t type, LazyHeader* node) noexcept {
         json j;
         j.m_type = type;
         j.m_storage = 1u;
@@ -1741,7 +1749,7 @@ struct json_access {
         return j.m_storage != 0u;
     }
 
-    static LazyNode* lazy_node(const json& j) noexcept {
+    static LazyHeader* lazy_node(const json& j) noexcept {
         return j.m_value.lazy;
     }
 
@@ -1790,9 +1798,11 @@ struct json_access {
             return;
         }
         if (type == json::value_t::array) {
-            json::destroy_array(static_cast<json::array_t*>(ptr));
+            auto* arr = static_cast<json::array_t*>(ptr);
+            json::json_value::destroy_container(arr);
         } else {
-            json::destroy_object(static_cast<json::object_t*>(ptr));
+            auto* obj = static_cast<json::object_t*>(ptr);
+            json::json_value::destroy_container(obj);
         }
     }
 
@@ -1802,16 +1812,14 @@ struct json_access {
         j.m_value.array = arr;
         return j;
     }
+
+    static json make_from_object_ptr(json::object_t* obj) noexcept {
+        json j;
+        j.m_type = json::value_t::object;
+        j.m_value.object = obj;
+        return j;
+    }
 };
-
-
-#if defined(__GNUC__) || defined(__clang__)
-#define NEOJSON_NOINLINE __attribute__((noinline))
-#elif defined(_MSC_VER)
-#define NEOJSON_NOINLINE __declspec(noinline)
-#else
-#define NEOJSON_NOINLINE
-#endif
 
 struct SharedYyDoc {
     std::atomic<std::uint32_t> refcount{1u};
@@ -1821,27 +1829,25 @@ struct SharedYyDoc {
     explicit SharedYyDoc(yyjson_doc* d) noexcept : doc(d) {}
 };
 
-inline void shared_doc_retain(SharedYyDoc* sdoc) noexcept {
-    sdoc->refcount.fetch_add(1u, std::memory_order_relaxed);
-}
-
 inline void shared_doc_release(SharedYyDoc* sdoc) noexcept {
-    if (sdoc != nullptr && sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+    if (sdoc != nullptr &&
+        (sdoc->refcount.load(std::memory_order_acquire) == 1u ||
+         sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u)) {
         yyjson_doc_free(sdoc->doc);
         delete sdoc;
     }
 }
 
-struct LazyNode {
-    std::atomic<std::uint32_t> refcount{1u};
-    std::atomic<std::uint8_t> dedup_state{0u};
-    std::atomic<std::uint8_t> lookup_probes{0u};
-    std::atomic_flag init_lock = ATOMIC_FLAG_INIT;
+struct LazyNode : LazyHeader {
     SharedYyDoc* doc;
     yyjson_val* val;
-    std::atomic<void*> materialized{nullptr};
+    std::atomic_flag init_lock = ATOMIC_FLAG_INIT;
+    std::atomic<std::uint8_t> lookup_probes{0u};
 
-    LazyNode(SharedYyDoc* d, yyjson_val* v) noexcept : doc(d), val(v) {}
+    LazyNode(SharedYyDoc* d, yyjson_val* v) noexcept
+        : LazyHeader(), doc(d), val(v) {
+        raw_len = unsafe_yyjson_get_len(v);
+    }
 };
 static_assert(sizeof(LazyNode) <= 48u, "LazyNode should fit in small pooled slab");
 
@@ -1986,7 +1992,44 @@ json make_node(yyjson_val* val) {
 }
 
 
-inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val) {
+struct DocRefBatch {
+    SharedYyDoc* sdoc;
+    std::size_t credit = 0u;
+
+    explicit DocRefBatch(SharedYyDoc* d) noexcept : sdoc(d) {}
+
+    ~DocRefBatch() noexcept {
+        if (credit > 0u) {
+            const std::uint32_t sub = static_cast<std::uint32_t>(credit);
+            if (sdoc->refcount.fetch_sub(sub, std::memory_order_acq_rel) == sub) {
+                yyjson_doc_free(sdoc->doc);
+                delete sdoc;
+            }
+        }
+    }
+
+    DocRefBatch(const DocRefBatch&) = delete;
+    DocRefBatch& operator=(const DocRefBatch&) = delete;
+
+    void take(const std::size_t remaining_hint) noexcept {
+        if (credit == 0u) {
+            const std::size_t chunk = (remaining_hint > 0u && remaining_hint < 16u)
+                                          ? remaining_hint
+                                          : 16u;
+            sdoc->refcount.fetch_add(static_cast<std::uint32_t>(chunk),
+                                      std::memory_order_relaxed);
+            credit = chunk;
+        }
+        --credit;
+    }
+
+    void unget() noexcept {
+        ++credit;
+    }
+};
+
+inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& batch,
+                            const std::size_t remaining_hint) {
     if (!yyjson_is_ctn(val)) {
         return make_node(val);
     }
@@ -2027,21 +2070,53 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val) {
             guard.p = nullptr;
             return json_access::make_from_array_ptr(arr);
         }
+    } else if (!is_arr && len <= 4u) {
+        bool cheap_leaf = true;
+        yyjson_obj_iter it = yyjson_obj_iter_with(val);
+        yyjson_val* k = nullptr;
+        while ((k = yyjson_obj_iter_next(&it)) != nullptr) {
+            yyjson_val* v = yyjson_obj_iter_get_val(k);
+            if (unsafe_yyjson_get_len(k) > 32u ||
+                (yyjson_is_ctn(v) ? (unsafe_yyjson_get_len(v) != 0u) : yyjson_is_str(v))) {
+                cheap_leaf = false;
+                break;
+            }
+        }
+        if (cheap_leaf) {
+            json::object_t* obj = json_access::create_object_cap(len);
+            struct ObjGuard {
+                json::object_t* p;
+                ~ObjGuard() {
+                    if (p != nullptr) {
+                        json_access::destroy_erased_container(p, value_t::object);
+                    }
+                }
+            } guard{obj};
+            yyjson_obj_iter fill_it = yyjson_obj_iter_with(val);
+            while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
+                yyjson_val* v = yyjson_obj_iter_get_val(k);
+                const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                obj->emplace_or_assign_key(kv, make_node(v));
+            }
+            guard.p = nullptr;
+            return json_access::make_from_object_ptr(obj);
+        }
     }
-    shared_doc_retain(sdoc);
+    batch.take(remaining_hint);
     void* mem = nullptr;
     try {
         mem = pool_alloc(sizeof(LazyNode));
     } catch (...) {
-        shared_doc_release(sdoc);
+        batch.unget();
         throw;
     }
     auto* node = new (mem) LazyNode(sdoc, val);
     return json_access::make_lazy(is_arr ? value_t::array : value_t::object, node);
 }
 
-inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val) {
+inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool known_unique) {
     const std::size_t len = unsafe_yyjson_get_len(val);
+    DocRefBatch batch(sdoc);
     if (yyjson_is_arr(val)) {
         json::array_t* arr = json_access::create_array_cap(len);
         struct ArrGuard {
@@ -2054,7 +2129,7 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val) {
         } guard{arr};
         yyjson_val* cur = unsafe_yyjson_get_first(val);
         for (std::size_t i = 0u; i < len; ++i) {
-            arr->emplace_back(make_lazy_child(sdoc, cur));
+            arr->emplace_back(make_lazy_child(sdoc, cur, batch, len - i));
             if (i + 1u < len) {
                 cur = unsafe_yyjson_get_next(cur);
             }
@@ -2073,10 +2148,21 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val) {
     } guard{obj};
     yyjson_obj_iter iter = yyjson_obj_iter_with(val);
     yyjson_val* key = nullptr;
-    while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
-        yyjson_val* cval = yyjson_obj_iter_get_val(key);
-        const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
-        obj->emplace_or_assign_key(k, make_lazy_child(sdoc, cval));
+    std::size_t rem = len;
+    if (known_unique) {
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            yyjson_val* cval = yyjson_obj_iter_get_val(key);
+            const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+            obj->emplace_back_unique_key(k, make_lazy_child(sdoc, cval, batch, rem));
+            --rem;
+        }
+    } else {
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            yyjson_val* cval = yyjson_obj_iter_get_val(key);
+            const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
+            obj->emplace_or_assign_key(k, make_lazy_child(sdoc, cval, batch, rem));
+            --rem;
+        }
     }
     guard.p = nullptr;
     return obj;
@@ -2097,17 +2183,13 @@ inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
         yyjson_is_arr(root) ? value_t::array : value_t::object, node);
 }
 
-void lazy_retain(LazyNode* node) noexcept {
-    if (node != nullptr) {
-        node->refcount.fetch_add(1u, std::memory_order_relaxed);
-    }
-}
-
-void lazy_release(LazyNode* node, const value_t type) noexcept {
-    if (node == nullptr) {
+void lazy_release(LazyHeader* hdr, const value_t type) noexcept {
+    if (hdr == nullptr) {
         return;
     }
-    if (node->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+    auto* node = static_cast<LazyNode*>(hdr);
+    if (node->refcount.load(std::memory_order_acquire) == 1u ||
+        node->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
         void* mat = node->materialized.load(std::memory_order_acquire);
         SharedYyDoc* sdoc = node->doc;
         node->~LazyNode();
@@ -2119,8 +2201,8 @@ void lazy_release(LazyNode* node, const value_t type) noexcept {
     }
 }
 
-const void* lazy_materialize_const(LazyNode* node, const value_t type) {
-    (void)type;
+const void* lazy_materialize_const(LazyHeader* hdr, const value_t type) {
+    auto* node = static_cast<LazyNode*>(hdr);
     void* existing = node->materialized.load(std::memory_order_acquire);
     if (existing != nullptr) {
         return existing;
@@ -2128,17 +2210,26 @@ const void* lazy_materialize_const(LazyNode* node, const value_t type) {
     SpinGuard guard(node->init_lock);
     existing = node->materialized.load(std::memory_order_relaxed);
     if (existing == nullptr) {
-        existing = shallow_materialize(node->doc, node->val);
+        const bool known_unique =
+            (type == value_t::object) &&
+            (node->dedup_state.load(std::memory_order_acquire) == 1u ||
+             node->doc->tree_unique_verified.load(std::memory_order_acquire));
+        existing = shallow_materialize(node->doc, node->val, known_unique);
         node->materialized.store(existing, std::memory_order_release);
     }
     return existing;
 }
 
-void* lazy_detach_mutable(LazyNode* node, const value_t type) {
+void* lazy_detach_mutable(LazyHeader* hdr, const value_t type) {
+    auto* node = static_cast<LazyNode*>(hdr);
     if (node->refcount.load(std::memory_order_acquire) == 1u) {
         void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
         if (mat == nullptr) {
-            mat = shallow_materialize(node->doc, node->val);
+            const bool known_unique =
+                (type == value_t::object) &&
+                (node->dedup_state.load(std::memory_order_acquire) == 1u ||
+                 node->doc->tree_unique_verified.load(std::memory_order_acquire));
+            mat = shallow_materialize(node->doc, node->val, known_unique);
         }
         SharedYyDoc* sdoc = node->doc;
         node->~LazyNode();
@@ -2146,19 +2237,20 @@ void* lazy_detach_mutable(LazyNode* node, const value_t type) {
         shared_doc_release(sdoc);
         return mat;
     }
-    const void* shared = lazy_materialize_const(node, type);
+    const void* shared = lazy_materialize_const(hdr, type);
     void* copy = (type == value_t::array)
                      ? static_cast<void*>(
                            json_access::clone_array(static_cast<const json::array_t*>(shared)))
                      : static_cast<void*>(
                            json_access::clone_object(static_cast<const json::object_t*>(shared)));
-    lazy_release(node, type);
+    lazy_release(hdr, type);
     return copy;
 }
 
-std::size_t lazy_size(LazyNode* node, const value_t type) noexcept {
+std::size_t lazy_size(LazyHeader* hdr, const value_t type) noexcept {
+    auto* node = static_cast<LazyNode*>(hdr);
     if (type == value_t::array) {
-        return unsafe_yyjson_get_len(node->val);
+        return node->raw_len;
     }
     void* mat = node->materialized.load(std::memory_order_acquire);
     if (mat != nullptr) {
@@ -2166,38 +2258,35 @@ std::size_t lazy_size(LazyNode* node, const value_t type) noexcept {
     }
     if (node->doc->tree_unique_verified.load(std::memory_order_acquire) ||
         node->dedup_state.load(std::memory_order_acquire) == 1u) {
-        return unsafe_yyjson_get_len(node->val);
+        return node->raw_len;
     }
     try {
         if (is_yyjson_object_unique(node->val)) {
             node->dedup_state.store(1u, std::memory_order_release);
-            return unsafe_yyjson_get_len(node->val);
+            return node->raw_len;
         }
         node->dedup_state.store(2u, std::memory_order_release);
         const auto* obj =
-            static_cast<const json::object_t*>(lazy_materialize_const(node, value_t::object));
+            static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
         return obj->size();
     } catch (...) {
         std::terminate();
     }
 }
 
-bool lazy_empty(LazyNode* node, const value_t /*type*/) noexcept {
-    return unsafe_yyjson_get_len(node->val) == 0u;
-}
-
-bool lazy_contains(LazyNode* node, const std::string_view key) {
+bool lazy_contains(LazyHeader* hdr, const std::string_view key) {
+    auto* node = static_cast<LazyNode*>(hdr);
     void* mat = node->materialized.load(std::memory_order_acquire);
     if (mat != nullptr) {
         return static_cast<const json::object_t*>(mat)->contains(key);
     }
-    const std::size_t len = unsafe_yyjson_get_len(node->val);
+    const std::size_t len = node->raw_len;
     if (len > 16u) {
         const std::uint8_t prev = node->lookup_probes.load(std::memory_order_relaxed);
         if (prev >= 3u ||
             node->lookup_probes.fetch_add(1u, std::memory_order_relaxed) >= 2u) {
             const auto* obj =
-                static_cast<const json::object_t*>(lazy_materialize_const(node, value_t::object));
+                static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
             return obj->contains(key);
         }
     }
@@ -2213,12 +2302,12 @@ bool lazy_contains(LazyNode* node, const std::string_view key) {
     return false;
 }
 
-void* lazy_clear(LazyNode* node, const value_t type) noexcept {
+void* lazy_clear(LazyHeader* hdr, const value_t type) noexcept {
     try {
         void* empty = (type == value_t::array)
                           ? static_cast<void*>(json_access::create_array_cap(0u))
                           : static_cast<void*>(json_access::create_object_cap(0u));
-        lazy_release(node, type);
+        lazy_release(hdr, type);
         return empty;
     } catch (...) {
         std::terminate();
@@ -2300,15 +2389,11 @@ void lazy_materialize_deep(json& root) {
     }
 }
 
-bool lazy_is_owned_materialized(const LazyNode* node) noexcept {
-    return node != nullptr && node->refcount.load(std::memory_order_acquire) == 1u &&
-           node->materialized.load(std::memory_order_acquire) != nullptr;
-}
-
-void* lazy_steal_owned_materialized(LazyNode* node, const value_t /*type*/) noexcept {
-    if (node == nullptr) {
+void* lazy_steal_owned_materialized(LazyHeader* hdr, const value_t /*type*/) noexcept {
+    if (hdr == nullptr) {
         return nullptr;
     }
+    auto* node = static_cast<LazyNode*>(hdr);
     void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
     if (mat == nullptr) {
         return nullptr;
@@ -2866,7 +2951,8 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
 
         case value_t::array:
             if (json_access::is_lazy(val)) {
-                dump_yyjson_node_compact_strict(out, json_access::lazy_node(val), value_t::array);
+                dump_yyjson_node_compact_strict(
+                    out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::array);
             } else {
                 dump_eager_array_compact_strict(out, json_access::array_of(val));
             }
@@ -2874,7 +2960,8 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
 
         case value_t::object:
             if (json_access::is_lazy(val)) {
-                dump_yyjson_node_compact_strict(out, json_access::lazy_node(val), value_t::object);
+                dump_yyjson_node_compact_strict(
+                    out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::object);
             } else {
                 dump_eager_object_compact_strict(out, json_access::object_of(val));
             }
@@ -2927,9 +3014,9 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
 
         case value_t::array:
             if (json_access::is_lazy(val)) {
-                dump_yyjson_node(out, json_access::lazy_node(val), value_t::array, pretty_print,
-                                 ensure_ascii, error_handler, indent_step, indent_string,
-                                 current_indent);
+                dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
+                                 value_t::array, pretty_print, ensure_ascii, error_handler,
+                                 indent_step, indent_string, current_indent);
             } else {
                 dump_eager_array_value(out, json_access::array_of(val), pretty_print, ensure_ascii,
                                        error_handler, indent_step, indent_string, current_indent);
@@ -2938,9 +3025,9 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
 
         case value_t::object:
             if (json_access::is_lazy(val)) {
-                dump_yyjson_node(out, json_access::lazy_node(val), value_t::object, pretty_print,
-                                 ensure_ascii, error_handler, indent_step, indent_string,
-                                 current_indent);
+                dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
+                                 value_t::object, pretty_print, ensure_ascii, error_handler,
+                                 indent_step, indent_string, current_indent);
             } else {
                 dump_eager_object_value(out, json_access::object_of(val), pretty_print,
                                         ensure_ascii, error_handler, indent_step, indent_string,

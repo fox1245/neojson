@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cerrno>
@@ -38,6 +39,16 @@
 #include <utility>
 #include <valarray>
 #include <vector>
+
+#ifndef NEOJSON_NOINLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define NEOJSON_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define NEOJSON_NOINLINE __declspec(noinline)
+#else
+#define NEOJSON_NOINLINE
+#endif
+#endif
 
 namespace neojson {
 
@@ -173,21 +184,26 @@ inline bool operator<(const value_t lhs, const value_t rhs) noexcept {
     return l_index < order.size() && r_index < order.size() && order[l_index] < order[r_index];
 }
 
-struct LazyNode;
+struct LazyHeader {
+    std::atomic<void*> materialized{nullptr};
+    std::size_t raw_len = 0;
+    std::atomic<std::uint32_t> refcount{1u};
+    std::atomic<std::uint8_t> dedup_state{0u};
+};
 
-void lazy_retain(LazyNode* node) noexcept;
-void lazy_release(LazyNode* node, value_t type) noexcept;
-const void* lazy_materialize_const(LazyNode* node, value_t type);
-void* lazy_detach_mutable(LazyNode* node, value_t type);
-std::size_t lazy_size(LazyNode* node, value_t type) noexcept;
-bool lazy_empty(LazyNode* node, value_t type) noexcept;
-bool lazy_contains(LazyNode* node, std::string_view key);
-void* lazy_clear(LazyNode* node, value_t type) noexcept;
+void lazy_release(LazyHeader* node, value_t type) noexcept;
+const void* lazy_materialize_const(LazyHeader* node, value_t type);
+void* lazy_detach_mutable(LazyHeader* node, value_t type);
+std::size_t lazy_size(LazyHeader* node, value_t type) noexcept;
+bool lazy_contains(LazyHeader* node, std::string_view key);
+void* lazy_clear(LazyHeader* node, value_t type) noexcept;
 bool lazy_equal(const json& lhs, const json& rhs) noexcept;
 bool lazy_less(const json& lhs, const json& rhs) noexcept;
 void lazy_materialize_deep(json& j);
-bool lazy_is_owned_materialized(const LazyNode* node) noexcept;
-void* lazy_steal_owned_materialized(LazyNode* node, value_t type) noexcept;
+void* lazy_steal_owned_materialized(LazyHeader* node, value_t type) noexcept;
+
+[[noreturn]] void throw_invalid_iterator(int id, const char* msg);
+[[noreturn]] void throw_type_error(int id, const char* prefix, const char* type_name);
 
 enum class error_handler_t {
     strict,
@@ -523,6 +539,18 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
             std::forward_as_tuple(std::move(value)));
         if (m_index != nullptr) {
             insert_index_entry(this->size() - 1, h);
+        }
+        return this->back().second;
+    }
+
+    T& emplace_back_unique_key(const std::string_view sv, T&& value) {
+        ensure_index_for_next();
+        Container::emplace_back(
+            std::piecewise_construct,
+            std::forward_as_tuple(sv),
+            std::forward_as_tuple(std::move(value)));
+        if (m_index != nullptr) {
+            insert_index_entry(this->size() - 1, detail::hash_bytes(sv.data(), sv.size()));
         }
         return this->back().second;
     }
@@ -1378,20 +1406,20 @@ private:
     // while key() returned the right one. Passed by value, the iterator need not be in memory at all.
     static reference element_at(pointer object, difference_type idx) {
         if (object == nullptr) {
-            throw invalid_iterator::create(214, "cannot get value");
+            throw_invalid_iterator(214, "cannot get value");
         }
         switch (object->m_type) {
             case value_t::object: {
                 if constexpr (std::is_const<BasicJsonType>::value) {
                     const auto* obj = object->const_object();
                     if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
-                        throw invalid_iterator::create(214, "cannot get value");
+                        throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*obj)[static_cast<std::size_t>(idx)].second;
                 } else {
                     auto* obj = object->mutable_object();
                     if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
-                        throw invalid_iterator::create(214, "cannot get value");
+                        throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*obj)[static_cast<std::size_t>(idx)].second;
                 }
@@ -1400,34 +1428,34 @@ private:
                 if constexpr (std::is_const<BasicJsonType>::value) {
                     const auto* arr = object->const_array();
                     if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
-                        throw invalid_iterator::create(214, "cannot get value");
+                        throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*arr)[static_cast<std::size_t>(idx)];
                 } else {
                     auto* arr = object->mutable_array();
                     if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
-                        throw invalid_iterator::create(214, "cannot get value");
+                        throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*arr)[static_cast<std::size_t>(idx)];
                 }
             }
             case value_t::null:
-                throw invalid_iterator::create(214, "cannot get value");
+                throw_invalid_iterator(214, "cannot get value");
             default:
                 if (idx == 0) {
                     return *object;
                 }
-                throw invalid_iterator::create(214, "cannot get value");
+                throw_invalid_iterator(214, "cannot get value");
         }
     }
 
     static const typename BasicJsonType::object_t::key_type& key_at(pointer object, difference_type idx) {
         if (object == nullptr || object->m_type != value_t::object) {
-            throw invalid_iterator::create(207, "cannot use key() for non-object iterators");
+            throw_invalid_iterator(207, "cannot use key() for non-object iterators");
         }
         const auto* obj = object->const_object();
         if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
-            throw invalid_iterator::create(214, "cannot get value");
+            throw_invalid_iterator(214, "cannot get value");
         }
         return (*obj)[static_cast<std::size_t>(idx)].first;
     }
@@ -3207,14 +3235,14 @@ private:
         object_t* object;
         array_t* array;
         string_t* string;
-        detail::LazyNode* lazy;
+        detail::LazyHeader* lazy;
         boolean_t boolean;
         number_integer_t number_integer;
         number_unsigned_t number_unsigned;
         number_float_t number_float;
 
         json_value() noexcept : object(nullptr) {}
-        json_value(boolean_t v) noexcept : boolean(v) {}
+        json_value(boolean_t v) noexcept : number_unsigned(0u) { boolean = v; }
         json_value(number_integer_t v) noexcept : number_integer(v) {}
         json_value(number_unsigned_t v) noexcept : number_unsigned(v) {}
         json_value(number_float_t v) noexcept : number_float(v) {}
@@ -3230,6 +3258,7 @@ private:
                     string = create_string();
                     break;
                 case value_t::boolean:
+                    number_unsigned = 0u;
                     boolean = false;
                     break;
                 case value_t::number_integer:
@@ -3252,7 +3281,9 @@ private:
 
         static bool is_container(const json& j) noexcept {
             if (j.m_storage != 0u) {
-                return detail::lazy_is_owned_materialized(j.m_value.lazy);
+                return j.m_value.lazy != nullptr &&
+                       j.m_value.lazy->refcount.load(std::memory_order_acquire) == 1u &&
+                       j.m_value.lazy->materialized.load(std::memory_order_acquire) != nullptr;
             }
             return j.m_type == value_t::array || j.m_type == value_t::object;
         }
@@ -3368,14 +3399,49 @@ private:
         }
     };
 
-    void destroy_value() noexcept {
+    static constexpr bool has_heap_payload(const value_t t) noexcept {
+        static_assert(static_cast<std::uint8_t>(value_t::object) == 1u &&
+                      static_cast<std::uint8_t>(value_t::array) == 2u &&
+                      static_cast<std::uint8_t>(value_t::string) == 3u,
+                      "heap-owning value_t tags must occupy [1, 3]");
+        return static_cast<unsigned>(
+                   static_cast<std::uint8_t>(static_cast<unsigned>(t) - 1u)) < 3u;
+    }
+
+    NEOJSON_NOINLINE void destroy_non_trivial() noexcept {
         if (m_storage != 0u) {
             detail::lazy_release(m_value.lazy, m_type);
-            m_value.lazy = nullptr;
-            m_storage = 0u;
         } else {
             m_value.destroy(m_type);
         }
+    }
+
+    NEOJSON_NOINLINE void copy_non_trivial(const json& other) {
+        if (m_storage != 0u) {
+            m_value.lazy->refcount.fetch_add(1u, std::memory_order_relaxed);
+            return;
+        }
+        switch (m_type) {
+            case value_t::object:
+                m_value.object = create_object(*(other.m_value.object));
+                break;
+            case value_t::array:
+                m_value.array = create_array(*(other.m_value.array));
+                break;
+            case value_t::string:
+                m_value.string = create_string(*(other.m_value.string));
+                break;
+            default:
+                break;
+        }
+    }
+
+    void destroy_value() noexcept {
+        if (has_heap_payload(m_type)) {
+            destroy_non_trivial();
+        }
+        m_storage = 0u;
+        m_value.object = nullptr;
         m_type = value_t::null;
     }
 
@@ -3399,6 +3465,9 @@ private:
 
     const object_t* const_object() const {
         if (m_storage != 0u) {
+            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                return static_cast<const object_t*>(mat);
+            }
             return static_cast<const object_t*>(
                 detail::lazy_materialize_const(m_value.lazy, m_type));
         }
@@ -3407,6 +3476,9 @@ private:
 
     const array_t* const_array() const {
         if (m_storage != 0u) {
+            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                return static_cast<const array_t*>(mat);
+            }
             return static_cast<const array_t*>(
                 detail::lazy_materialize_const(m_value.lazy, m_type));
         }
@@ -3558,40 +3630,10 @@ public:
         return json(init, false, value_t::array);
     }
 
-    json(const json& other) : m_type(other.m_type), m_storage(other.m_storage) {
-        if (m_storage != 0u) {
-            detail::lazy_retain(other.m_value.lazy);
-            m_value.lazy = other.m_value.lazy;
-            return;
-        }
-        switch (m_type) {
-            case value_t::object:
-                m_value.object = create_object(*(other.m_value.object));
-                break;
-            case value_t::array:
-                m_value.array = create_array(*(other.m_value.array));
-                break;
-            case value_t::string:
-                m_value.string = create_string(*(other.m_value.string));
-                break;
-            case value_t::boolean:
-                m_value.boolean = other.m_value.boolean;
-                break;
-            case value_t::number_integer:
-                m_value.number_integer = other.m_value.number_integer;
-                break;
-            case value_t::number_unsigned:
-                m_value.number_unsigned = other.m_value.number_unsigned;
-                break;
-            case value_t::number_float:
-                m_value.number_float = other.m_value.number_float;
-                break;
-            case value_t::null:
-            case value_t::binary:
-            case value_t::discarded:
-            default:
-                m_value.object = nullptr;
-                break;
+    json(const json& other)
+        : m_type(other.m_type), m_storage(other.m_storage), m_value(other.m_value) {
+        if (has_heap_payload(m_type)) {
+            copy_non_trivial(other);
         }
     }
 
@@ -3601,10 +3643,8 @@ public:
           m_value(std::exchange(other.m_value, json_value{})) {}
 
     ~json() noexcept {
-        if (m_storage != 0u) {
-            detail::lazy_release(m_value.lazy, m_type);
-        } else {
-            m_value.destroy(m_type);
+        if (has_heap_payload(m_type)) {
+            destroy_non_trivial();
         }
     }
 
@@ -3695,10 +3735,10 @@ public:
             case value_t::null:
                 return true;
             case value_t::array:
-                return m_storage != 0u ? detail::lazy_empty(m_value.lazy, m_type)
+                return m_storage != 0u ? (m_value.lazy->raw_len == 0u)
                                        : m_value.array->empty();
             case value_t::object:
-                return m_storage != 0u ? detail::lazy_empty(m_value.lazy, m_type)
+                return m_storage != 0u ? (m_value.lazy->raw_len == 0u)
                                        : m_value.object->empty();
             default:
                 return false;
@@ -3710,11 +3750,19 @@ public:
             case value_t::null:
                 return 0;
             case value_t::array:
-                return m_storage != 0u ? detail::lazy_size(m_value.lazy, m_type)
+                return m_storage != 0u ? m_value.lazy->raw_len
                                        : m_value.array->size();
             case value_t::object:
-                return m_storage != 0u ? detail::lazy_size(m_value.lazy, m_type)
-                                       : m_value.object->size();
+                if (m_storage != 0u) {
+                    if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                        return static_cast<const object_t*>(mat)->size();
+                    }
+                    if (m_value.lazy->dedup_state.load(std::memory_order_acquire) == 1u) {
+                        return m_value.lazy->raw_len;
+                    }
+                    return detail::lazy_size(m_value.lazy, m_type);
+                }
+                return m_value.object->size();
             default:
                 return 1;
         }
@@ -3855,16 +3903,16 @@ public:
             }
             return (*arr)[idx];
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a numeric argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a numeric argument with ",
+                                 type_name());
     }
 
     const_reference operator[](size_type idx) const {
         if (is_array()) {
             return (*const_array())[idx];
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a numeric argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a numeric argument with ",
+                                 type_name());
     }
 
     reference operator[](const typename object_t::key_type& key) {
@@ -3875,8 +3923,8 @@ public:
         if (is_object()) {
             return (*mutable_object())[key];
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a string argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
+                                 type_name());
     }
 
     const_reference operator[](const typename object_t::key_type& key) const {
@@ -3886,8 +3934,8 @@ public:
             assert(it != obj->end());
             return it->second;
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a string argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
+                                 type_name());
     }
 
     template <typename CharT,
@@ -3900,8 +3948,8 @@ public:
         if (is_object()) {
             return (*mutable_object())[std::string_view(key)];
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a string argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
+                                 type_name());
     }
 
     template <typename CharT,
@@ -3913,8 +3961,8 @@ public:
             assert(it != obj->end());
             return it->second;
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a string argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
+                                 type_name());
     }
 
     template <typename KeyType,
@@ -3933,8 +3981,8 @@ public:
         if (is_object()) {
             return (*mutable_object())[std::string_view(key)];
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a string argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
+                                 type_name());
     }
 
     template <typename KeyType,
@@ -3952,8 +4000,8 @@ public:
             assert(it != obj->end());
             return it->second;
         }
-        throw type_error::create(
-            305, std::string("cannot use operator[] with a string argument with ") + type_name());
+        detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
+                                 type_name());
     }
 
     reference operator[](const json_pointer& ptr) {
@@ -4118,8 +4166,13 @@ public:
         if (!is_object()) {
             return false;
         }
-        return m_storage != 0u ? detail::lazy_contains(m_value.lazy, std::string_view(key))
-                               : m_value.object->contains(key);
+        if (m_storage != 0u) {
+            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                return static_cast<const object_t*>(mat)->contains(key);
+            }
+            return detail::lazy_contains(m_value.lazy, std::string_view(key));
+        }
+        return m_value.object->contains(key);
     }
 
     template <class KeyType,
@@ -4132,8 +4185,14 @@ public:
         if (!is_object()) {
             return false;
         }
-        return m_storage != 0u ? detail::lazy_contains(m_value.lazy, std::string_view(key))
-                               : m_value.object->contains(std::string_view(key));
+        const std::string_view sv(key);
+        if (m_storage != 0u) {
+            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                return static_cast<const object_t*>(mat)->contains(sv);
+            }
+            return detail::lazy_contains(m_value.lazy, sv);
+        }
+        return m_value.object->contains(sv);
     }
 
     bool contains(const json_pointer& ptr) const {
@@ -5245,6 +5304,8 @@ public:
     void merge_patch(const json& apply_patch);
 
 private:
+    static_assert(std::is_trivially_copyable<json_value>::value,
+                  "json_value must be trivially copyable");
     value_t m_type = value_t::null;
     std::uint8_t m_storage = 0u;
     json_value m_value{};

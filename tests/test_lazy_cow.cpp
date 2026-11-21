@@ -37,7 +37,7 @@ std::string build_dup_object_text(const std::size_t n) {
 }
 
 TEST(LazyCow, LayoutAndSmallScalarArrays) {
-    static constexpr std::array<const char*, 12> kInputs = {{
+    static constexpr std::array<const char*, 15> kInputs = {{
         "{}",
         "[]",
         "null",
@@ -50,6 +50,9 @@ TEST(LazyCow, LayoutAndSmallScalarArrays) {
         "[1, 2, 3, 4]",
         "[1, \"two\", true, null]",
         R"({"pts":[[1.5,-2.25],[3.5,4.75]],"big_arr":[1,2,3,4,5],"nested":[[1],2,3,4],"ok":false})",
+        R"({"wrap":[{"areaId":123,"blockIds":[]},{"a":1,"b":2,"c":3,"d":true}],"ok":1})",
+        R"({"wrap":{"a":1,"b":{},"a":2,"c":null},"other":{"flag":false,"cnt":9}})",
+        R"({"dup":{"a":1,"b":false,"a":2,"c":[]},"plain":{"x":1,"y":2,"z":{}}})",
     }};
 
     for (const char* raw : kInputs) {
@@ -423,18 +426,22 @@ TEST(LazyCow, DeepNestingOn512KiBSmallStack) {
         });
         ASSERT_TRUE(err_a.empty()) << err_a;
 
-        // (b) Partial const materialization down 600 levels + iterative destroy via release_containers.
+        // (b) Const materialization down 1050 levels + iterative Lazy destruction via release_containers.
         const std::string err_b = neojson::test::run_with_stack(kSmallStack, [&]() {
-            jk doc = jk::parse(raw, nullptr, true, false, opts);
-            const jk* cur = &doc;
-            for (std::size_t i = 0; i < 600; ++i) {
-                if (cur->is_array()) {
-                    cur = &((*cur)[0]);
-                } else {
-                    cur = &((*cur)["k"]);
+            const std::size_t heap_uses_before = neojson::detail::destroy_heap_stack_uses();
+            {
+                const jk doc = jk::parse(raw, nullptr, true, false, opts);
+                const jk* cur = &doc;
+                for (std::size_t i = 0; i < 1050; ++i) {
+                    if (cur->is_array()) {
+                        cur = &((*cur)[0]);
+                    } else {
+                        cur = &((*cur)["k"]);
+                    }
                 }
+                EXPECT_TRUE(cur->is_structured());
             }
-            EXPECT_TRUE(cur->is_structured());
+            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), heap_uses_before);
         });
         ASSERT_TRUE(err_b.empty()) << err_b;
 
