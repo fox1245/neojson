@@ -235,17 +235,85 @@ struct is_InputIt
           bool,
           is_iterator_traits<T>::value && !std::is_integral<std::decay_t<T>>::value> {};
 
+// Member count above which ordered_map maintains a flat open-addressed hash index for O(1) lookup.
+inline constexpr std::size_t kOrderedMapHashThreshold = 16;
+
+std::uint64_t hash_seed_init() noexcept;
+
+inline std::uint64_t rotl64(const std::uint64_t x, const unsigned r) noexcept {
+    return (x << r) | (x >> (64u - r));
+}
+
+inline std::uint64_t fmix64(std::uint64_t k) noexcept {
+    k ^= k >> 33u;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33u;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33u;
+    return k;
+}
+
+inline std::uint64_t hash_bytes(const char* data, const std::size_t len) noexcept {
+    static const std::uint64_t seed = hash_seed_init();
+    std::uint64_t h = seed ^ (static_cast<std::uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
+    const auto* p = reinterpret_cast<const unsigned char*>(data);
+    if (len <= 16) {
+        if (len >= 8) {
+            std::uint64_t a = 0;
+            std::uint64_t b = 0;
+            std::memcpy(&a, p, 8);
+            std::memcpy(&b, p + len - 8, 8);
+            h ^= a * 0xbf58476d1ce4e5b9ULL;
+            h = rotl64(h, 27u) ^ (b * 0x94d049bb133111ebULL);
+            return fmix64(h);
+        }
+        if (len >= 4) {
+            std::uint32_t a = 0;
+            std::uint32_t b = 0;
+            std::memcpy(&a, p, 4);
+            std::memcpy(&b, p + len - 4, 4);
+            h ^= (static_cast<std::uint64_t>(a) << 32u) | b;
+            return fmix64(h);
+        }
+        if (len > 0) {
+            const std::uint64_t v = (static_cast<std::uint64_t>(p[0]) << 16u) |
+                                    (static_cast<std::uint64_t>(p[len >> 1u]) << 8u) |
+                                    static_cast<std::uint64_t>(p[len - 1]);
+            h ^= v * 0x9e3779b97f4a7c15ULL;
+            return fmix64(h);
+        }
+        return fmix64(h);
+    }
+    std::size_t n = len;
+    while (n >= 8) {
+        std::uint64_t w = 0;
+        std::memcpy(&w, p, 8);
+        h ^= w * 0xbf58476d1ce4e5b9ULL;
+        h = rotl64(h, 31u) * 0x9e3779b97f4a7c15ULL;
+        p += 8;
+        n -= 8;
+    }
+    if (n > 0) {
+        std::uint64_t tail = 0;
+        std::memcpy(&tail, reinterpret_cast<const unsigned char*>(data) + len - 8, 8);
+        h ^= tail * 0x94d049bb133111ebULL;
+    }
+    return fmix64(h);
+}
+
 } // namespace detail
 
 template <class Key, class T, class IgnoredLess = std::less<Key>,
-          class Allocator = std::allocator<std::pair<const Key, T>>>
-struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
+          class Allocator = std::allocator<std::pair<Key, T>>>
+struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
     using key_type = Key;
     using mapped_type = T;
-    using Container = std::vector<std::pair<const Key, T>, Allocator>;
+    using Container = std::vector<std::pair<Key, T>, Allocator>;
     using iterator = typename Container::iterator;
     using const_iterator = typename Container::const_iterator;
     using size_type = typename Container::size_type;
+    using difference_type = typename Container::difference_type;
+    using reference = typename Container::reference;
     using value_type = typename Container::value_type;
     using key_compare = std::equal_to<Key>;
 
@@ -253,27 +321,146 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
     explicit ordered_map(const Allocator& alloc) noexcept(noexcept(Container(alloc)))
         : Container(alloc) {}
 
+    ordered_map(const ordered_map& other)
+        : Container(other),
+          m_index(other.m_index != nullptr ? std::make_unique<HashIndex>(*other.m_index)
+                                           : nullptr) {}
+
+    ordered_map(ordered_map&& other) noexcept = default;
+
+    ordered_map& operator=(const ordered_map& other) {
+        if (this != &other) {
+            ordered_map tmp(other);
+            swap(tmp);
+        }
+        return *this;
+    }
+
+    ordered_map& operator=(ordered_map&& other) noexcept = default;
+
     template <class It, std::enable_if_t<detail::is_InputIt<It>::value, int> = 0>
     ordered_map(It first, It last, const Allocator& alloc = Allocator())
-        : Container(first, last, alloc) {}
+        : Container(first, last, alloc) {
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
 
     ordered_map(std::initializer_list<value_type> init, const Allocator& alloc = Allocator())
-        : Container(init, alloc) {}
+        : Container(init, alloc) {
+        if (this->size() > detail::kOrderedMapHashThreshold) {
+            build_index_with_min_cap(this->size());
+        }
+    }
+
+    void swap(ordered_map& other) noexcept {
+        Container::swap(other);
+        m_index.swap(other.m_index);
+    }
+
+    void clear() noexcept {
+        Container::clear();
+        m_index.reset();
+    }
+
+    void reserve_for_build(const std::size_t expected_len) {
+        Container::reserve(expected_len);
+        if (expected_len > detail::kOrderedMapHashThreshold &&
+            expected_len <= kMaxIndexedSize) {
+            const std::size_t needed = next_pow2(expected_len * 2);
+            if (m_index == nullptr || m_index->cap < needed) {
+                build_index_with_cap(needed);
+            }
+        }
+    }
+
+    void push_back(const value_type& value) {
+        ensure_index_for_next();
+        Container::push_back(value);
+        if (m_index != nullptr) {
+            const auto& k = this->back().first;
+            insert_index_entry(this->size() - 1, detail::hash_bytes(k.data(), k.size()));
+        }
+    }
+
+    void push_back(value_type&& value) {
+        ensure_index_for_next();
+        Container::push_back(std::move(value));
+        if (m_index != nullptr) {
+            const auto& k = this->back().first;
+            insert_index_entry(this->size() - 1, detail::hash_bytes(k.data(), k.size()));
+        }
+    }
+
+    template <class... Args>
+    reference emplace_back(Args&&... args) {
+        ensure_index_for_next();
+        reference inserted = Container::emplace_back(std::forward<Args>(args)...);
+        if (m_index != nullptr) {
+            insert_index_entry(this->size() - 1,
+                               detail::hash_bytes(inserted.first.data(), inserted.first.size()));
+        }
+        return inserted;
+    }
+
+    void pop_back() {
+        if (this->empty()) {
+            return;
+        }
+        if (m_index != nullptr) {
+            if (this->size() - 1 <= detail::kOrderedMapHashThreshold) {
+                m_index.reset();
+            } else {
+                remove_index_entry(this->size() - 1);
+            }
+        }
+        Container::pop_back();
+    }
 
     template <class KeyType, class... Args,
               std::enable_if_t<std::is_convertible<const KeyType&, std::string_view>::value, int> = 0>
     std::pair<iterator, bool> emplace(KeyType&& key, Args&&... args) {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                return {it, false};
-            }
+        const std::string_view sv(key);
+        std::uint64_t h = 0;
+        const std::size_t found = find_pos_with_hash(sv, h);
+        if (found != kNpos) {
+            return {this->begin() + static_cast<difference_type>(found), false};
+        }
+        const bool had_index = (m_index != nullptr);
+        ensure_index_for_next();
+        if (m_index != nullptr && !had_index) {
+            h = detail::hash_bytes(sv.data(), sv.size());
         }
         Container::emplace_back(
             std::piecewise_construct,
             std::forward_as_tuple(std::forward<KeyType>(key)),
             std::forward_as_tuple(std::forward<Args>(args)...));
+        if (m_index != nullptr) {
+            insert_index_entry(this->size() - 1, h);
+        }
         return {std::prev(this->end()), true};
+    }
+
+    T& emplace_or_assign_key(const std::string_view sv, T&& value) {
+        std::uint64_t h = 0;
+        const std::size_t found = find_pos_with_hash(sv, h);
+        if (found != kNpos) {
+            (*this)[found].second = std::move(value);
+            return (*this)[found].second;
+        }
+        const bool had_index = (m_index != nullptr);
+        ensure_index_for_next();
+        if (m_index != nullptr && !had_index) {
+            h = detail::hash_bytes(sv.data(), sv.size());
+        }
+        Container::emplace_back(
+            std::piecewise_construct,
+            std::forward_as_tuple(sv),
+            std::forward_as_tuple(std::move(value)));
+        if (m_index != nullptr) {
+            insert_index_entry(this->size() - 1, h);
+        }
+        return this->back().second;
     }
 
     using Container::operator[];
@@ -305,10 +492,9 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
     }
 
     T& at(const key_type& key) {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == key) {
-                return it->second;
-            }
+        const std::size_t pos = find_pos(std::string_view(key));
+        if (pos != kNpos) {
+            return (*this)[pos].second;
         }
         throw std::out_of_range("key not found");
     }
@@ -318,20 +504,17 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, key_type>::value,
                                int> = 0>
     T& at(KeyType&& key) {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                return it->second;
-            }
+        const std::size_t pos = find_pos(std::string_view(key));
+        if (pos != kNpos) {
+            return (*this)[pos].second;
         }
         throw std::out_of_range("key not found");
     }
 
     const T& at(const key_type& key) const {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == key) {
-                return it->second;
-            }
+        const std::size_t pos = find_pos(std::string_view(key));
+        if (pos != kNpos) {
+            return (*this)[pos].second;
         }
         throw std::out_of_range("key not found");
     }
@@ -341,27 +524,20 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, key_type>::value,
                                int> = 0>
     const T& at(KeyType&& key) const {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                return it->second;
-            }
+        const std::size_t pos = find_pos(std::string_view(key));
+        if (pos != kNpos) {
+            return (*this)[pos].second;
         }
         throw std::out_of_range("key not found");
     }
 
     size_type erase(const key_type& key) {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == key) {
-                for (auto next = it; ++next != this->end(); ++it) {
-                    it->~value_type();
-                    new (&*it) value_type(std::move(*next));
-                }
-                Container::pop_back();
-                return 1;
-            }
+        const std::size_t pos = find_pos(std::string_view(key));
+        if (pos == kNpos) {
+            return 0;
         }
-        return 0;
+        erase_at(pos);
+        return 1;
     }
 
     template <class KeyType,
@@ -371,51 +547,49 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, const_iterator>::value,
                                int> = 0>
     size_type erase(KeyType&& key) {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                for (auto next = it; ++next != this->end(); ++it) {
-                    it->~value_type();
-                    new (&*it) value_type(std::move(*next));
-                }
-                Container::pop_back();
-                return 1;
-            }
+        const std::size_t pos = find_pos(std::string_view(key));
+        if (pos == kNpos) {
+            return 0;
         }
-        return 0;
+        erase_at(pos);
+        return 1;
     }
 
     iterator erase(iterator pos) {
-        return erase(pos, std::next(pos));
+        const auto offset = static_cast<std::size_t>(std::distance(this->begin(), pos));
+        erase_at(offset);
+        return this->begin() + static_cast<difference_type>(offset);
     }
 
     iterator erase(const_iterator pos) {
-        return erase(pos, std::next(pos));
+        const auto offset = static_cast<std::size_t>(std::distance(this->cbegin(), pos));
+        erase_at(offset);
+        return this->begin() + static_cast<difference_type>(offset);
     }
 
     iterator erase(const_iterator first, const_iterator last) {
-        if (first == last) {
-            return this->begin() + std::distance(this->cbegin(), first);
-        }
-        const auto elements_affected = std::distance(first, last);
         const auto offset = std::distance(this->cbegin(), first);
-        for (auto it = this->begin() + offset; it + elements_affected != this->end(); ++it) {
-            it->~value_type();
-            new (&*it) value_type(std::move(*(it + elements_affected)));
+        const auto count = std::distance(first, last);
+        if (count == 0) {
+            return this->begin() + offset;
         }
-        for (std::ptrdiff_t i = 0; i < elements_affected; ++i) {
-            Container::pop_back();
+        if (count == 1) {
+            erase_at(static_cast<std::size_t>(offset));
+            return this->begin() + offset;
+        }
+        Container::erase(this->begin() + offset, this->begin() + offset + count);
+        if (m_index != nullptr) {
+            if (this->size() <= detail::kOrderedMapHashThreshold) {
+                m_index.reset();
+            } else {
+                build_index_with_min_cap(this->size());
+            }
         }
         return this->begin() + offset;
     }
 
     size_type count(const key_type& key) const {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == key) {
-                return 1;
-            }
-        }
-        return 0;
+        return find_pos(std::string_view(key)) != kNpos ? 1 : 0;
     }
 
     template <class KeyType,
@@ -423,22 +597,12 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, key_type>::value,
                                int> = 0>
     size_type count(KeyType&& key) const {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                return 1;
-            }
-        }
-        return 0;
+        return find_pos(std::string_view(key)) != kNpos ? 1 : 0;
     }
 
     iterator find(const key_type& key) {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == key) {
-                return it;
-            }
-        }
-        return Container::end();
+        const std::size_t pos = find_pos(std::string_view(key));
+        return pos != kNpos ? this->begin() + static_cast<difference_type>(pos) : Container::end();
     }
 
     template <class KeyType,
@@ -446,22 +610,13 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, key_type>::value,
                                int> = 0>
     iterator find(KeyType&& key) {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                return it;
-            }
-        }
-        return Container::end();
+        const std::size_t pos = find_pos(std::string_view(key));
+        return pos != kNpos ? this->begin() + static_cast<difference_type>(pos) : Container::end();
     }
 
     const_iterator find(const key_type& key) const {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == key) {
-                return it;
-            }
-        }
-        return Container::end();
+        const std::size_t pos = find_pos(std::string_view(key));
+        return pos != kNpos ? this->cbegin() + static_cast<difference_type>(pos) : Container::cend();
     }
 
     template <class KeyType,
@@ -469,17 +624,12 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, key_type>::value,
                                int> = 0>
     const_iterator find(KeyType&& key) const {
-        std::string_view sv(key);
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == sv) {
-                return it;
-            }
-        }
-        return Container::end();
+        const std::size_t pos = find_pos(std::string_view(key));
+        return pos != kNpos ? this->cbegin() + static_cast<difference_type>(pos) : Container::cend();
     }
 
     bool contains(const key_type& key) const {
-        return find(key) != this->end();
+        return find_pos(std::string_view(key)) != kNpos;
     }
 
     template <class KeyType,
@@ -487,21 +637,15 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
                                    !std::is_same<std::decay_t<KeyType>, key_type>::value,
                                int> = 0>
     bool contains(KeyType&& key) const {
-        return find(std::forward<KeyType>(key)) != this->end();
+        return find_pos(std::string_view(key)) != kNpos;
     }
 
     std::pair<iterator, bool> insert(value_type&& value) {
-        return emplace(value.first, std::move(value.second));
+        return emplace(std::move(value.first), std::move(value.second));
     }
 
     std::pair<iterator, bool> insert(const value_type& value) {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (it->first == value.first) {
-                return {it, false};
-            }
-        }
-        Container::push_back(value);
-        return {std::prev(this->end()), true};
+        return emplace(value.first, value.second);
     }
 
     iterator insert(const_iterator /*hint*/, const value_type& value) {
@@ -518,6 +662,193 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
             insert(*it);
         }
     }
+
+    friend bool operator==(const ordered_map& lhs, const ordered_map& rhs) {
+        return static_cast<const Container&>(lhs) == static_cast<const Container&>(rhs);
+    }
+
+    friend bool operator!=(const ordered_map& lhs, const ordered_map& rhs) {
+        return !(lhs == rhs);
+    }
+
+    friend bool operator<(const ordered_map& lhs, const ordered_map& rhs) {
+        return static_cast<const Container&>(lhs) < static_cast<const Container&>(rhs);
+    }
+
+private:
+    struct Slot {
+        std::uint32_t idx_plus_one = 0;
+        std::uint32_t hash32 = 0;
+    };
+
+    struct HashIndex {
+        std::size_t cap = 0;
+        std::unique_ptr<Slot[]> slots;
+
+        explicit HashIndex(const std::size_t c)
+            : cap(c), slots(std::make_unique<Slot[]>(c)) {}
+
+        HashIndex(const HashIndex& other)
+            : cap(other.cap), slots(std::make_unique<Slot[]>(other.cap)) {
+            std::memcpy(slots.get(), other.slots.get(), cap * sizeof(Slot));
+        }
+    };
+
+    static constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
+    static constexpr std::size_t kMaxIndexedSize = 0xFFFFFFFEu;
+
+    static bool key_equals(const key_type& k, const std::string_view sv) noexcept {
+        return k.size() == sv.size() &&
+               (sv.empty() || std::memcmp(k.data(), sv.data(), sv.size()) == 0);
+    }
+
+    static std::size_t next_pow2(const std::size_t v) noexcept {
+        std::size_t cap = 64;
+        while (cap < v && cap <= (std::size_t{1} << 62u)) {
+            cap <<= 1u;
+        }
+        return cap;
+    }
+
+    std::size_t find_pos_with_hash(const std::string_view sv, std::uint64_t& out_h) const noexcept {
+        if (m_index != nullptr) {
+            const std::uint64_t h = detail::hash_bytes(sv.data(), sv.size());
+            out_h = h;
+            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+            const std::size_t mask = m_index->cap - 1;
+            std::size_t pos = static_cast<std::size_t>(h) & mask;
+            const Slot* slots = m_index->slots.get();
+            const value_type* elems = this->data();
+            for (;;) {
+                const Slot s = slots[pos];
+                if (s.idx_plus_one == 0) {
+                    return kNpos;
+                }
+                if (s.hash32 == h32) {
+                    const std::size_t idx = static_cast<std::size_t>(s.idx_plus_one - 1);
+                    if (key_equals(elems[idx].first, sv)) {
+                        return idx;
+                    }
+                }
+                pos = (pos + 1) & mask;
+            }
+        }
+        const value_type* elems = this->data();
+        const std::size_t n = this->size();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (key_equals(elems[i].first, sv)) {
+                return i;
+            }
+        }
+        return kNpos;
+    }
+
+    std::size_t find_pos(const std::string_view sv) const noexcept {
+        std::uint64_t unused = 0;
+        return find_pos_with_hash(sv, unused);
+    }
+
+    void build_index_with_cap(const std::size_t target_cap) {
+        const std::size_t n = this->size();
+        auto next_idx = std::make_unique<HashIndex>(target_cap);
+        const std::size_t mask = target_cap - 1;
+        Slot* slots = next_idx->slots.get();
+        const value_type* elems = this->data();
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t h =
+                detail::hash_bytes(elems[i].first.data(), elems[i].first.size());
+            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+            std::size_t pos = static_cast<std::size_t>(h) & mask;
+            while (slots[pos].idx_plus_one != 0) {
+                pos = (pos + 1) & mask;
+            }
+            slots[pos] = {static_cast<std::uint32_t>(i + 1), h32};
+        }
+        m_index = std::move(next_idx);
+    }
+
+    void build_index_with_min_cap(const std::size_t min_elements) {
+        if (min_elements > kMaxIndexedSize) {
+            m_index.reset();
+            return;
+        }
+        build_index_with_cap(next_pow2(min_elements * 2));
+    }
+
+    void ensure_index_for_next() {
+        const std::size_t next_n = this->size() + 1;
+        if (m_index != nullptr) {
+            if (next_n > kMaxIndexedSize) {
+                m_index.reset();
+            } else if (next_n * 2 > m_index->cap) {
+                build_index_with_min_cap(next_n);
+            }
+        } else if (next_n > detail::kOrderedMapHashThreshold && next_n <= kMaxIndexedSize) {
+            build_index_with_min_cap(next_n);
+        }
+    }
+
+    void insert_index_entry(const std::size_t idx, const std::uint64_t h) noexcept {
+        const std::size_t mask = m_index->cap - 1;
+        const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+        Slot* slots = m_index->slots.get();
+        std::size_t pos = static_cast<std::size_t>(h) & mask;
+        while (slots[pos].idx_plus_one != 0) {
+            pos = (pos + 1) & mask;
+        }
+        slots[pos] = {static_cast<std::uint32_t>(idx + 1), h32};
+    }
+
+    void remove_index_entry(const std::size_t idx) noexcept {
+        const std::size_t mask = m_index->cap - 1;
+        Slot* slots = m_index->slots.get();
+        const key_type& target_key = (*this)[idx].first;
+        const std::uint64_t h = detail::hash_bytes(target_key.data(), target_key.size());
+        std::size_t pos = static_cast<std::size_t>(h) & mask;
+        const std::uint32_t want = static_cast<std::uint32_t>(idx + 1);
+        while (slots[pos].idx_plus_one != want) {
+            pos = (pos + 1) & mask;
+        }
+        std::size_t cur = pos;
+        std::size_t scan = (cur + 1) & mask;
+        for (;;) {
+            const Slot ns = slots[scan];
+            if (ns.idx_plus_one == 0) {
+                slots[cur] = Slot{};
+                break;
+            }
+            const key_type& nk = (*this)[static_cast<std::size_t>(ns.idx_plus_one - 1)].first;
+            const std::size_t home =
+                static_cast<std::size_t>(detail::hash_bytes(nk.data(), nk.size())) & mask;
+            if (((cur - home) & mask) < ((scan - home) & mask)) {
+                slots[cur] = ns;
+                cur = scan;
+            }
+            scan = (scan + 1) & mask;
+        }
+    }
+
+    void erase_at(const std::size_t idx) {
+        if (m_index != nullptr) {
+            if (this->size() - 1 <= detail::kOrderedMapHashThreshold) {
+                m_index.reset();
+            } else {
+                remove_index_entry(idx);
+                if (idx + 1 < this->size()) {
+                    const std::uint32_t pivot = static_cast<std::uint32_t>(idx + 1);
+                    Slot* slots = m_index->slots.get();
+                    for (std::size_t i = 0; i < m_index->cap; ++i) {
+                        if (slots[i].idx_plus_one > pivot) {
+                            --slots[i].idx_plus_one;
+                        }
+                    }
+                }
+            }
+        }
+        Container::erase(this->begin() + static_cast<difference_type>(idx));
+    }
+
+    std::unique_ptr<HashIndex> m_index;
 };
 
 namespace detail {
@@ -2617,7 +2948,7 @@ public:
 
     using object_comparator_t = std::less<std::string>;
     using object_t = ordered_map<std::string, json, object_comparator_t,
-                                 std::allocator<std::pair<const std::string, json>>>;
+                                 std::allocator<std::pair<std::string, json>>>;
     using array_t = std::vector<json, std::allocator<json>>;
     using string_t = std::string;
     using boolean_t = bool;
@@ -2684,7 +3015,7 @@ private:
             return j;
         }
 
-        static json& element_of(std::pair<const std::string, json>& member) noexcept {
+        static json& element_of(std::pair<std::string, json>& member) noexcept {
             return member.second;
         }
 
@@ -4525,6 +4856,8 @@ private:
 };
 
 static_assert(sizeof(json) == 16, "neojson::json must be 16 bytes");
+static_assert(std::is_nothrow_move_constructible<std::pair<std::string, json>>::value,
+              "ordered_map value_type must be nothrow move-constructible");
 
 // Out-of-line json member functions that depend on adl_serializer
 
