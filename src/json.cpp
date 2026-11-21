@@ -1674,7 +1674,7 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
     if (len == 0u) {
         return is_arr ? json_access::make_array() : json_access::make_object();
     }
-    if (is_arr && len <= 4u) {
+    if (is_arr && len <= 8u) {
         bool all_scalar = true;
         yyjson_val* elem = unsafe_yyjson_get_first(val);
         for (std::size_t i = 0u; i < len; ++i) {
@@ -1706,14 +1706,14 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
             guard.p = nullptr;
             return json_access::make_from_array_ptr(arr);
         }
-    } else if (!is_arr && len <= 4u) {
+    } else if (!is_arr && len <= 8u) {
         bool cheap_leaf = true;
         yyjson_obj_iter it = yyjson_obj_iter_with(val);
         yyjson_val* k = nullptr;
         while ((k = yyjson_obj_iter_next(&it)) != nullptr) {
             yyjson_val* v = yyjson_obj_iter_get_val(k);
             if (unsafe_yyjson_get_len(k) > 32u ||
-                (yyjson_is_ctn(v) ? (unsafe_yyjson_get_len(v) != 0u) : yyjson_is_str(v))) {
+                (yyjson_is_ctn(v) && unsafe_yyjson_get_len(v) != 0u)) {
                 cheap_leaf = false;
                 break;
             }
@@ -1729,10 +1729,18 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
                 }
             } guard{obj};
             yyjson_obj_iter fill_it = yyjson_obj_iter_with(val);
-            while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
-                yyjson_val* v = yyjson_obj_iter_get_val(k);
-                const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
-                obj->emplace_or_assign_key(kv, make_node(v));
+            if (sdoc->tree_unique_verified.load(std::memory_order_acquire)) {
+                while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
+                    yyjson_val* v = yyjson_obj_iter_get_val(k);
+                    const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                    obj->emplace_back_unique_key(kv, make_node(v));
+                }
+            } else {
+                while ((k = yyjson_obj_iter_next(&fill_it)) != nullptr) {
+                    yyjson_val* v = yyjson_obj_iter_get_val(k);
+                    const std::string_view kv(unsafe_yyjson_get_str(k), unsafe_yyjson_get_len(k));
+                    obj->emplace_or_assign_key(kv, make_node(v));
+                }
             }
             guard.p = nullptr;
             return json_access::make_from_object_ptr(obj);
@@ -1869,6 +1877,10 @@ const void* lazy_materialize_const(LazyHeader* hdr, const value_t type) {
             ((node->dedup_state.load(std::memory_order_acquire) & 1u) != 0u ||
              node->doc->tree_unique_verified.load(std::memory_order_acquire));
         existing = shallow_materialize(node->doc, node->val, known_unique);
+        if (type == value_t::object && !known_unique &&
+            static_cast<const json::object_t*>(existing)->size() == node->raw_len) {
+            mark_own_unique(node);
+        }
         node->materialized.store(existing, std::memory_order_release);
     }
     return existing;
