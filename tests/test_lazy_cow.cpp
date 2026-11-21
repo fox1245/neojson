@@ -431,7 +431,7 @@ TEST(LazyCow, DeepNestingOn512KiBSmallStack) {
         });
         ASSERT_TRUE(err_a.empty()) << err_a;
 
-        // (b) Const materialization down 1050 levels + iterative Lazy destruction via release_containers.
+        // (b) Const arena materialization down 1050 levels + O(1) DocArena destruction on 512 KiB stack.
         const std::string err_b = neojson::test::run_with_stack(kSmallStack, [&]() {
             const std::size_t heap_uses_before = neojson::detail::destroy_heap_stack_uses();
             {
@@ -446,15 +446,19 @@ TEST(LazyCow, DeepNestingOn512KiBSmallStack) {
                 }
                 EXPECT_TRUE(cur->is_structured());
             }
-            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), heap_uses_before);
+            EXPECT_EQ(neojson::detail::destroy_heap_stack_uses(), heap_uses_before);
         });
         ASSERT_TRUE(err_b.empty()) << err_b;
 
         // (c) Full iterative materialize() + iterative destroy on 512 KiB stack.
         const std::string err_c = neojson::test::run_with_stack(kSmallStack, [&]() {
-            jk doc = jk::parse(raw, nullptr, true, false, opts);
-            doc.materialize();
-            EXPECT_EQ(doc.size(), 1u);
+            const std::size_t heap_uses_before = neojson::detail::destroy_heap_stack_uses();
+            {
+                jk doc = jk::parse(raw, nullptr, true, false, opts);
+                doc.materialize();
+                EXPECT_EQ(doc.size(), 1u);
+            }
+            EXPECT_GT(neojson::detail::destroy_heap_stack_uses(), heap_uses_before);
         });
         ASSERT_TRUE(err_c.empty()) << err_c;
 
@@ -1602,6 +1606,164 @@ TEST(LazyCow, OrderedMapSubstringSelfAliasGrowth) {
     for (const auto& kv : heap_expected) {
         ASSERT_TRUE(heap_obj.contains(kv.first));
         EXPECT_EQ(heap_obj.at(kv.first), kv.second);
+    }
+}
+
+TEST(LazyCow, DocArenaConstViewsIsolationAndConcurrency) {
+    // 1. Duplicate keys (<= 16 and > 16) including overwritten container values.
+    std::string dup_raw = R"({"k0":{"gone":[1,2,3]},"k1":"v1","k0":{"kept":"long_arena_string_exceeding_sso_threshold_1234567890"},"empty_str":"","empty_arr":[],"empty_obj":{}})";
+    const jk dup_doc = jk::parse(dup_raw);
+    const oj dup_ref = oj::parse(dup_raw);
+    EXPECT_EQ(dup_doc.size(), dup_ref.size());
+    EXPECT_EQ(dup_doc.dump(), dup_ref.dump());
+    EXPECT_EQ(dup_doc.dump(2), dup_ref.dump(2));
+    EXPECT_EQ(dup_doc["k0"]["kept"], "long_arena_string_exceeding_sso_threshold_1234567890");
+    EXPECT_EQ(dup_doc["empty_str"], "");
+    EXPECT_TRUE(dup_doc["empty_arr"].empty());
+    EXPECT_TRUE(dup_doc["empty_obj"].empty());
+
+    // Build a >16 key object with multiple duplicates including overwritten heap containers.
+    std::string big_raw = "{";
+    for (int i = 0; i < 24; ++i) {
+        if (i > 0) {
+            big_raw += ',';
+        }
+        big_raw += "\"key_" + std::to_string(i) + "\":";
+        if (i == 2) {
+            big_raw += "{\"old_big_nested\":[10,20,30]}";
+        } else if (i == 20) {
+            big_raw += "\"payload_string_long_enough_for_heap_" + std::to_string(i) +
+                       "_abcdefghijklmnopqrstuvwxyz\"";
+        } else {
+            big_raw += std::to_string(i);
+        }
+    }
+    big_raw += R"(,"key_2":{"final_nested":["alpha_long_string_that_is_not_sso_at_all_12345",99]},"key_20":"final_20"})";
+
+    jk escaped_subobj;
+    jk escaped_str;
+    jk escaped_empty_str;
+    jk escaped_small_arr;
+    jk slice_arr;
+    jk slice_obj;
+    {
+        const jk big_doc = jk::parse(big_raw);
+        const oj big_ref = oj::parse(big_raw);
+        EXPECT_EQ(big_doc.size(), big_ref.size());
+        EXPECT_TRUE(big_doc.contains("key_2"));
+        EXPECT_TRUE(big_doc.contains("key_20"));
+        EXPECT_FALSE(big_doc.contains("missing_key"));
+        EXPECT_EQ(big_doc.at("key_20"), "final_20");
+        EXPECT_EQ(big_doc.find("key_2")->at("final_nested")[1], 99);
+        EXPECT_EQ(big_doc.dump(), big_ref.dump());
+
+        // Exercise compat_cache get_ptr<const object_t*>() and get_ptr<const array_t*>()
+        // on nested arena children (must leave zero reference cycles on doc destruction).
+        const auto* top_obj_ptr = big_doc.get_ptr<const jk::object_t*>();
+        ASSERT_NE(top_obj_ptr, nullptr);
+        EXPECT_EQ(top_obj_ptr->size(), big_ref.size());
+        const jk& nested_sub = big_doc["key_2"]["final_nested"];
+        const auto* nested_arr_ptr = nested_sub.get_ptr<const jk::array_t*>();
+        ASSERT_NE(nested_arr_ptr, nullptr);
+        ASSERT_EQ(nested_arr_ptr->size(), 2u);
+        EXPECT_EQ((*nested_arr_ptr)[0], "alpha_long_string_that_is_not_sso_at_all_12345");
+
+        // Escape copies out of ArenaArray / ArenaObject / ArenaString and compat_cache.
+        escaped_subobj = big_doc["key_2"];
+        escaped_str = (*nested_arr_ptr)[0];
+        escaped_empty_str = dup_doc["empty_str"];
+        escaped_small_arr = nested_sub;
+        slice_arr = jk(nested_sub.begin(), nested_sub.end());
+        slice_obj = jk(big_doc.begin(), std::next(big_doc.begin(), 6));
+    }
+
+    // Original big_doc is destroyed; escaped copies (4u->5u strings and cloned containers) must work!
+    EXPECT_EQ(escaped_str, "alpha_long_string_that_is_not_sso_at_all_12345");
+    EXPECT_EQ(escaped_empty_str, "");
+    EXPECT_EQ(escaped_small_arr.size(), 2u);
+    EXPECT_EQ(slice_arr, escaped_small_arr);
+    EXPECT_EQ(slice_obj.size(), 6u);
+    EXPECT_EQ(escaped_subobj["final_nested"][0],
+              "alpha_long_string_that_is_not_sso_at_all_12345");
+
+    // Mutate, pin, erase, swap, clear, and materialize escaped values.
+    jk pinned_copy = escaped_str;
+    std::string* pinned_ptr = escaped_str.get_ptr<std::string*>();
+    ASSERT_NE(pinned_ptr, nullptr);
+    pinned_ptr->append("_mutated");
+    EXPECT_EQ(escaped_str, "alpha_long_string_that_is_not_sso_at_all_12345_mutated");
+    EXPECT_EQ(pinned_copy, "alpha_long_string_that_is_not_sso_at_all_12345");
+
+    std::string tmp_swap = "swapped_val";
+    escaped_empty_str.swap(tmp_swap);
+    EXPECT_EQ(escaped_empty_str, "swapped_val");
+    EXPECT_EQ(tmp_swap, "");
+
+    jk to_clear = pinned_copy;
+    to_clear.clear();
+    EXPECT_TRUE(to_clear.is_string());
+    EXPECT_EQ(to_clear, "");
+
+    jk to_erase = escaped_small_arr;
+    to_erase.erase(0u);
+    EXPECT_EQ(to_erase.size(), 1u);
+    EXPECT_EQ(to_erase[0], 99);
+
+    escaped_subobj.materialize();
+    EXPECT_EQ(escaped_subobj["final_nested"][1], 99);
+
+    // Cross-representation == and < across Lazy (1u), Arena (4u), Small (2u), Empty (3u), Eager (0u).
+    jk eager_arr = jk::array({"alpha_long_string_that_is_not_sso_at_all_12345", 99});
+    EXPECT_EQ(escaped_small_arr, eager_arr);
+    EXPECT_FALSE(escaped_small_arr < eager_arr);
+    EXPECT_FALSE(eager_arr < escaped_small_arr);
+
+    // 4-thread concurrent const traversal + indexed >16-key lookup + compat_cache + dump + copy.
+    std::string conc_raw = "{";
+    for (int i = 0; i < 40; ++i) {
+        if (i > 0) {
+            conc_raw += ',';
+        }
+        conc_raw += "\"item_" + std::to_string(i) +
+                    "\":{\"text\":\"concurrent_arena_string_value_long_" + std::to_string(i) +
+                    "\",\"arr\":[" + std::to_string(i) + "," + std::to_string(i * 2) + "]}";
+    }
+    conc_raw += '}';
+    const jk shared_doc = jk::parse(conc_raw);
+    const std::string expected_dump = oj::parse(conc_raw).dump();
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int iter = 0; iter < 16; ++iter) {
+                const int idx = (iter * 7 + t) % 40;
+                const std::string k = "item_" + std::to_string(idx);
+                ASSERT_TRUE(shared_doc.contains(k));
+                const jk& sub = shared_doc.at(k);
+                EXPECT_EQ(sub["arr"][1].get<int>(), idx * 2);
+                const std::string expected_s =
+                    "concurrent_arena_string_value_long_" + std::to_string(idx);
+                EXPECT_EQ(sub.find("text")->get_ref<const std::string&>(), expected_s);
+
+                if (iter == 0) {
+                    const auto* sub_obj = sub.get_ptr<const jk::object_t*>();
+                    ASSERT_NE(sub_obj, nullptr);
+                    EXPECT_EQ(sub_obj->size(), 2u);
+                    const auto* sub_arr = sub["arr"].get_ptr<const jk::array_t*>();
+                    ASSERT_NE(sub_arr, nullptr);
+                    EXPECT_EQ(sub_arr->size(), 2u);
+                }
+
+                jk local_copy = sub;
+                EXPECT_EQ(local_copy["text"], expected_s);
+            }
+            if (t == 0) {
+                EXPECT_EQ(shared_doc.dump(), expected_dump);
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
     }
 }
 

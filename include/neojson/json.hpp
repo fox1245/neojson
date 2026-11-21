@@ -195,8 +195,18 @@ inline bool operator<(const value_t lhs, const value_t rhs) noexcept {
     return l_index < order.size() && r_index < order.size() && order[l_index] < order[r_index];
 }
 
+struct SharedYyDoc;
+struct SmallArray2;
+struct SmallObject4;
+struct ArenaArray;
+struct ArenaObject;
+struct ArenaHashIndex;
+inline constexpr std::size_t kSmallObjCap = 4u;
+inline constexpr std::uint32_t kArenaStringRef = 0xC0000000u;
+
 struct LazyHeader {
     std::atomic<void*> materialized{nullptr};
+    std::atomic<void*> arena_view{nullptr};
     std::size_t raw_len = 0;
     std::atomic<std::uint32_t> refcount{1u};
     // Bitmask: 0 = unknown, 1 = own-level unique, 2 = own-level has duplicate keys,
@@ -205,18 +215,15 @@ struct LazyHeader {
 };
 
 struct SharedString {
-    // 0u = unshareable (pinned because caller obtained mutable string_t* / string_t&)
+    // 0u = unshareable (pinned), kArenaStringRef = DocArena-owned string
     std::atomic<std::uint32_t> refcount{1u};
     std::string value;
+    SharedYyDoc* owner_doc = nullptr;
 
     template <typename... Args>
     explicit SharedString(Args&&... args) : value(std::forward<Args>(args)...) {}
 };
 static_assert(sizeof(SharedString) <= 48u, "SharedString should fit in small pooled slab");
-
-struct SmallArray2;
-struct SmallObject4;
-inline constexpr std::size_t kSmallObjCap = 4u;
 
 void lazy_release(LazyHeader* node, value_t type) noexcept;
 const void* lazy_materialize_const(LazyHeader* node, value_t type);
@@ -228,6 +235,13 @@ bool lazy_equal(const json& lhs, const json& rhs) noexcept;
 bool lazy_less(const json& lhs, const json& rhs) noexcept;
 void lazy_materialize_deep(json& j);
 void* lazy_steal_owned_materialized(LazyHeader* node, value_t type) noexcept;
+void shared_doc_addref(SharedYyDoc* sdoc) noexcept;
+void shared_doc_release(SharedYyDoc* sdoc) noexcept;
+const void* lazy_materialize_arena(LazyHeader* node, value_t type);
+NEOJSON_NOINLINE ArenaHashIndex* arena_obj_build_index_slow(const ArenaObject* ao) noexcept;
+void arena_clone_to_owned(json& dst, const json& src);
+const void* arena_compat_array(const ArenaArray* aa);
+const void* arena_compat_object(const ArenaObject* ao);
 
 [[noreturn]] void throw_invalid_iterator(int id, const char* msg);
 [[noreturn]] void throw_type_error(int id, const char* prefix, const char* type_name);
@@ -400,6 +414,107 @@ NEOJSON_ALWAYS_INLINE std::uint64_t hash_bytes(const char* data, const std::size
         return fmix64(h);
     }
     return hash_bytes_long(data, len, h);
+}
+
+struct ArenaArray {
+    std::uint32_t count = 0u;
+    std::uint32_t pad = 0u;
+    SharedYyDoc* doc = nullptr;
+
+    json* elems() noexcept {
+        return std::launder(
+            reinterpret_cast<json*>(reinterpret_cast<unsigned char*>(this) + sizeof(ArenaArray)));
+    }
+
+    const json* elems() const noexcept {
+        return std::launder(reinterpret_cast<const json*>(
+            reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaArray)));
+    }
+};
+static_assert(sizeof(ArenaArray) == 16u && alignof(ArenaArray) == alignof(void*),
+              "ArenaArray must stay 16-byte pointer-aligned");
+
+struct ArenaHashSlot {
+    std::uint32_t idx_plus_one;
+    std::uint32_t hash32;
+};
+
+struct ArenaHashIndex {
+    std::size_t cap = 0u;
+    ArenaHashSlot* slots = nullptr;
+};
+
+struct ArenaObject {
+    std::uint32_t count = 0u;
+    std::uint32_t pad = 0u;
+    SharedYyDoc* doc = nullptr;
+    mutable std::atomic<ArenaHashIndex*> index{nullptr};
+
+    const std::string** keys() noexcept {
+        return std::launder(reinterpret_cast<const std::string**>(
+            reinterpret_cast<unsigned char*>(this) + sizeof(ArenaObject)));
+    }
+
+    const std::string* const* keys() const noexcept {
+        return std::launder(reinterpret_cast<const std::string* const*>(
+            reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaObject)));
+    }
+
+    json* vals() noexcept {
+        return std::launder(reinterpret_cast<json*>(
+            reinterpret_cast<unsigned char*>(this) + sizeof(ArenaObject) +
+            static_cast<std::size_t>(count) * sizeof(const std::string*)));
+    }
+
+    const json* vals() const noexcept {
+        return std::launder(reinterpret_cast<const json*>(
+            reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaObject) +
+            static_cast<std::size_t>(count) * sizeof(const std::string*)));
+    }
+};
+static_assert(sizeof(ArenaObject) == 24u && alignof(ArenaObject) == alignof(void*),
+              "ArenaObject must preserve alignment for trailing pointers and json values");
+
+NEOJSON_ALWAYS_INLINE std::size_t arena_obj_find(const ArenaObject* ao,
+                                                 const std::string_view sv) noexcept {
+    const std::size_t n = ao->count;
+    const std::string* const* ks = ao->keys();
+    if (n > kOrderedMapHashThreshold) {
+        const ArenaHashIndex* hidx = ao->index.load(std::memory_order_acquire);
+        if (hidx == nullptr) {
+            hidx = arena_obj_build_index_slow(ao);
+        }
+        if (hidx != nullptr) {
+            const std::uint64_t h = hash_bytes(sv.data(), sv.size());
+            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+            const std::size_t mask = hidx->cap - 1u;
+            std::size_t pos = static_cast<std::size_t>(h) & mask;
+            const ArenaHashSlot* slots = hidx->slots;
+            for (;;) {
+                const ArenaHashSlot s = slots[pos];
+                if (s.idx_plus_one == 0u) {
+                    return n;
+                }
+                if (s.hash32 == h32) {
+                    const std::size_t elem_idx = static_cast<std::size_t>(s.idx_plus_one - 1u);
+                    const std::string& k = *ks[elem_idx];
+                    if (k.size() == sv.size() &&
+                        (sv.empty() || std::memcmp(k.data(), sv.data(), sv.size()) == 0)) {
+                        return elem_idx;
+                    }
+                }
+                pos = (pos + 1u) & mask;
+            }
+        }
+    }
+    for (std::size_t i = 0u; i < n; ++i) {
+        const std::string& k = *ks[i];
+        if (k.size() == sv.size() &&
+            (sv.empty() || std::memcmp(k.data(), sv.data(), sv.size()) == 0)) {
+            return i;
+        }
+    }
+    return n;
 }
 
 } // namespace detail
@@ -1585,19 +1700,39 @@ private:
                     }
                 }
                 if constexpr (std::is_const<BasicJsonType>::value) {
-                    const typename BasicJsonType::object_t* obj = nullptr;
-                    if (object->m_storage == 0u) {
-                        obj = object->m_value.object;
-                    } else if (object->m_storage == 1u) {
-                        void* mat =
-                            object->m_value.lazy->materialized.load(std::memory_order_acquire);
-                        obj = mat != nullptr
-                                  ? static_cast<const typename BasicJsonType::object_t*>(mat)
-                                  : object->const_object_slow();
-                    } else {
+                    if (object->m_storage == 4u) {
+                        const auto* ao = object->m_value.arena_obj;
+                        if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
+                            throw_invalid_iterator(214, "cannot get value");
+                        }
+                        return ao->vals()[static_cast<std::size_t>(idx)];
+                    }
+                    if (object->m_storage == 1u) {
+                        void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
+                        if (av == nullptr) {
+                            if (void* mat = object->m_value.lazy->materialized.load(
+                                    std::memory_order_acquire)) {
+                                const auto* obj =
+                                    static_cast<const typename BasicJsonType::object_t*>(mat);
+                                if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                                    throw_invalid_iterator(214, "cannot get value");
+                                }
+                                return (*obj)[static_cast<std::size_t>(idx)].second;
+                            }
+                            av = const_cast<void*>(
+                                detail::lazy_materialize_arena(object->m_value.lazy, value_t::object));
+                        }
+                        const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                        if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
+                            throw_invalid_iterator(214, "cannot get value");
+                        }
+                        return ao->vals()[static_cast<std::size_t>(idx)];
+                    }
+                    if (object->m_storage != 0u) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
-                    if (static_cast<std::size_t>(idx) >= obj->size()) {
+                    const auto* obj = object->m_value.object;
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*obj)[static_cast<std::size_t>(idx)].second;
@@ -1631,19 +1766,39 @@ private:
                     }
                 }
                 if constexpr (std::is_const<BasicJsonType>::value) {
-                    const typename BasicJsonType::array_t* arr = nullptr;
-                    if (object->m_storage == 0u) {
-                        arr = object->m_value.array;
-                    } else if (object->m_storage == 1u) {
-                        void* mat =
-                            object->m_value.lazy->materialized.load(std::memory_order_acquire);
-                        arr = mat != nullptr
-                                  ? static_cast<const typename BasicJsonType::array_t*>(mat)
-                                  : object->const_array_slow();
-                    } else {
+                    if (object->m_storage == 4u) {
+                        const auto* aa = object->m_value.arena_arr;
+                        if (idx < 0 || static_cast<std::size_t>(idx) >= aa->count) {
+                            throw_invalid_iterator(214, "cannot get value");
+                        }
+                        return aa->elems()[static_cast<std::size_t>(idx)];
+                    }
+                    if (object->m_storage == 1u) {
+                        void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
+                        if (av == nullptr) {
+                            if (void* mat = object->m_value.lazy->materialized.load(
+                                    std::memory_order_acquire)) {
+                                const auto* arr =
+                                    static_cast<const typename BasicJsonType::array_t*>(mat);
+                                if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                                    throw_invalid_iterator(214, "cannot get value");
+                                }
+                                return (*arr)[static_cast<std::size_t>(idx)];
+                            }
+                            av = const_cast<void*>(
+                                detail::lazy_materialize_arena(object->m_value.lazy, value_t::array));
+                        }
+                        const auto* aa = static_cast<const detail::ArenaArray*>(av);
+                        if (idx < 0 || static_cast<std::size_t>(idx) >= aa->count) {
+                            throw_invalid_iterator(214, "cannot get value");
+                        }
+                        return aa->elems()[static_cast<std::size_t>(idx)];
+                    }
+                    if (object->m_storage != 0u) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
-                    if (static_cast<std::size_t>(idx) >= arr->size()) {
+                    const auto* arr = object->m_value.array;
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
                     return (*arr)[static_cast<std::size_t>(idx)];
@@ -1672,24 +1827,31 @@ private:
         if (object != nullptr && idx >= 0) {
             const auto u_idx = static_cast<std::size_t>(idx);
             if (object->m_type == value_t::object) {
-                if (object->m_storage == 0u) {
-                    auto* obj = object->m_value.object;
-                    if (u_idx < obj->size()) {
-                        return (*obj)[u_idx].second;
-                    }
-                } else if (object->m_storage == 2u) {
-                    auto* so = object->m_value.small_obj;
-                    if (u_idx < BasicJsonType::small_obj_size(so)) {
-                        if constexpr (std::is_const<BasicJsonType>::value) {
-                            return BasicJsonType::small_obj_val(so, u_idx);
-                        } else if (!BasicJsonType::small_obj_has_const_cache(so)) {
+                if constexpr (std::is_const<BasicJsonType>::value) {
+                    if (object->m_storage == 4u) {
+                        const auto* ao = object->m_value.arena_obj;
+                        if (u_idx < ao->count) {
+                            return ao->vals()[u_idx];
+                        }
+                    } else if (object->m_storage == 0u) {
+                        const auto* obj = object->m_value.object;
+                        if (u_idx < obj->size()) {
+                            return (*obj)[u_idx].second;
+                        }
+                    } else if (object->m_storage == 2u) {
+                        const auto* so = object->m_value.small_obj;
+                        if (u_idx < BasicJsonType::small_obj_size(so)) {
                             return BasicJsonType::small_obj_val(so, u_idx);
                         }
-                    }
-                } else if constexpr (std::is_const<BasicJsonType>::value) {
-                    if (object->m_storage == 1u) {
-                        if (void* mat = object->m_value.lazy->materialized.load(
+                    } else if (object->m_storage == 1u) {
+                        if (void* av = object->m_value.lazy->arena_view.load(
                                 std::memory_order_acquire)) {
+                            const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                            if (u_idx < ao->count) {
+                                return ao->vals()[u_idx];
+                            }
+                        } else if (void* mat = object->m_value.lazy->materialized.load(
+                                       std::memory_order_acquire)) {
                             const auto* obj =
                                 static_cast<const typename BasicJsonType::object_t*>(mat);
                             if (u_idx < obj->size()) {
@@ -1697,31 +1859,64 @@ private:
                             }
                         }
                     }
-                }
-            } else if (object->m_type == value_t::array) {
-                if (object->m_storage == 0u) {
-                    auto* arr = object->m_value.array;
-                    if (u_idx < arr->size()) {
-                        return (*arr)[u_idx];
-                    }
-                } else if (object->m_storage == 2u) {
-                    auto* sa = object->m_value.small_arr;
-                    if (u_idx < BasicJsonType::small_arr_size(sa)) {
-                        if constexpr (std::is_const<BasicJsonType>::value) {
-                            return BasicJsonType::small_arr_elem(sa, u_idx);
-                        } else if (!BasicJsonType::small_arr_has_const_cache(sa)) {
-                            return BasicJsonType::small_arr_elem(sa, u_idx);
+                } else {
+                    if (object->m_storage == 0u) {
+                        auto* obj = object->m_value.object;
+                        if (u_idx < obj->size()) {
+                            return (*obj)[u_idx].second;
+                        }
+                    } else if (object->m_storage == 2u) {
+                        auto* so = object->m_value.small_obj;
+                        if (u_idx < BasicJsonType::small_obj_size(so) &&
+                            !BasicJsonType::small_obj_has_const_cache(so)) {
+                            return BasicJsonType::small_obj_val(so, u_idx);
                         }
                     }
-                } else if constexpr (std::is_const<BasicJsonType>::value) {
-                    if (object->m_storage == 1u) {
-                        if (void* mat = object->m_value.lazy->materialized.load(
+                }
+            } else if (object->m_type == value_t::array) {
+                if constexpr (std::is_const<BasicJsonType>::value) {
+                    if (object->m_storage == 4u) {
+                        const auto* aa = object->m_value.arena_arr;
+                        if (u_idx < aa->count) {
+                            return aa->elems()[u_idx];
+                        }
+                    } else if (object->m_storage == 0u) {
+                        const auto* arr = object->m_value.array;
+                        if (u_idx < arr->size()) {
+                            return (*arr)[u_idx];
+                        }
+                    } else if (object->m_storage == 2u) {
+                        const auto* sa = object->m_value.small_arr;
+                        if (u_idx < BasicJsonType::small_arr_size(sa)) {
+                            return BasicJsonType::small_arr_elem(sa, u_idx);
+                        }
+                    } else if (object->m_storage == 1u) {
+                        if (void* av = object->m_value.lazy->arena_view.load(
                                 std::memory_order_acquire)) {
+                            const auto* aa = static_cast<const detail::ArenaArray*>(av);
+                            if (u_idx < aa->count) {
+                                return aa->elems()[u_idx];
+                            }
+                        } else if (void* mat = object->m_value.lazy->materialized.load(
+                                       std::memory_order_acquire)) {
                             const auto* arr =
                                 static_cast<const typename BasicJsonType::array_t*>(mat);
                             if (u_idx < arr->size()) {
                                 return (*arr)[u_idx];
                             }
+                        }
+                    }
+                } else {
+                    if (object->m_storage == 0u) {
+                        auto* arr = object->m_value.array;
+                        if (u_idx < arr->size()) {
+                            return (*arr)[u_idx];
+                        }
+                    } else if (object->m_storage == 2u) {
+                        auto* sa = object->m_value.small_arr;
+                        if (u_idx < BasicJsonType::small_arr_size(sa) &&
+                            !BasicJsonType::small_arr_has_const_cache(sa)) {
+                            return BasicJsonType::small_arr_elem(sa, u_idx);
                         }
                     }
                 }
@@ -1735,6 +1930,13 @@ private:
         if (object == nullptr || object->m_type != value_t::object) {
             throw_invalid_iterator(207, "cannot use key() for non-object iterators");
         }
+        if (object->m_storage == 4u) {
+            const auto* ao = object->m_value.arena_obj;
+            if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
+                throw_invalid_iterator(214, "cannot get value");
+            }
+            return *ao->keys()[static_cast<std::size_t>(idx)];
+        }
         if (object->m_storage == 2u) {
             const auto* cso = object->m_value.small_obj;
             if (idx < 0 || static_cast<std::size_t>(idx) >= BasicJsonType::small_obj_size(cso)) {
@@ -1746,9 +1948,29 @@ private:
         if (object->m_storage == 0u) {
             obj = object->m_value.object;
         } else if (object->m_storage == 1u) {
-            void* mat = object->m_value.lazy->materialized.load(std::memory_order_acquire);
-            obj = mat != nullptr ? static_cast<const typename BasicJsonType::object_t*>(mat)
-                                 : object->const_object_slow();
+            if constexpr (std::is_const<BasicJsonType>::value) {
+                void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
+                if (av == nullptr) {
+                    if (void* mat =
+                            object->m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                        obj = static_cast<const typename BasicJsonType::object_t*>(mat);
+                    } else {
+                        av = const_cast<void*>(
+                            detail::lazy_materialize_arena(object->m_value.lazy, value_t::object));
+                    }
+                }
+                if (av != nullptr) {
+                    const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    return *ao->keys()[static_cast<std::size_t>(idx)];
+                }
+            } else {
+                void* mat = object->m_value.lazy->materialized.load(std::memory_order_acquire);
+                obj = mat != nullptr ? static_cast<const typename BasicJsonType::object_t*>(mat)
+                                     : object->const_object_slow();
+            }
         } else {
             throw_invalid_iterator(214, "cannot get value");
         }
@@ -1762,7 +1984,12 @@ private:
         pointer object, difference_type idx) {
         if (object != nullptr && object->m_type == value_t::object && idx >= 0) {
             const auto u_idx = static_cast<std::size_t>(idx);
-            if (object->m_storage == 0u) {
+            if (object->m_storage == 4u) {
+                const auto* ao = object->m_value.arena_obj;
+                if (u_idx < ao->count) {
+                    return *ao->keys()[u_idx];
+                }
+            } else if (object->m_storage == 0u) {
                 const auto* obj = object->m_value.object;
                 if (u_idx < obj->size()) {
                     return (*obj)[u_idx].first;
@@ -1773,11 +2000,29 @@ private:
                     return BasicJsonType::small_obj_key(so, u_idx);
                 }
             } else if (object->m_storage == 1u) {
-                if (void* mat =
-                        object->m_value.lazy->materialized.load(std::memory_order_acquire)) {
-                    const auto* obj = static_cast<const typename BasicJsonType::object_t*>(mat);
-                    if (u_idx < obj->size()) {
-                        return (*obj)[u_idx].first;
+                if constexpr (std::is_const<BasicJsonType>::value) {
+                    if (void* av = object->m_value.lazy->arena_view.load(
+                            std::memory_order_acquire)) {
+                        const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                        if (u_idx < ao->count) {
+                            return *ao->keys()[u_idx];
+                        }
+                    } else if (void* mat = object->m_value.lazy->materialized.load(
+                                   std::memory_order_acquire)) {
+                        const auto* obj =
+                            static_cast<const typename BasicJsonType::object_t*>(mat);
+                        if (u_idx < obj->size()) {
+                            return (*obj)[u_idx].first;
+                        }
+                    }
+                } else {
+                    if (void* mat = object->m_value.lazy->materialized.load(
+                            std::memory_order_acquire)) {
+                        const auto* obj =
+                            static_cast<const typename BasicJsonType::object_t*>(mat);
+                        if (u_idx < obj->size()) {
+                            return (*obj)[u_idx].first;
+                        }
                     }
                 }
             }
@@ -3665,6 +3910,14 @@ private:
         }
     }
 
+    NEOJSON_ALWAYS_INLINE void release_string_storage() noexcept {
+        if (m_storage == 5u) {
+            detail::shared_doc_release(m_value.string->owner_doc);
+        } else if (m_storage == 0u) {
+            release_string(m_value.string);
+        }
+    }
+
     static detail::SharedString* share_or_clone_string(detail::SharedString* src) {
         const std::uint32_t rc = src->refcount.load(std::memory_order_acquire);
         if (rc != 0u && rc < 0x80000000u) {
@@ -3676,35 +3929,51 @@ private:
 
     string_t* mutable_string_unique() {
         detail::SharedString* s = m_value.string;
-        if (s->refcount.load(std::memory_order_acquire) <= 1u) {
+        if (m_storage == 0u && s->refcount.load(std::memory_order_acquire) <= 1u) {
             return &s->value;
         }
         detail::SharedString* fresh = create_string(s->value);
         m_value.string = fresh;
-        release_string(s);
+        if (m_storage == 5u) {
+            m_storage = 0u;
+            detail::shared_doc_release(s->owner_doc);
+        } else if (m_storage == 0u) {
+            release_string(s);
+        } else {
+            m_storage = 0u;
+        }
         return &fresh->value;
     }
 
     string_t* mutable_string_pin() {
         detail::SharedString* s = m_value.string;
-        const std::uint32_t rc = s->refcount.load(std::memory_order_acquire);
-        if (rc == 0u) {
-            return &s->value;
-        }
-        if (rc == 1u) {
-            s->refcount.store(0u, std::memory_order_relaxed);
-            return &s->value;
+        if (m_storage == 0u) {
+            const std::uint32_t rc = s->refcount.load(std::memory_order_acquire);
+            if (rc == 0u) {
+                return &s->value;
+            }
+            if (rc == 1u) {
+                s->refcount.store(0u, std::memory_order_relaxed);
+                return &s->value;
+            }
         }
         detail::SharedString* fresh = create_string(s->value);
         fresh->refcount.store(0u, std::memory_order_relaxed);
         m_value.string = fresh;
-        release_string(s);
+        if (m_storage == 5u) {
+            m_storage = 0u;
+            detail::shared_doc_release(s->owner_doc);
+        } else if (m_storage == 0u) {
+            release_string(s);
+        } else {
+            m_storage = 0u;
+        }
         return &fresh->value;
     }
 
     static string_t extract_string_key(json& key_json) {
         detail::SharedString* s = key_json.m_value.string;
-        if (s->refcount.load(std::memory_order_acquire) <= 1u) {
+        if (key_json.m_storage == 0u && s->refcount.load(std::memory_order_acquire) <= 1u) {
             return std::move(s->value);
         }
         return s->value;
@@ -3799,6 +4068,8 @@ private:
         array_t* array;
         detail::SmallArray2* small_arr;
         detail::SmallObject4* small_obj;
+        detail::ArenaArray* arena_arr;
+        detail::ArenaObject* arena_obj;
         detail::SharedString* string;
         detail::LazyHeader* lazy;
         boolean_t boolean;
@@ -3854,7 +4125,7 @@ private:
                 return (j.m_type == value_t::array && j.m_value.small_arr != nullptr) ||
                        (j.m_type == value_t::object && j.m_value.small_obj != nullptr);
             }
-            if (j.m_storage == 3u) {
+            if (j.m_storage >= 3u) {
                 return false;
             }
             return (j.m_type == value_t::array && j.m_value.array != nullptr) ||
@@ -3904,7 +4175,7 @@ private:
                                current.m_value.small_obj != nullptr) {
                         take_small_object_containers(*current.m_value.small_obj, stack);
                     }
-                } else if (current.m_storage == 3u) {
+                } else if (current.m_storage >= 3u) {
                     continue;
                 } else if (current.m_type == value_t::array) {
                     if (current.m_value.array != nullptr) {
@@ -4247,13 +4518,48 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (m_type == value_t::string) {
-                    m_value.string = share_or_clone_string(first.m_object->m_value.string);
+                    if (first.m_object->m_storage == 4u || first.m_object->m_storage == 5u) {
+                        detail::SharedString* ss = first.m_object->m_value.string;
+                        m_value.string = ss;
+                        if (ss->owner_doc != nullptr) {
+                            detail::shared_doc_addref(ss->owner_doc);
+                            m_storage = 5u;
+                        } else {
+                            m_storage = 4u;
+                        }
+                    } else {
+                        m_value.string = share_or_clone_string(first.m_object->m_value.string);
+                    }
                 } else {
                     m_value = first.m_object->m_value;
                 }
                 break;
             }
             case value_t::array: {
+                if (first.m_object->m_storage == 4u) {
+                    const detail::ArenaArray* aa = first.m_object->m_value.arena_arr;
+                    const auto sz = static_cast<difference_type>(aa->count);
+                    if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
+                        m_type = value_t::null;
+                        throw invalid_iterator::create(204, "iterators out of range");
+                    }
+                    const difference_type slice = last.idx_ - first.idx_;
+                    if (slice == 1) {
+                        m_value.small_arr =
+                            create_small_array1(aa->elems()[static_cast<std::size_t>(first.idx_)]);
+                        m_storage = 2u;
+                    } else if (slice == 2) {
+                        m_value.small_arr = create_small_array2_copy(
+                            aa->elems()[static_cast<std::size_t>(first.idx_)],
+                            aa->elems()[static_cast<std::size_t>(first.idx_ + 1)]);
+                        m_storage = 2u;
+                    } else if (slice > 2) {
+                        m_value.array = create_array(aa->elems() + first.idx_, aa->elems() + last.idx_);
+                    } else {
+                        m_storage = 3u;
+                    }
+                    break;
+                }
                 if (first.m_object->m_storage == 2u) {
                     const detail::SmallArray2* sa = first.m_object->m_value.small_arr;
                     const auto sz = static_cast<difference_type>(small_arr_size(sa));
@@ -4299,6 +4605,53 @@ public:
                 break;
             }
             case value_t::object: {
+                if (first.m_object->m_storage == 4u) {
+                    const detail::ArenaObject* ao = first.m_object->m_value.arena_obj;
+                    const auto sz = static_cast<difference_type>(ao->count);
+                    if (first.idx_ < 0 || last.idx_ < first.idx_ || last.idx_ > sz) {
+                        m_type = value_t::null;
+                        throw invalid_iterator::create(204, "iterators out of range");
+                    }
+                    const difference_type slice = last.idx_ - first.idx_;
+                    if (slice > 0 && static_cast<std::size_t>(slice) <= detail::kSmallObjCap) {
+                        detail::SmallObject4* so = create_small_object_empty();
+                        struct SmallObjGuard {
+                            detail::SmallObject4* p;
+                            ~SmallObjGuard() {
+                                if (p != nullptr) {
+                                    json::destroy_small_object(p);
+                                }
+                            }
+                        } guard{so};
+                        for (difference_type i = first.idx_; i < last.idx_; ++i) {
+                            small_obj_emplace_entry(
+                                so, std::string_view(*ao->keys()[i]), json(ao->vals()[i]));
+                        }
+                        guard.p = nullptr;
+                        m_value.small_obj = so;
+                        m_storage = 2u;
+                    } else if (slice > 0) {
+                        object_t* obj = create_object();
+                        struct ObjGuard {
+                            object_t* p;
+                            ~ObjGuard() {
+                                if (p != nullptr) {
+                                    json::destroy_object(p);
+                                }
+                            }
+                        } guard{obj};
+                        obj->reserve_vector_only(static_cast<std::size_t>(slice));
+                        for (difference_type i = first.idx_; i < last.idx_; ++i) {
+                            obj->emplace_back_unindexed(
+                                std::string_view(*ao->keys()[i]), json(ao->vals()[i]));
+                        }
+                        guard.p = nullptr;
+                        m_value.object = obj;
+                    } else {
+                        m_storage = 3u;
+                    }
+                    break;
+                }
                 if (first.m_object->m_storage == 2u) {
                     const detail::SmallObject4* so = first.m_object->m_value.small_obj;
                     const auto sz = static_cast<difference_type>(small_obj_size(so));
@@ -4501,6 +4854,25 @@ public:
 
     const_reference at(const typename object_t::key_type& key) const {
         if (is_object()) {
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
+            } else if (m_storage == 1u) {
+                void* av = m_value.lazy->arena_view.load(std::memory_order_acquire);
+                if (av != nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(av);
+                } else if (m_value.lazy->materialized.load(std::memory_order_acquire) == nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(
+                        detail::lazy_materialize_arena(m_value.lazy, m_type));
+                }
+            }
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, std::string_view(key));
+                if (idx >= ao->count) {
+                    throw out_of_range::create(403, "key '" + key + "' not found");
+                }
+                return ao->vals()[idx];
+            }
             if (m_storage == 2u) {
                 const detail::SmallObject4* so = m_value.small_obj;
                 const std::size_t idx = small_obj_find(so, std::string_view(key));
@@ -4577,6 +4949,25 @@ public:
     const_reference at(const KeyType& key) const {
         if (is_object()) {
             std::string_view sv(key);
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
+            } else if (m_storage == 1u) {
+                void* av = m_value.lazy->arena_view.load(std::memory_order_acquire);
+                if (av != nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(av);
+                } else if (m_value.lazy->materialized.load(std::memory_order_acquire) == nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(
+                        detail::lazy_materialize_arena(m_value.lazy, m_type));
+                }
+            }
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, sv);
+                if (idx >= ao->count) {
+                    throw out_of_range::create(403, "key '" + std::string(sv) + "' not found");
+                }
+                return ao->vals()[idx];
+            }
             if (m_storage == 2u) {
                 const detail::SmallObject4* so = m_value.small_obj;
                 const std::size_t idx = small_obj_find(so, sv);
@@ -4615,16 +5006,21 @@ public:
 
     NEOJSON_ALWAYS_INLINE const_reference operator[](const typename object_t::key_type& key) const {
         if (m_type == value_t::object) {
-            const object_t* obj = nullptr;
-            if (m_storage == 0u) {
-                obj = m_value.object;
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
             } else if (m_storage == 1u) {
-                obj = static_cast<const object_t*>(
-                    m_value.lazy->materialized.load(std::memory_order_acquire));
+                ao = static_cast<const detail::ArenaObject*>(
+                    m_value.lazy->arena_view.load(std::memory_order_acquire));
             }
-            if (obj != nullptr) {
-                auto it = obj->find(key);
-                assert(it != obj->end());
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, std::string_view(key));
+                assert(idx < ao->count);
+                return ao->vals()[idx];
+            }
+            if (m_storage == 0u) {
+                auto it = m_value.object->find(key);
+                assert(it != m_value.object->end());
                 return it->second;
             }
         }
@@ -4646,16 +5042,21 @@ public:
     NEOJSON_ALWAYS_INLINE const_reference operator[](CharT* key) const {
         const std::string_view sv(key);
         if (m_type == value_t::object) {
-            const object_t* obj = nullptr;
-            if (m_storage == 0u) {
-                obj = m_value.object;
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
             } else if (m_storage == 1u) {
-                obj = static_cast<const object_t*>(
-                    m_value.lazy->materialized.load(std::memory_order_acquire));
+                ao = static_cast<const detail::ArenaObject*>(
+                    m_value.lazy->arena_view.load(std::memory_order_acquire));
             }
-            if (obj != nullptr) {
-                auto it = obj->find(sv);
-                assert(it != obj->end());
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, sv);
+                assert(idx < ao->count);
+                return ao->vals()[idx];
+            }
+            if (m_storage == 0u) {
+                auto it = m_value.object->find(sv);
+                assert(it != m_value.object->end());
                 return it->second;
             }
         }
@@ -4689,16 +5090,21 @@ public:
     NEOJSON_ALWAYS_INLINE const_reference operator[](const KeyType& key) const {
         const std::string_view sv(key);
         if (m_type == value_t::object) {
-            const object_t* obj = nullptr;
-            if (m_storage == 0u) {
-                obj = m_value.object;
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
             } else if (m_storage == 1u) {
-                obj = static_cast<const object_t*>(
-                    m_value.lazy->materialized.load(std::memory_order_acquire));
+                ao = static_cast<const detail::ArenaObject*>(
+                    m_value.lazy->arena_view.load(std::memory_order_acquire));
             }
-            if (obj != nullptr) {
-                auto it = obj->find(sv);
-                assert(it != obj->end());
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, sv);
+                assert(idx < ao->count);
+                return ao->vals()[idx];
+            }
+            if (m_storage == 0u) {
+                auto it = m_value.object->find(sv);
+                assert(it != m_value.object->end());
                 return it->second;
             }
         }
@@ -4819,6 +5225,22 @@ public:
 
     const_iterator find(const typename object_t::key_type& key) const {
         if (is_object()) {
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
+            } else if (m_storage == 1u) {
+                void* av = m_value.lazy->arena_view.load(std::memory_order_acquire);
+                if (av != nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(av);
+                } else if (m_value.lazy->materialized.load(std::memory_order_acquire) == nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(
+                        detail::lazy_materialize_arena(m_value.lazy, m_type));
+                }
+            }
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, std::string_view(key));
+                return const_iterator(this, static_cast<difference_type>(idx));
+            }
             if (m_storage == 2u) {
                 const detail::SmallObject4* so = m_value.small_obj;
                 const std::size_t idx = small_obj_find(so, std::string_view(key));
@@ -4870,6 +5292,22 @@ public:
     const_iterator find(KeyType&& key) const {
         if (is_object()) {
             const std::string_view sv(key);
+            const detail::ArenaObject* ao = nullptr;
+            if (m_storage == 4u) {
+                ao = m_value.arena_obj;
+            } else if (m_storage == 1u) {
+                void* av = m_value.lazy->arena_view.load(std::memory_order_acquire);
+                if (av != nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(av);
+                } else if (m_value.lazy->materialized.load(std::memory_order_acquire) == nullptr) {
+                    ao = static_cast<const detail::ArenaObject*>(
+                        detail::lazy_materialize_arena(m_value.lazy, m_type));
+                }
+            }
+            if (ao != nullptr) {
+                const std::size_t idx = detail::arena_obj_find(ao, sv);
+                return const_iterator(this, static_cast<difference_type>(idx));
+            }
             if (m_storage == 2u) {
                 const detail::SmallObject4* so = m_value.small_obj;
                 const std::size_t idx = small_obj_find(so, sv);
@@ -4905,6 +5343,10 @@ public:
         if (!is_object()) {
             return false;
         }
+        if (m_storage == 4u) {
+            const detail::ArenaObject* ao = m_value.arena_obj;
+            return detail::arena_obj_find(ao, std::string_view(key)) < ao->count;
+        }
         if (m_storage == 0u) {
             return m_value.object->contains(key);
         }
@@ -4913,6 +5355,10 @@ public:
             return small_obj_find(so, std::string_view(key)) < small_obj_size(so);
         }
         if (m_storage == 1u) {
+            if (void* av = m_value.lazy->arena_view.load(std::memory_order_acquire)) {
+                const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                return detail::arena_obj_find(ao, std::string_view(key)) < ao->count;
+            }
             if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                 return static_cast<const object_t*>(mat)->contains(key);
             }
@@ -4932,6 +5378,10 @@ public:
             return false;
         }
         const std::string_view sv(key);
+        if (m_storage == 4u) {
+            const detail::ArenaObject* ao = m_value.arena_obj;
+            return detail::arena_obj_find(ao, sv) < ao->count;
+        }
         if (m_storage == 0u) {
             return m_value.object->contains(sv);
         }
@@ -4940,6 +5390,10 @@ public:
             return small_obj_find(so, sv) < small_obj_size(so);
         }
         if (m_storage == 1u) {
+            if (void* av = m_value.lazy->arena_view.load(std::memory_order_acquire)) {
+                const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                return detail::arena_obj_find(ao, sv) < ao->count;
+            }
             if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                 return static_cast<const object_t*>(mat)->contains(sv);
             }
@@ -5300,8 +5754,9 @@ public:
                     throw invalid_iterator::create(205, "iterator out of range");
                 }
                 if (is_string()) {
-                    release_string(m_value.string);
+                    release_string_storage();
                     m_value.string = nullptr;
+                    m_storage = 0u;
                 }
                 m_type = value_t::null;
                 return IteratorType(this, 0);
@@ -5346,8 +5801,9 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (is_string()) {
-                    release_string(m_value.string);
+                    release_string_storage();
                     m_value.string = nullptr;
+                    m_storage = 0u;
                 }
                 m_type = value_t::null;
                 return IteratorType(this, 0);
@@ -5428,8 +5884,14 @@ public:
     }
 
     friend bool operator==(const json& lhs, const json& rhs) noexcept {
-        if (lhs.m_storage != 0u || rhs.m_storage != 0u) {
-            if (lhs.m_storage == 1u || rhs.m_storage == 1u) {
+        if ((lhs.m_storage | rhs.m_storage) != 0u) {
+            if (lhs.m_type == value_t::string || rhs.m_type == value_t::string) {
+                return lhs.m_type == rhs.m_type &&
+                       (lhs.m_value.string == rhs.m_value.string ||
+                        lhs.m_value.string->value == rhs.m_value.string->value);
+            }
+            if (lhs.m_storage == 1u || rhs.m_storage == 1u ||
+                lhs.m_storage == 4u || rhs.m_storage == 4u) {
                 return detail::lazy_equal(lhs, rhs);
             }
             return equal_with_small_container(lhs, rhs);
@@ -5549,8 +6011,16 @@ public:
     }
 
     friend bool operator<(const json& lhs, const json& rhs) noexcept {
-        if (lhs.m_storage != 0u || rhs.m_storage != 0u) {
-            if (lhs.m_storage == 1u || rhs.m_storage == 1u) {
+        if ((lhs.m_storage | rhs.m_storage) != 0u) {
+            if (lhs.m_type == value_t::string || rhs.m_type == value_t::string) {
+                if (lhs.m_type != rhs.m_type) {
+                    return operator<(lhs.m_type, rhs.m_type);
+                }
+                return lhs.m_value.string != rhs.m_value.string &&
+                       lhs.m_value.string->value < rhs.m_value.string->value;
+            }
+            if (lhs.m_storage == 1u || rhs.m_storage == 1u ||
+                lhs.m_storage == 4u || rhs.m_storage == 4u) {
                 return detail::lazy_less(lhs, rhs);
             }
             return less_with_small_container(lhs, rhs);
@@ -6266,7 +6736,7 @@ void json::destroy_small_array_slow(detail::SmallArray2*& sa) noexcept {
             for (std::size_t i = 0u; i < n; ++i) {
                 json& e = sa->elem(i);
                 if (e.m_type == value_t::string) {
-                    release_string(e.m_value.string);
+                    e.release_string_storage();
                 }
             }
         }
@@ -6547,7 +7017,7 @@ void json::destroy_small_object_slow(detail::SmallObject4*& so) noexcept {
             for (std::size_t i = 0u; i < n; ++i) {
                 entry_t& e = so->entry(i);
                 if (e.second.m_type == value_t::string) {
-                    release_string(e.second.m_value.string);
+                    e.second.release_string_storage();
                 }
                 std::destroy_at(&e.first);
             }
@@ -6606,6 +7076,10 @@ void json::destroy_non_trivial() noexcept {
         } else {
             destroy_small_object(m_value.small_obj);
         }
+    } else if (m_storage == 4u) {
+        return;
+    } else if (m_storage == 5u) {
+        detail::shared_doc_release(m_value.string->owner_doc);
     } else {
         m_value.destroy(m_type);
     }
@@ -6622,6 +7096,22 @@ void json::copy_non_trivial(const json& other) {
         } else {
             m_value.small_obj = clone_small_object(other.m_value.small_obj);
         }
+        return;
+    }
+    if (m_storage == 4u) {
+        if (m_type == value_t::string) {
+            detail::SharedYyDoc* owner = other.m_value.string->owner_doc;
+            if (owner != nullptr) {
+                detail::shared_doc_addref(owner);
+                m_storage = 5u;
+            }
+            return;
+        }
+        detail::arena_clone_to_owned(*this, other);
+        return;
+    }
+    if (m_storage == 5u) {
+        detail::shared_doc_addref(other.m_value.string->owner_doc);
         return;
     }
     switch (m_type) {
@@ -6694,11 +7184,32 @@ json::object_t* json::promote_small_object_mutable(const std::size_t reserve_cap
 }
 
 json::const_reference json::const_object_index_slow(const std::string_view key) const {
-    if (m_type == value_t::object && m_storage == 2u) {
-        const detail::SmallObject4* so = m_value.small_obj;
-        const std::size_t idx = small_obj_find(so, key);
-        assert(idx < small_obj_size(so));
-        return small_obj_val(so, idx);
+    if (m_type == value_t::object) {
+        if (m_storage == 2u) {
+            const detail::SmallObject4* so = m_value.small_obj;
+            const std::size_t idx = small_obj_find(so, key);
+            assert(idx < small_obj_size(so));
+            return small_obj_val(so, idx);
+        }
+        if (m_storage == 1u) {
+            if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
+                const auto* obj = static_cast<const object_t*>(mat);
+                auto it = obj->find(key);
+                assert(it != obj->end());
+                return it->second;
+            }
+            const auto* ao = static_cast<const detail::ArenaObject*>(
+                detail::lazy_materialize_arena(m_value.lazy, value_t::object));
+            const std::size_t idx = detail::arena_obj_find(ao, key);
+            assert(idx < ao->count);
+            return ao->vals()[idx];
+        }
+        if (m_storage == 4u) {
+            const detail::ArenaObject* ao = m_value.arena_obj;
+            const std::size_t idx = detail::arena_obj_find(ao, key);
+            assert(idx < ao->count);
+            return ao->vals()[idx];
+        }
     }
     if (!is_object()) {
         detail::throw_type_error(305, "cannot use operator[] with a string argument with ",
@@ -6861,6 +7372,9 @@ json::array_t* json::mutable_array_slow() {
 }
 
 const json::object_t* json::const_object_slow() const {
+    if (m_storage == 4u) {
+        return static_cast<const object_t*>(detail::arena_compat_object(m_value.arena_obj));
+    }
     if (m_storage == 1u) {
         if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
             return static_cast<const object_t*>(mat);
@@ -6874,6 +7388,9 @@ const json::object_t* json::const_object_slow() const {
 }
 
 const json::array_t* json::const_array_slow() const {
+    if (m_storage == 4u) {
+        return static_cast<const array_t*>(detail::arena_compat_array(m_value.arena_arr));
+    }
     if (m_storage == 1u) {
         if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
             return static_cast<const array_t*>(mat);
@@ -6888,6 +7405,9 @@ const json::array_t* json::const_array_slow() const {
 
 bool json::empty() const noexcept {
     if (m_type == value_t::array) {
+        if (m_storage == 4u) {
+            return false;
+        }
         if (m_storage == 0u) {
             return m_value.array->empty();
         }
@@ -6897,6 +7417,9 @@ bool json::empty() const noexcept {
         return m_storage == 3u;
     }
     if (m_type == value_t::object) {
+        if (m_storage == 4u) {
+            return false;
+        }
         if (m_storage == 0u) {
             return m_value.object->empty();
         }
@@ -6910,6 +7433,9 @@ bool json::empty() const noexcept {
 
 json::size_type json::size() const noexcept {
     if (m_type == value_t::array) {
+        if (m_storage == 4u) {
+            return m_value.arena_arr->count;
+        }
         if (m_storage == 0u) {
             return m_value.array->size();
         }
@@ -6919,12 +7445,18 @@ json::size_type json::size() const noexcept {
         return (m_storage == 2u) ? m_value.small_arr->count : 0u;
     }
     if (m_type == value_t::object) {
+        if (m_storage == 4u) {
+            return m_value.arena_obj->count;
+        }
         if (m_storage == 0u) {
             return m_value.object->size();
         }
         if (m_storage == 1u) {
             if ((m_value.lazy->dedup_state.load(std::memory_order_relaxed) & 1u) != 0u) {
                 return m_value.lazy->raw_len;
+            }
+            if (void* av = m_value.lazy->arena_view.load(std::memory_order_acquire)) {
+                return static_cast<const detail::ArenaObject*>(av)->count;
             }
             if (void* mat = m_value.lazy->materialized.load(std::memory_order_acquire)) {
                 return static_cast<const object_t*>(mat)->size();
@@ -6965,6 +7497,30 @@ inline json::reference json::at(const size_type idx) {
 
 inline json::const_reference json::at(const size_type idx) const {
     if (is_array()) {
+        if (m_storage == 4u) {
+            const detail::ArenaArray* aa = m_value.arena_arr;
+            if (idx >= aa->count) {
+                throw out_of_range::create(
+                    401, "array index " + std::to_string(idx) + " is out of range");
+            }
+            return aa->elems()[idx];
+        }
+        if (m_storage == 1u) {
+            void* av = m_value.lazy->arena_view.load(std::memory_order_acquire);
+            if (av != nullptr ||
+                m_value.lazy->materialized.load(std::memory_order_acquire) == nullptr) {
+                if (av == nullptr) {
+                    av = const_cast<void*>(
+                        detail::lazy_materialize_arena(m_value.lazy, value_t::array));
+                }
+                const auto* aa = static_cast<const detail::ArenaArray*>(av);
+                if (idx >= aa->count) {
+                    throw out_of_range::create(
+                        401, "array index " + std::to_string(idx) + " is out of range");
+                }
+                return aa->elems()[idx];
+            }
+        }
         if (m_storage == 2u) {
             if (idx >= m_value.small_arr->count) {
                 throw out_of_range::create(
@@ -7033,6 +7589,20 @@ inline json::reference json::operator[](const size_type idx) {
 
 inline json::const_reference json::operator[](const size_type idx) const {
     if (is_array()) {
+        if (m_storage == 4u) {
+            return m_value.arena_arr->elems()[idx];
+        }
+        if (m_storage == 1u) {
+            void* av = m_value.lazy->arena_view.load(std::memory_order_acquire);
+            if (av != nullptr ||
+                m_value.lazy->materialized.load(std::memory_order_acquire) == nullptr) {
+                if (av == nullptr) {
+                    av = const_cast<void*>(
+                        detail::lazy_materialize_arena(m_value.lazy, value_t::array));
+                }
+                return static_cast<const detail::ArenaArray*>(av)->elems()[idx];
+            }
+        }
         if (m_storage == 2u) {
             return m_value.small_arr->elem(idx);
         }
@@ -7057,13 +7627,20 @@ inline void json::clear() noexcept {
             m_value.boolean = false;
             break;
         case value_t::string:
-            if (m_value.string->refcount.load(std::memory_order_acquire) <= 1u) {
+            if (m_storage == 0u &&
+                m_value.string->refcount.load(std::memory_order_acquire) <= 1u) {
                 m_value.string->value.clear();
             } else {
                 detail::SharedString* fresh = create_string();
                 detail::SharedString* old = m_value.string;
+                const std::uint8_t old_storage = m_storage;
                 m_value.string = fresh;
-                release_string(old);
+                m_storage = 0u;
+                if (old_storage == 5u) {
+                    detail::shared_doc_release(old->owner_doc);
+                } else if (old_storage == 0u) {
+                    release_string(old);
+                }
             }
             break;
         case value_t::array:

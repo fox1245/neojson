@@ -1823,35 +1823,360 @@ struct json_access {
         j.m_value.object = obj;
         return j;
     }
+
+    static bool is_arena_array(const json& j) noexcept {
+        return j.m_storage == 4u && j.m_type == json::value_t::array;
+    }
+
+    static bool is_arena_object(const json& j) noexcept {
+        return j.m_storage == 4u && j.m_type == json::value_t::object;
+    }
+
+    static ArenaArray* arena_array_ptr(const json& j) noexcept {
+        return j.m_value.arena_arr;
+    }
+
+    static ArenaObject* arena_object_ptr(const json& j) noexcept {
+        return j.m_value.arena_obj;
+    }
+
+    static std::uint8_t storage_of(const json& j) noexcept {
+        return j.m_storage;
+    }
+
+    static SharedString* shared_string_ptr(const json& j) noexcept {
+        return j.m_value.string;
+    }
+
+    static json make_from_arena_array(ArenaArray* aa) noexcept {
+        json j;
+        j.m_type = json::value_t::array;
+        j.m_storage = 4u;
+        j.m_value.arena_arr = aa;
+        return j;
+    }
+
+    static json make_from_arena_object(ArenaObject* ao) noexcept {
+        json j;
+        j.m_type = json::value_t::object;
+        j.m_storage = 4u;
+        j.m_value.arena_obj = ao;
+        return j;
+    }
+
+    static json make_arena_string_json(SharedString* ss) noexcept {
+        json j;
+        j.m_type = json::value_t::string;
+        j.m_storage = 4u;
+        j.m_value.string = ss;
+        return j;
+    }
+
+    static json make_owned_arena_string_json(SharedString* ss) noexcept {
+        json j;
+        j.m_type = json::value_t::string;
+        j.m_value.string = ss;
+        if (ss->owner_doc != nullptr) {
+            shared_doc_addref(ss->owner_doc);
+            j.m_storage = 5u;
+        } else {
+            j.m_storage = 4u;
+        }
+        return j;
+    }
+
+    static void init_arena_null(json* dst) noexcept {
+        ::new (dst) json();
+    }
+
+    static void init_arena_bool(json* dst, const bool b) noexcept {
+        ::new (dst) json(b);
+    }
+
+    static void init_arena_uint(json* dst, const json::number_unsigned_t u) noexcept {
+        ::new (dst) json(u);
+    }
+
+    static void init_arena_sint(json* dst, const json::number_integer_t i) noexcept {
+        ::new (dst) json(i);
+    }
+
+    static void init_arena_real(json* dst, const json::number_float_t d) noexcept {
+        ::new (dst) json(d);
+    }
+
+    static void init_arena_string(json* dst, SharedString* ss) noexcept {
+        ::new (dst) json();
+        dst->m_type = json::value_t::string;
+        dst->m_storage = 4u;
+        dst->m_value.string = ss;
+    }
+
+    static void init_arena_empty_array(json* dst) noexcept {
+        ::new (dst) json();
+        dst->m_type = json::value_t::array;
+        dst->m_storage = 3u;
+    }
+
+    static void init_arena_empty_object(json* dst) noexcept {
+        ::new (dst) json();
+        dst->m_type = json::value_t::object;
+        dst->m_storage = 3u;
+    }
+
+    static void init_arena_array_ptr(json* dst, ArenaArray* aa) noexcept {
+        ::new (dst) json();
+        dst->m_type = json::value_t::array;
+        dst->m_storage = 4u;
+        dst->m_value.arena_arr = aa;
+    }
+
+    static void set_arena_array_ptr(json* dst, ArenaArray* aa) noexcept {
+        dst->m_type = json::value_t::array;
+        dst->m_storage = 4u;
+        dst->m_value.arena_arr = aa;
+    }
+
+    static void set_arena_object_ptr(json* dst, ArenaObject* ao) noexcept {
+        dst->m_type = json::value_t::object;
+        dst->m_storage = 4u;
+        dst->m_value.arena_obj = ao;
+    }
+
+    // Shallowly copies an m_storage == 4u container/scalar slot into sdoc->compat_cache
+    // without incrementing SharedYyDoc refcount or deep-cloning nested subtrees; safe because
+    // destroy_shared_doc tears down compat_cache before destroying sdoc->arena.
+    static json copy_arena_slot_raw(const json& src) noexcept {
+        json j;
+        j.m_type = src.m_type;
+        j.m_storage = src.m_storage;
+        j.m_value = src.m_value;
+        return j;
+    }
+
+    static SmallArray2* create_small_array_from_elem0(json&& v0) {
+        return json::create_small_array1(std::move(v0));
+    }
+
+    static SmallArray2* create_small_array_from_elem2(json&& v0, json&& v1) {
+        return json::create_small_array2(std::move(v0), std::move(v1));
+    }
+
+    static json make_small_array_from_ptr(SmallArray2* sa) noexcept {
+        json j;
+        j.m_type = json::value_t::array;
+        j.m_storage = 2u;
+        j.m_value.small_arr = sa;
+        return j;
+    }
+
+    static void destroy_small_array_raw(SmallArray2*& sa) noexcept {
+        json::destroy_small_array(sa);
+    }
+
+    static json& small_array_slot(SmallArray2* sa, const std::size_t idx) noexcept {
+        return sa->elem(idx);
+    }
+
+    static json& small_object_append_placeholder(SmallObject4* so, const std::string_view key) {
+        const std::size_t n = so->count;
+        assert(n < kSmallObjCap);
+        const std::uint8_t tag = small_obj_key_tag(key);
+        ::new (so->slot_ptr(n)) SmallObject4::entry_t(
+            std::piecewise_construct,
+            std::forward_as_tuple(key.data(), key.size()),
+            std::forward_as_tuple());
+        so->tags[n] = tag;
+        so->count = static_cast<std::uint8_t>(n + 1u);
+        return so->entry(n).second;
+    }
+
+    static void commit_cloned_owned(json& dst, json&& owned) noexcept {
+        dst.m_type = std::exchange(owned.m_type, json::value_t::null);
+        dst.m_storage = std::exchange(owned.m_storage, static_cast<std::uint8_t>(0u));
+        dst.m_value = std::exchange(owned.m_value, json::json_value{});
+    }
 };
 
 namespace {
+
+inline bool string_is_inline(const std::string& s) noexcept {
+    const char* p = s.data();
+    const char* base = reinterpret_cast<const char*>(&s);
+    const std::less<const char*> lt{};
+    return !lt(p, base) && lt(p, base + sizeof(std::string));
+}
+
+inline const std::string& empty_key_string_singleton() noexcept {
+    static const std::string kEmpty;
+    return kEmpty;
+}
+
+inline SharedString& empty_arena_string_singleton() noexcept {
+    struct Holder {
+        SharedString ss;
+        Holder() {
+            ss.refcount.store(kArenaStringRef, std::memory_order_relaxed);
+            ss.owner_doc = nullptr;
+        }
+    };
+    static Holder h;
+    return h.ss;
+}
+
+struct DocArenaChunk {
+    DocArenaChunk* next = nullptr;
+    std::size_t used = 0u;
+    std::size_t cap = 0u;
+};
+
+struct DocArena {
+    DocArenaChunk* head = nullptr;
+    DocArenaChunk* cur = nullptr;
+    std::size_t next_chunk_bytes = 65536u;
+    std::vector<std::string*> heap_strings;
+
+    void* alloc(const std::size_t bytes) {
+        const std::size_t n = (bytes + 7u) & ~std::size_t{7u};
+        DocArenaChunk* c = cur;
+        if (c != nullptr && n <= c->cap - c->used) {
+            void* p = reinterpret_cast<char*>(c) + c->used;
+            c->used += n;
+            return p;
+        }
+        const std::size_t header_sz = (sizeof(DocArenaChunk) + 15u) & ~std::size_t{15u};
+        const std::size_t min_need = header_sz + n;
+        std::size_t req = (min_need > next_chunk_bytes) ? min_need : next_chunk_bytes;
+        if (req > kLargeCacheMaxEntryBytes && min_need <= kLargeCacheMaxEntryBytes) {
+            req = kLargeCacheMaxEntryBytes;
+        }
+        std::size_t actual_cap = 0u;
+        void* mem = large_alloc_full_cap(req, actual_cap);
+        if (mem == nullptr) {
+            throw std::bad_alloc();
+        }
+        auto* chunk = ::new (mem) DocArenaChunk();
+        chunk->used = header_sz + n;
+        chunk->cap = actual_cap;
+        chunk->next = head;
+        head = chunk;
+        cur = chunk;
+        const std::size_t doubled = req * 2u;
+        next_chunk_bytes = (doubled <= kLargeCacheMaxEntryBytes && doubled > req)
+                               ? doubled
+                               : kLargeCacheMaxEntryBytes;
+        return reinterpret_cast<char*>(chunk) + header_sz;
+    }
+
+    const std::string* alloc_key_string(const char* p, const std::size_t len) {
+        if (len == 0u) {
+            return &empty_key_string_singleton();
+        }
+        void* mem = alloc(sizeof(std::string));
+        auto* s = ::new (mem) std::string(p, len);
+        if (!string_is_inline(*s)) {
+            try {
+                heap_strings.push_back(s);
+            } catch (...) {
+                using StringT = std::string;
+                s->~StringT();
+                throw;
+            }
+        }
+        return s;
+    }
+
+    SharedString* alloc_arena_string(SharedYyDoc* sdoc, const char* p, const std::size_t len) {
+        if (len == 0u) {
+            return &empty_arena_string_singleton();
+        }
+        void* mem = alloc(sizeof(SharedString));
+        auto* ss = ::new (mem) SharedString(p, len);
+        ss->refcount.store(kArenaStringRef, std::memory_order_relaxed);
+        ss->owner_doc = sdoc;
+        if (!string_is_inline(ss->value)) {
+            try {
+                heap_strings.push_back(&ss->value);
+            } catch (...) {
+                ss->~SharedString();
+                throw;
+            }
+        }
+        return ss;
+    }
+
+    void destroy_all() noexcept {
+        using StringT = std::string;
+        for (std::string* s : heap_strings) {
+            s->~StringT();
+        }
+        heap_strings.clear();
+        DocArenaChunk* c = head;
+        head = nullptr;
+        cur = nullptr;
+        while (c != nullptr) {
+            DocArenaChunk* next = c->next;
+            large_free(nullptr, c);
+            c = next;
+        }
+    }
+};
+
+} // namespace
 
 struct SharedYyDoc {
     std::atomic<std::uint32_t> refcount{1u};
     std::atomic<bool> tree_unique_verified{false};
     yyjson_doc* doc = nullptr;
+    DocArena arena;
+#if __cplusplus >= 202002L || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
+    std::atomic_flag arena_lock{};
+    std::atomic_flag extra_lock{};
+#else
+    std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
+    std::atomic_flag extra_lock = ATOMIC_FLAG_INIT;
+#endif
+    std::vector<ArenaHashIndex*> arena_indices;
+    std::unordered_map<const void*, std::pair<void*, value_t>> compat_cache;
 
     explicit SharedYyDoc(yyjson_doc* d) noexcept : doc(d) {}
 };
-static_assert(sizeof(SharedYyDoc) <= 32u, "SharedYyDoc should fit in small pooled slab");
+static_assert(sizeof(SharedYyDoc) <= 256u, "SharedYyDoc should fit in 256-byte pooled slab");
+
+namespace {
+
+inline void destroy_arena_index(ArenaHashIndex* idx) noexcept {
+    if (idx == nullptr) {
+        return;
+    }
+    if (idx->slots != nullptr && idx->cap > 0u) {
+        pool_free(idx->slots, idx->cap * sizeof(ArenaHashSlot));
+    }
+    pool_free(idx, sizeof(ArenaHashIndex));
+}
 
 inline void destroy_shared_doc(SharedYyDoc* sdoc) noexcept {
     if (sdoc == nullptr) {
         return;
     }
+    // 1. Destroy compat_cache containers before arena memory goes away so m_storage == 4u
+    //    no-op elements remain harmless and zero reference cycle exists.
+    for (auto& kv : sdoc->compat_cache) {
+        json_access::destroy_erased_container(kv.second.first, kv.second.second);
+    }
+    sdoc->compat_cache.clear();
+    // 2. Free ArenaHashIndex tables.
+    for (ArenaHashIndex* idx : sdoc->arena_indices) {
+        destroy_arena_index(idx);
+    }
+    sdoc->arena_indices.clear();
+    // 3. Free all DocArena heap strings and chunks back to ThreadLargeCache / OS.
+    sdoc->arena.destroy_all();
+    // 4. Free yyjson document and SharedYyDoc slab object last.
     yyjson_doc* d = sdoc->doc;
     sdoc->~SharedYyDoc();
     pool_free(sdoc, sizeof(SharedYyDoc));
     yyjson_doc_free(d);
-}
-
-inline void shared_doc_release(SharedYyDoc* sdoc) noexcept {
-    if (sdoc != nullptr &&
-        (sdoc->refcount.load(std::memory_order_acquire) == 1u ||
-         sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u)) {
-        destroy_shared_doc(sdoc);
-    }
 }
 
 struct LazyNode : LazyHeader {
@@ -1869,7 +2194,7 @@ struct LazyNode : LazyHeader {
         raw_len = unsafe_yyjson_get_len(v);
     }
 };
-static_assert(sizeof(LazyNode) <= 48u, "LazyNode should fit in small pooled slab");
+static_assert(sizeof(LazyNode) <= 64u, "LazyNode should fit in small pooled slab");
 
 struct SpinGuard {
     std::atomic_flag& flag;
@@ -2345,7 +2670,724 @@ inline bool is_yyjson_tree_unique(yyjson_val* root) {
     return true;
 }
 
+struct KeyInternSlot {
+    std::uint64_t hash = 0u;
+    const std::string* str = nullptr;
+    std::uint32_t doc_stamp = 0u;
+    std::uint32_t key_id = 0u;
+};
+
+struct KeySeenToken {
+    std::uint64_t token = 0u;
+    std::uint32_t out_idx = 0u;
+};
+
+struct KeyInternTable {
+    std::vector<KeyInternSlot> slots;
+    std::vector<KeySeenToken> seen;
+    std::uint32_t doc_stamp = 1u;
+    std::uint32_t obj_stamp = 1u;
+    std::size_t used = 0u;
+    std::uint32_t next_key_id = 1u;
+
+    struct Result {
+        const std::string* str;
+        std::uint32_t key_id;
+    };
+
+    void begin_doc() {
+        used = 0u;
+        next_key_id = 1u;
+        if (slots.empty()) {
+            slots.assign(1024u, KeyInternSlot{});
+            seen.assign(512u, KeySeenToken{});
+            doc_stamp = 1u;
+            obj_stamp = 1u;
+            return;
+        }
+        if (slots.size() > 65536u) {
+            slots.assign(4096u, KeyInternSlot{});
+            doc_stamp = 1u;
+        } else {
+            ++doc_stamp;
+            if (doc_stamp == 0u) {
+                std::fill(slots.begin(), slots.end(), KeyInternSlot{});
+                doc_stamp = 1u;
+            }
+        }
+        if (seen.size() > 65536u) {
+            seen.assign(4096u, KeySeenToken{});
+        } else if (doc_stamp == 1u) {
+            std::fill(seen.begin(), seen.end(), KeySeenToken{});
+        }
+        obj_stamp = 1u;
+    }
+
+    std::uint64_t next_obj_token() {
+        ++obj_stamp;
+        if (obj_stamp == 0u) {
+            ++doc_stamp;
+            if (doc_stamp == 0u) {
+                std::fill(slots.begin(), slots.end(), KeyInternSlot{});
+                doc_stamp = 1u;
+            }
+            std::fill(seen.begin(), seen.end(), KeySeenToken{});
+            obj_stamp = 1u;
+        }
+        return (static_cast<std::uint64_t>(doc_stamp) << 32u) | obj_stamp;
+    }
+
+    NEOJSON_NOINLINE void rehash(const std::size_t new_cap) {
+        std::vector<KeyInternSlot> fresh(new_cap, KeyInternSlot{});
+        const std::size_t mask = new_cap - 1u;
+        for (const KeyInternSlot& s : slots) {
+            if (s.doc_stamp == doc_stamp) {
+                std::size_t pos = static_cast<std::size_t>(s.hash) & mask;
+                while (fresh[pos].doc_stamp == doc_stamp) {
+                    pos = (pos + 1u) & mask;
+                }
+                fresh[pos] = s;
+            }
+        }
+        slots.swap(fresh);
+    }
+
+    NEOJSON_NOINLINE void grow_seen(const std::uint32_t needed_id) {
+        std::size_t new_sz = seen.empty() ? 512u : seen.size() * 2u;
+        while (new_sz <= needed_id) {
+            new_sz *= 2u;
+        }
+        seen.resize(new_sz, KeySeenToken{});
+    }
+
+    Result intern(DocArena& arena, const char* kp, const std::size_t kl) {
+        if (kl == 0u) {
+            return Result{&empty_key_string_singleton(), 0u};
+        }
+        const std::uint64_t h = hash_bytes(kp, kl);
+        std::size_t mask = slots.size() - 1u;
+        std::size_t pos = static_cast<std::size_t>(h) & mask;
+        for (;;) {
+            KeyInternSlot& s = slots[pos];
+            if (s.doc_stamp != doc_stamp) {
+                if ((used + 1u) * 2u >= slots.size()) {
+                    rehash(slots.size() * 2u);
+                    mask = slots.size() - 1u;
+                    pos = static_cast<std::size_t>(h) & mask;
+                    continue;
+                }
+                const std::string* inserted = arena.alloc_key_string(kp, kl);
+                const std::uint32_t id = next_key_id++;
+                if (id >= seen.size()) {
+                    grow_seen(id);
+                }
+                slots[pos] = KeyInternSlot{h, inserted, doc_stamp, id};
+                ++used;
+                return Result{inserted, id};
+            }
+            if (s.hash == h && s.str->size() == kl && std::memcmp(s.str->data(), kp, kl) == 0) {
+                return Result{s.str, s.key_id};
+            }
+            pos = (pos + 1u) & mask;
+        }
+    }
+};
+
+struct ArenaWorkItem {
+    yyjson_val* yy_ctn;
+    json* dst_slot;
+};
+
+struct ArenaMaterializeScratch {
+    std::vector<ArenaWorkItem> workstack;
+    std::vector<const std::string*> tmp_keys;
+    std::vector<yyjson_val*> tmp_vals;
+};
+
+inline KeyInternTable& tls_key_intern_table() {
+    thread_local KeyInternTable t;
+    return t;
+}
+
+inline ArenaMaterializeScratch& tls_arena_materialize_scratch() {
+    thread_local ArenaMaterializeScratch s;
+    return s;
+}
+
+inline void construct_arena_scalar(json* dst, SharedYyDoc* sdoc, yyjson_val* val) {
+    switch (yyjson_get_tag(val)) {
+        case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+            json_access::init_arena_null(dst);
+            return;
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+            json_access::init_arena_bool(dst, true);
+            return;
+
+        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+            json_access::init_arena_bool(dst, false);
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+            json_access::init_arena_uint(
+                dst, static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+            json_access::init_arena_sint(
+                dst, static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
+            return;
+
+        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+            json_access::init_arena_real(
+                dst, static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
+            return;
+
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
+            SharedString* ss = sdoc->arena.alloc_arena_string(
+                sdoc, unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
+            json_access::init_arena_string(dst, ss);
+            return;
+        }
+
+        default:
+            json_access::init_arena_null(dst);
+            return;
+    }
+}
+
+inline ArenaArray* try_build_inline_leaf_arena_array(SharedYyDoc* sdoc, yyjson_val* val,
+                                                     const std::size_t len) {
+    yyjson_val* elems[2];
+    yyjson_val* e = unsafe_yyjson_get_first(val);
+    for (std::size_t i = 0u; i < len; ++i) {
+        if (yyjson_is_ctn(e)) {
+            return nullptr;
+        }
+        elems[i] = e;
+        if (i + 1u < len) {
+            e = unsafe_yyjson_get_next(e);
+        }
+    }
+    void* mem = sdoc->arena.alloc(sizeof(ArenaArray) + len * sizeof(json));
+    auto* aa = ::new (mem) ArenaArray();
+    aa->count = static_cast<std::uint32_t>(len);
+    aa->doc = sdoc;
+    json* out = aa->elems();
+    for (std::size_t i = 0u; i < len; ++i) {
+        construct_arena_scalar(&out[i], sdoc, elems[i]);
+    }
+    return aa;
+}
+
+inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
+                                          std::vector<ArenaWorkItem>& workstack) {
+    const std::size_t len = unsafe_yyjson_get_len(val);
+    void* mem = sdoc->arena.alloc(sizeof(ArenaArray) + len * sizeof(json));
+    auto* aa = ::new (mem) ArenaArray();
+    aa->count = static_cast<std::uint32_t>(len);
+    aa->doc = sdoc;
+    json* out = aa->elems();
+    yyjson_val* cur = unsafe_yyjson_get_first(val);
+    for (std::size_t i = 0u; i < len; ++i) {
+        if (!yyjson_is_ctn(cur)) {
+            construct_arena_scalar(&out[i], sdoc, cur);
+        } else {
+            const std::size_t clen = unsafe_yyjson_get_len(cur);
+            if (clen == 0u) {
+                if (yyjson_is_arr(cur)) {
+                    json_access::init_arena_empty_array(&out[i]);
+                } else {
+                    json_access::init_arena_empty_object(&out[i]);
+                }
+            } else if (clen <= 2u && yyjson_is_arr(cur)) {
+                if (ArenaArray* leaf = try_build_inline_leaf_arena_array(sdoc, cur, clen)) {
+                    json_access::init_arena_array_ptr(&out[i], leaf);
+                } else {
+                    json_access::init_arena_null(&out[i]);
+                    workstack.push_back(ArenaWorkItem{cur, &out[i]});
+                }
+            } else {
+                json_access::init_arena_null(&out[i]);
+                workstack.push_back(ArenaWorkItem{cur, &out[i]});
+            }
+        }
+        if (i + 1u < len) {
+            cur = unsafe_yyjson_get_next(cur);
+        }
+    }
+    return aa;
+}
+
+inline ArenaObject* build_arena_object_node(SharedYyDoc* sdoc, yyjson_val* val,
+                                            KeyInternTable& intern,
+                                            ArenaMaterializeScratch& scratch, bool& own_unique,
+                                            bool& saw_dup) {
+    const std::size_t len = unsafe_yyjson_get_len(val);
+    own_unique = true;
+    const std::string* small_keys[64];
+    yyjson_val* small_vals[64];
+    const std::string** kbuf = small_keys;
+    yyjson_val** vbuf = small_vals;
+    if (len > 64u) {
+        scratch.tmp_keys.resize(len);
+        scratch.tmp_vals.resize(len);
+        kbuf = scratch.tmp_keys.data();
+        vbuf = scratch.tmp_vals.data();
+    }
+
+    std::size_t out_n = 0u;
+    yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+    yyjson_val* k = nullptr;
+    if (len <= 16u) {
+        while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+            const auto res = intern.intern(sdoc->arena, unsafe_yyjson_get_str(k),
+                                           unsafe_yyjson_get_len(k));
+            yyjson_val* cv = yyjson_obj_iter_get_val(k);
+            bool found = false;
+            for (std::size_t j = 0u; j < out_n; ++j) {
+                if (kbuf[j] == res.str) {
+                    vbuf[j] = cv;
+                    own_unique = false;
+                    saw_dup = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                kbuf[out_n] = res.str;
+                vbuf[out_n] = cv;
+                ++out_n;
+            }
+        }
+    } else {
+        const std::uint64_t obj_tok = intern.next_obj_token();
+        while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+            const auto res = intern.intern(sdoc->arena, unsafe_yyjson_get_str(k),
+                                           unsafe_yyjson_get_len(k));
+            yyjson_val* cv = yyjson_obj_iter_get_val(k);
+            KeySeenToken& st = intern.seen[res.key_id];
+            if (st.token == obj_tok) {
+                vbuf[st.out_idx] = cv;
+                own_unique = false;
+                saw_dup = true;
+            } else {
+                st.token = obj_tok;
+                st.out_idx = static_cast<std::uint32_t>(out_n);
+                kbuf[out_n] = res.str;
+                vbuf[out_n] = cv;
+                ++out_n;
+            }
+        }
+    }
+
+    void* mem = sdoc->arena.alloc(sizeof(ArenaObject) + out_n * sizeof(const std::string*) +
+                                  out_n * sizeof(json));
+    auto* ao = ::new (mem) ArenaObject();
+    ao->count = static_cast<std::uint32_t>(out_n);
+    ao->doc = sdoc;
+    const std::string** dst_keys = ao->keys();
+    if (out_n > 0u) {
+        std::memcpy(dst_keys, kbuf, out_n * sizeof(const std::string*));
+    }
+    json* out = ao->vals();
+    for (std::size_t i = 0u; i < out_n; ++i) {
+        yyjson_val* cv = vbuf[i];
+        if (!yyjson_is_ctn(cv)) {
+            construct_arena_scalar(&out[i], sdoc, cv);
+        } else {
+            const std::size_t clen = unsafe_yyjson_get_len(cv);
+            if (clen == 0u) {
+                if (yyjson_is_arr(cv)) {
+                    json_access::init_arena_empty_array(&out[i]);
+                } else {
+                    json_access::init_arena_empty_object(&out[i]);
+                }
+            } else if (clen <= 2u && yyjson_is_arr(cv)) {
+                if (ArenaArray* leaf = try_build_inline_leaf_arena_array(sdoc, cv, clen)) {
+                    json_access::init_arena_array_ptr(&out[i], leaf);
+                } else {
+                    json_access::init_arena_null(&out[i]);
+                    scratch.workstack.push_back(ArenaWorkItem{cv, &out[i]});
+                }
+            } else {
+                json_access::init_arena_null(&out[i]);
+                scratch.workstack.push_back(ArenaWorkItem{cv, &out[i]});
+            }
+        }
+    }
+    return ao;
+}
+
+inline const void* materialize_doc_arena(SharedYyDoc* sdoc, yyjson_val* root,
+                                         const value_t root_type, bool& root_own_unique,
+                                         bool& saw_dup) {
+    if (sdoc->arena.head == nullptr && sdoc->doc != nullptr) {
+        const std::size_t vc = yyjson_doc_get_val_count(sdoc->doc);
+        std::size_t est = vc * 24u + 4096u;
+        if (est < 65536u) {
+            est = 65536u;
+        } else if (est > kLargeCacheMaxEntryBytes) {
+            est = kLargeCacheMaxEntryBytes;
+        }
+        sdoc->arena.next_chunk_bytes = est;
+    }
+
+    KeyInternTable& intern = tls_key_intern_table();
+    intern.begin_doc();
+    ArenaMaterializeScratch& scratch = tls_arena_materialize_scratch();
+    scratch.workstack.clear();
+    struct ScratchGuard {
+        ArenaMaterializeScratch& s;
+        ~ScratchGuard() {
+            s.workstack.clear();
+        }
+    } scratch_guard{scratch};
+
+    root_own_unique = true;
+    saw_dup = false;
+
+    const void* root_ptr = nullptr;
+    if (root_type == value_t::array) {
+        root_ptr = build_arena_array_node(sdoc, root, scratch.workstack);
+    } else {
+        root_ptr = build_arena_object_node(sdoc, root, intern, scratch, root_own_unique, saw_dup);
+    }
+
+    while (!scratch.workstack.empty()) {
+        const ArenaWorkItem item = scratch.workstack.back();
+        scratch.workstack.pop_back();
+        if (yyjson_is_arr(item.yy_ctn)) {
+            ArenaArray* child_aa = build_arena_array_node(sdoc, item.yy_ctn, scratch.workstack);
+            json_access::set_arena_array_ptr(item.dst_slot, child_aa);
+        } else {
+            bool ignored_own_unique = true;
+            ArenaObject* child_ao = build_arena_object_node(
+                sdoc, item.yy_ctn, intern, scratch, ignored_own_unique, saw_dup);
+            json_access::set_arena_object_ptr(item.dst_slot, child_ao);
+        }
+    }
+    return root_ptr;
+}
+
 } // namespace
+
+void shared_doc_addref(SharedYyDoc* sdoc) noexcept {
+    if (sdoc != nullptr) {
+        sdoc->refcount.fetch_add(1u, std::memory_order_relaxed);
+    }
+}
+
+void shared_doc_release(SharedYyDoc* sdoc) noexcept {
+    if (sdoc != nullptr &&
+        (sdoc->refcount.load(std::memory_order_acquire) == 1u ||
+         sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u)) {
+        destroy_shared_doc(sdoc);
+    }
+}
+
+const void* lazy_materialize_arena(LazyHeader* hdr, const value_t type) {
+    auto* node = static_cast<LazyNode*>(hdr);
+    void* existing = node->arena_view.load(std::memory_order_acquire);
+    if (existing != nullptr) {
+        return existing;
+    }
+    SpinGuard guard(node->doc->arena_lock);
+    existing = node->arena_view.load(std::memory_order_relaxed);
+    if (existing == nullptr) {
+        bool root_own_unique = true;
+        bool saw_dup = false;
+        const void* built =
+            materialize_doc_arena(node->doc, node->val, type, root_own_unique, saw_dup);
+        if (type == value_t::object) {
+            if (root_own_unique) {
+                mark_own_unique(node);
+            } else {
+                mark_own_dup(node);
+            }
+        }
+        if (!saw_dup && node->val == yyjson_doc_get_root(node->doc->doc)) {
+            node->doc->tree_unique_verified.store(true, std::memory_order_release);
+        }
+        existing = const_cast<void*>(built);
+        node->arena_view.store(existing, std::memory_order_release);
+    }
+    return existing;
+}
+
+ArenaHashIndex* arena_obj_build_index_slow(const ArenaObject* ao) noexcept {
+    if (ao == nullptr || ao->doc == nullptr || ao->count <= kOrderedMapHashThreshold) {
+        return nullptr;
+    }
+    try {
+        SpinGuard guard(ao->doc->extra_lock);
+        if (ArenaHashIndex* existing = ao->index.load(std::memory_order_relaxed)) {
+            return existing;
+        }
+        const std::size_t n = ao->count;
+        std::size_t cap = 32u;
+        while (cap < n * 2u) {
+            cap <<= 1u;
+        }
+        auto* slots = static_cast<ArenaHashSlot*>(pool_alloc(cap * sizeof(ArenaHashSlot)));
+        ArenaHashIndex* idx = nullptr;
+        try {
+            idx = static_cast<ArenaHashIndex*>(pool_alloc(sizeof(ArenaHashIndex)));
+            ::new (idx) ArenaHashIndex{cap, slots};
+            ao->doc->arena_indices.reserve(ao->doc->arena_indices.size() + 1u);
+        } catch (...) {
+            if (idx != nullptr) {
+                pool_free(idx, sizeof(ArenaHashIndex));
+            }
+            pool_free(slots, cap * sizeof(ArenaHashSlot));
+            throw;
+        }
+        std::fill_n(slots, cap, ArenaHashSlot{0u, 0u});
+        const std::size_t mask = cap - 1u;
+        const std::string* const* ks = ao->keys();
+        for (std::size_t i = 0u; i < n; ++i) {
+            const std::uint64_t h = hash_bytes(ks[i]->data(), ks[i]->size());
+            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+            std::size_t pos = static_cast<std::size_t>(h) & mask;
+            while (slots[pos].idx_plus_one != 0u) {
+                pos = (pos + 1u) & mask;
+            }
+            slots[pos] = ArenaHashSlot{static_cast<std::uint32_t>(i + 1u), h32};
+        }
+        ao->doc->arena_indices.push_back(idx);
+        ao->index.store(idx, std::memory_order_release);
+        return idx;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+namespace {
+
+inline json clone_arena_leaf_or_placeholder(const json& src, bool& is_nested_ctn) {
+    is_nested_ctn = false;
+    if (json_access::storage_of(src) == 4u) {
+        if (json_access::type_of(src) == value_t::string) {
+            return json_access::make_owned_arena_string_json(json_access::shared_string_ptr(src));
+        }
+        is_nested_ctn = true;
+        return json(nullptr);
+    }
+    // Scalar (0u) or empty container (3u) or escaped string (5u)
+    if (json_access::type_of(src) == value_t::string) {
+        return json_access::make_owned_arena_string_json(json_access::shared_string_ptr(src));
+    }
+    return src;
+}
+
+} // namespace
+
+void arena_clone_to_owned(json& dst, const json& src) {
+    json owned;
+    std::vector<std::pair<const json*, json*>> workstack;
+    workstack.emplace_back(&src, &owned);
+
+    while (!workstack.empty()) {
+        const auto item = workstack.back();
+        workstack.pop_back();
+        const json* cur_src = item.first;
+        json* cur_dst = item.second;
+
+        if (json_access::is_arena_array(*cur_src)) {
+            const ArenaArray* aa = json_access::arena_array_ptr(*cur_src);
+            const std::size_t n = aa->count;
+            const json* elems = aa->elems();
+            if (n == 0u) {
+                *cur_dst = json_access::make_array();
+            } else if (n == 1u) {
+                bool nested = false;
+                SmallArray2* sa = json_access::create_small_array_from_elem0(
+                    clone_arena_leaf_or_placeholder(elems[0], nested));
+                try {
+                    if (nested) {
+                        workstack.emplace_back(&elems[0], &json_access::small_array_slot(sa, 0u));
+                    }
+                } catch (...) {
+                    json_access::destroy_small_array_raw(sa);
+                    throw;
+                }
+                *cur_dst = json_access::make_small_array_from_ptr(sa);
+            } else if (n == 2u) {
+                bool nested0 = false;
+                bool nested1 = false;
+                json v0 = clone_arena_leaf_or_placeholder(elems[0], nested0);
+                json v1 = clone_arena_leaf_or_placeholder(elems[1], nested1);
+                SmallArray2* sa =
+                    json_access::create_small_array_from_elem2(std::move(v0), std::move(v1));
+                try {
+                    if (nested0) {
+                        workstack.emplace_back(&elems[0], &json_access::small_array_slot(sa, 0u));
+                    }
+                    if (nested1) {
+                        workstack.emplace_back(&elems[1], &json_access::small_array_slot(sa, 1u));
+                    }
+                } catch (...) {
+                    json_access::destroy_small_array_raw(sa);
+                    throw;
+                }
+                *cur_dst = json_access::make_small_array_from_ptr(sa);
+            } else {
+                json::array_t* arr = json_access::create_array_cap(n);
+                struct ArrGuard {
+                    json::array_t* p;
+                    ~ArrGuard() {
+                        if (p != nullptr) {
+                            json_access::destroy_erased_container(p, value_t::array);
+                        }
+                    }
+                } guard{arr};
+                for (std::size_t i = 0u; i < n; ++i) {
+                    bool nested = false;
+                    arr->push_back(clone_arena_leaf_or_placeholder(elems[i], nested));
+                    if (nested) {
+                        workstack.emplace_back(&elems[i], &(*arr)[i]);
+                    }
+                }
+                guard.p = nullptr;
+                *cur_dst = json_access::make_from_array_ptr(arr);
+            }
+        } else {
+            const ArenaObject* ao = json_access::arena_object_ptr(*cur_src);
+            const std::size_t n = ao->count;
+            const std::string* const* ks = ao->keys();
+            const json* vs = ao->vals();
+            if (n == 0u) {
+                *cur_dst = json_access::make_object();
+            } else if (n <= kSmallObjCap) {
+                SmallObject4* so = json_access::create_small_object_raw();
+                struct SmallObjGuard {
+                    SmallObject4* p;
+                    ~SmallObjGuard() {
+                        if (p != nullptr) {
+                            json_access::destroy_small_object_raw(p);
+                        }
+                    }
+                } guard{so};
+                for (std::size_t i = 0u; i < n; ++i) {
+                    bool nested = false;
+                    json val = clone_arena_leaf_or_placeholder(vs[i], nested);
+                    json_access::small_object_append_unique(so, *ks[i], std::move(val));
+                    if (nested) {
+                        workstack.emplace_back(&vs[i], &so->entry(i).second);
+                    }
+                }
+                guard.p = nullptr;
+                *cur_dst = json_access::make_from_small_object(so);
+            } else {
+                json::object_t* obj = json_access::create_object_vec_cap(n);
+                struct ObjGuard {
+                    json::object_t* p;
+                    ~ObjGuard() {
+                        if (p != nullptr) {
+                            json_access::destroy_erased_container(p, value_t::object);
+                        }
+                    }
+                } guard{obj};
+                for (std::size_t i = 0u; i < n; ++i) {
+                    bool nested = false;
+                    json val = clone_arena_leaf_or_placeholder(vs[i], nested);
+                    obj->emplace_back_unindexed(*ks[i], std::move(val));
+                    if (nested) {
+                        workstack.emplace_back(&vs[i], &(*obj)[i].second);
+                    }
+                }
+                guard.p = nullptr;
+                *cur_dst = json_access::make_from_object_ptr(obj);
+            }
+        }
+    }
+
+    json_access::commit_cloned_owned(dst, std::move(owned));
+}
+
+const void* arena_compat_array(const ArenaArray* aa) {
+    SharedYyDoc* sdoc = aa->doc;
+    {
+        SpinGuard guard(sdoc->extra_lock);
+        const auto it = sdoc->compat_cache.find(aa);
+        if (it != sdoc->compat_cache.end()) {
+            return it->second.first;
+        }
+    }
+    const std::size_t n = aa->count;
+    const json* elems = aa->elems();
+    json::array_t* arr = json_access::create_array_cap(n);
+    struct ArrGuard {
+        json::array_t* p;
+        ~ArrGuard() {
+            if (p != nullptr) {
+                json_access::destroy_erased_container(p, value_t::array);
+            }
+        }
+    } arr_guard{arr};
+    for (std::size_t i = 0u; i < n; ++i) {
+        const json& e = elems[i];
+        if (e.is_string()) {
+            // Detach strings to m_storage == 0u so compat_cache never holds a refcount cycle to sdoc.
+            const auto& s = json_access::string_of(e);
+            arr->push_back(json_access::make_string(s.data(), s.size()));
+        } else {
+            arr->push_back(json_access::copy_arena_slot_raw(e));
+        }
+    }
+    SpinGuard lock_guard(sdoc->extra_lock);
+    const auto [it, inserted] =
+        sdoc->compat_cache.emplace(static_cast<const void*>(aa),
+                                   std::make_pair(static_cast<void*>(arr), value_t::array));
+    if (inserted) {
+        arr_guard.p = nullptr;
+        return arr;
+    }
+    return it->second.first;
+}
+
+const void* arena_compat_object(const ArenaObject* ao) {
+    SharedYyDoc* sdoc = ao->doc;
+    {
+        SpinGuard guard(sdoc->extra_lock);
+        const auto it = sdoc->compat_cache.find(ao);
+        if (it != sdoc->compat_cache.end()) {
+            return it->second.first;
+        }
+    }
+    const std::size_t n = ao->count;
+    const std::string* const* ks = ao->keys();
+    const json* vs = ao->vals();
+    json::object_t* obj = json_access::create_object_vec_cap(n);
+    struct ObjGuard {
+        json::object_t* p;
+        ~ObjGuard() {
+            if (p != nullptr) {
+                json_access::destroy_erased_container(p, value_t::object);
+            }
+        }
+    } obj_guard{obj};
+    for (std::size_t i = 0u; i < n; ++i) {
+        const json& v = vs[i];
+        if (v.is_string()) {
+            // Detach strings to m_storage == 0u so compat_cache never holds a refcount cycle to sdoc.
+            const auto& s = json_access::string_of(v);
+            obj->emplace_back_unindexed(*ks[i], json_access::make_string(s.data(), s.size()));
+        } else {
+            obj->emplace_back_unindexed(*ks[i], json_access::copy_arena_slot_raw(v));
+        }
+    }
+    SpinGuard lock_guard(sdoc->extra_lock);
+    const auto [it, inserted] =
+        sdoc->compat_cache.emplace(static_cast<const void*>(ao),
+                                   std::make_pair(static_cast<void*>(obj), value_t::object));
+    if (inserted) {
+        obj_guard.p = nullptr;
+        return obj;
+    }
+    return it->second.first;
+}
 
 void lazy_release(LazyHeader* hdr, const value_t type) noexcept {
     if (hdr == nullptr) {
@@ -2428,6 +3470,10 @@ std::size_t lazy_size(LazyHeader* hdr, const value_t type) noexcept {
     if (type == value_t::array) {
         return node->raw_len;
     }
+    void* av = node->arena_view.load(std::memory_order_acquire);
+    if (av != nullptr) {
+        return static_cast<const ArenaObject*>(av)->count;
+    }
     void* mat = node->materialized.load(std::memory_order_acquire);
     if (mat != nullptr) {
         return static_cast<const json::object_t*>(mat)->size();
@@ -2452,6 +3498,11 @@ std::size_t lazy_size(LazyHeader* hdr, const value_t type) noexcept {
 
 bool lazy_contains(LazyHeader* hdr, const std::string_view key) {
     auto* node = static_cast<LazyNode*>(hdr);
+    void* av = node->arena_view.load(std::memory_order_acquire);
+    if (av != nullptr) {
+        const auto* ao = static_cast<const ArenaObject*>(av);
+        return arena_obj_find(ao, key) < ao->count;
+    }
     void* mat = node->materialized.load(std::memory_order_acquire);
     if (mat != nullptr) {
         return static_cast<const json::object_t*>(mat)->contains(key);
@@ -2461,9 +3512,9 @@ bool lazy_contains(LazyHeader* hdr, const std::string_view key) {
         const std::uint8_t prev = node->lookup_probes.load(std::memory_order_relaxed);
         if (prev >= 3u ||
             node->lookup_probes.fetch_add(1u, std::memory_order_relaxed) >= 2u) {
-            const auto* obj =
-                static_cast<const json::object_t*>(lazy_materialize_const(hdr, value_t::object));
-            return obj->contains(key);
+            const auto* ao =
+                static_cast<const ArenaObject*>(lazy_materialize_arena(hdr, value_t::object));
+            return arena_obj_find(ao, key) < ao->count;
         }
     }
     yyjson_obj_iter iter = yyjson_obj_iter_with(node->val);
@@ -2507,50 +3558,138 @@ void* lazy_clear(LazyHeader* hdr, const value_t type) noexcept {
 
 namespace {
 
-inline bool array_view_equal(const json& lhs, const json& rhs) {
-    if (json_access::is_small_array(lhs)) {
-        const auto& sa = json_access::small_array_of(lhs);
-        if (json_access::is_small_array(rhs)) {
-            const auto& sb = json_access::small_array_of(rhs);
-            if (sa.count != sb.count) {
-                return false;
-            }
-            for (std::size_t i = 0u; i < sa.count; ++i) {
-                if (!(sa.elem(i) == sb.elem(i))) {
-                    return false;
-                }
-            }
-            return true;
+struct ArrView {
+    enum class Kind : std::uint8_t { Empty, Small, Arena, Eager } kind = Kind::Empty;
+    const void* ptr = nullptr;
+    std::size_t n = 0u;
+
+    const json& at(const std::size_t i) const noexcept {
+        switch (kind) {
+            case Kind::Small:
+                return static_cast<const SmallArray2*>(ptr)->elem(i);
+            case Kind::Arena:
+                return static_cast<const ArenaArray*>(ptr)->elems()[i];
+            case Kind::Eager:
+            case Kind::Empty:
+            default:
+                return (*static_cast<const json::array_t*>(ptr))[i];
         }
-        const auto* bv = json_access::const_array_of(rhs);
-        if (sa.count != bv->size()) {
+    }
+};
+
+inline ArrView resolve_arr_view(const json& j) {
+    const std::uint8_t st = json_access::storage_of(j);
+    if (st == 3u) {
+        return ArrView{};
+    }
+    if (st == 2u) {
+        const auto* sa = &json_access::small_array_of(j);
+        return ArrView{ArrView::Kind::Small, sa, sa->count};
+    }
+    if (st == 4u) {
+        const auto* aa = json_access::arena_array_ptr(j);
+        return ArrView{ArrView::Kind::Arena, aa, aa->count};
+    }
+    if (st == 1u) {
+        LazyHeader* hdr = json_access::lazy_node(j);
+        void* av = hdr->arena_view.load(std::memory_order_acquire);
+        if (av == nullptr) {
+            if (void* mat = hdr->materialized.load(std::memory_order_acquire)) {
+                const auto* arr = static_cast<const json::array_t*>(mat);
+                return ArrView{ArrView::Kind::Eager, arr, arr->size()};
+            }
+            av = const_cast<void*>(lazy_materialize_arena(hdr, value_t::array));
+        }
+        const auto* aa = static_cast<const ArenaArray*>(av);
+        return ArrView{ArrView::Kind::Arena, aa, aa->count};
+    }
+    const auto* arr = json_access::raw_array_ptr(j);
+    return ArrView{ArrView::Kind::Eager, arr, arr->size()};
+}
+
+struct ObjView {
+    enum class Kind : std::uint8_t { Empty, Small, Arena, Eager } kind = Kind::Empty;
+    const void* ptr = nullptr;
+    std::size_t n = 0u;
+
+    const std::string& key(const std::size_t i) const noexcept {
+        switch (kind) {
+            case Kind::Small:
+                return static_cast<const SmallObject4*>(ptr)->entry(i).first;
+            case Kind::Arena:
+                return *static_cast<const ArenaObject*>(ptr)->keys()[i];
+            case Kind::Eager:
+            case Kind::Empty:
+            default:
+                return (*static_cast<const json::object_t*>(ptr))[i].first;
+        }
+    }
+
+    const json& val(const std::size_t i) const noexcept {
+        switch (kind) {
+            case Kind::Small:
+                return static_cast<const SmallObject4*>(ptr)->entry(i).second;
+            case Kind::Arena:
+                return static_cast<const ArenaObject*>(ptr)->vals()[i];
+            case Kind::Eager:
+            case Kind::Empty:
+            default:
+                return (*static_cast<const json::object_t*>(ptr))[i].second;
+        }
+    }
+};
+
+inline ObjView resolve_obj_view(const json& j) {
+    const std::uint8_t st = json_access::storage_of(j);
+    if (st == 3u) {
+        return ObjView{};
+    }
+    if (st == 2u) {
+        const auto* so = &json_access::small_object_of(j);
+        return ObjView{ObjView::Kind::Small, so, so->count};
+    }
+    if (st == 4u) {
+        const auto* ao = json_access::arena_object_ptr(j);
+        return ObjView{ObjView::Kind::Arena, ao, ao->count};
+    }
+    if (st == 1u) {
+        LazyHeader* hdr = json_access::lazy_node(j);
+        void* av = hdr->arena_view.load(std::memory_order_acquire);
+        if (av == nullptr) {
+            if (void* mat = hdr->materialized.load(std::memory_order_acquire)) {
+                const auto* obj = static_cast<const json::object_t*>(mat);
+                return ObjView{ObjView::Kind::Eager, obj, obj->size()};
+            }
+            av = const_cast<void*>(lazy_materialize_arena(hdr, value_t::object));
+        }
+        const auto* ao = static_cast<const ArenaObject*>(av);
+        return ObjView{ObjView::Kind::Arena, ao, ao->count};
+    }
+    const auto* obj = json_access::raw_object_ptr(j);
+    return ObjView{ObjView::Kind::Eager, obj, obj->size()};
+}
+
+inline bool array_view_equal(const json& lhs, const json& rhs) {
+    const ArrView lv = resolve_arr_view(lhs);
+    const ArrView rv = resolve_arr_view(rhs);
+    if (lv.n != rv.n) {
+        return false;
+    }
+    for (std::size_t i = 0u; i < lv.n; ++i) {
+        if (!(lv.at(i) == rv.at(i))) {
             return false;
         }
-        for (std::size_t i = 0u; i < sa.count; ++i) {
-            if (!(sa.elem(i) == (*bv)[i])) {
-                return false;
-            }
-        }
-        return true;
     }
-    if (json_access::is_small_array(rhs)) {
-        return array_view_equal(rhs, lhs);
-    }
-    return *json_access::const_array_of(lhs) == *json_access::const_array_of(rhs);
+    return true;
 }
 
 inline bool array_view_less(const json& lhs, const json& rhs) {
-    if (!json_access::is_small_array(lhs) && !json_access::is_small_array(rhs)) {
-        return *json_access::const_array_of(lhs) < *json_access::const_array_of(rhs);
-    }
-    const std::size_t ln = lhs.size();
-    const std::size_t rn = rhs.size();
-    const std::size_t common = (std::min)(ln, rn);
-    const auto* la = json_access::is_small_array(lhs) ? nullptr : json_access::const_array_of(lhs);
-    const auto* ra = json_access::is_small_array(rhs) ? nullptr : json_access::const_array_of(rhs);
+    const ArrView lv = resolve_arr_view(lhs);
+    const ArrView rv = resolve_arr_view(rhs);
+    const std::size_t common = (std::min)(lv.n, rv.n);
     for (std::size_t i = 0u; i < common; ++i) {
-        const json& le = la != nullptr ? (*la)[i] : json_access::small_array_of(lhs).elem(i);
-        const json& re = ra != nullptr ? (*ra)[i] : json_access::small_array_of(rhs).elem(i);
+        const json& le = lv.at(i);
+        const json& re = rv.at(i);
         if (le < re) {
             return true;
         }
@@ -2558,73 +3697,46 @@ inline bool array_view_less(const json& lhs, const json& rhs) {
             return false;
         }
     }
-    return ln < rn;
+    return lv.n < rv.n;
 }
 
 inline bool object_view_equal(const json& lhs, const json& rhs) {
-    if (json_access::is_small_object(lhs)) {
-        const auto& lo = json_access::small_object_of(lhs);
-        if (json_access::is_small_object(rhs)) {
-            const auto& ro = json_access::small_object_of(rhs);
-            if (lo.count != ro.count) {
-                return false;
-            }
-            for (std::size_t i = 0u; i < lo.count; ++i) {
-                const auto& lp = lo.entry(i);
-                const auto& rp = ro.entry(i);
-                if (!(lp.first == rp.first && lp.second == rp.second)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-        const auto* ro = json_access::const_object_of(rhs);
-        if (lo.count != ro->size()) {
+    const ObjView lv = resolve_obj_view(lhs);
+    const ObjView rv = resolve_obj_view(rhs);
+    if (lv.n != rv.n) {
+        return false;
+    }
+    for (std::size_t i = 0u; i < lv.n; ++i) {
+        if (!(lv.key(i) == rv.key(i) && lv.val(i) == rv.val(i))) {
             return false;
         }
-        for (std::size_t i = 0u; i < lo.count; ++i) {
-            const auto& lp = lo.entry(i);
-            const auto& rp = (*ro)[i];
-            if (!(lp.first == rp.first && lp.second == rp.second)) {
-                return false;
-            }
-        }
-        return true;
     }
-    if (json_access::is_small_object(rhs)) {
-        return object_view_equal(rhs, lhs);
-    }
-    return *json_access::const_object_of(lhs) == *json_access::const_object_of(rhs);
+    return true;
 }
 
 inline bool object_view_less(const json& lhs, const json& rhs) {
-    if (!json_access::is_small_object(lhs) && !json_access::is_small_object(rhs)) {
-        return *json_access::const_object_of(lhs) < *json_access::const_object_of(rhs);
-    }
-    const auto* lo =
-        json_access::is_small_object(lhs) ? nullptr : json_access::const_object_of(lhs);
-    const auto* ro =
-        json_access::is_small_object(rhs) ? nullptr : json_access::const_object_of(rhs);
-    const std::size_t ln = lo != nullptr ? lo->size() : json_access::small_object_of(lhs).count;
-    const std::size_t rn = ro != nullptr ? ro->size() : json_access::small_object_of(rhs).count;
-    const std::size_t common = (std::min)(ln, rn);
+    const ObjView lv = resolve_obj_view(lhs);
+    const ObjView rv = resolve_obj_view(rhs);
+    const std::size_t common = (std::min)(lv.n, rv.n);
     for (std::size_t i = 0u; i < common; ++i) {
-        const auto& lp = lo != nullptr ? (*lo)[i] : json_access::small_object_of(lhs).entry(i);
-        const auto& rp = ro != nullptr ? (*ro)[i] : json_access::small_object_of(rhs).entry(i);
-        if (lp.first < rp.first) {
+        const std::string& lk = lv.key(i);
+        const std::string& rk = rv.key(i);
+        if (lk < rk) {
             return true;
         }
-        if (rp.first < lp.first) {
+        if (rk < lk) {
             return false;
         }
-        if (lp.second < rp.second) {
+        const json& lval = lv.val(i);
+        const json& rval = rv.val(i);
+        if (lval < rval) {
             return true;
         }
-        if (rp.second < lp.second) {
+        if (rval < lval) {
             return false;
         }
     }
-    return ln < rn;
+    return lv.n < rv.n;
 }
 
 } // namespace
@@ -2925,6 +4037,42 @@ void dump_yyjson_val_compact_strict(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_v
     }
 }
 
+inline void dump_arena_array_compact_strict(DumpBuffer& out, const ArenaArray* aa) {
+    const std::size_t n = aa->count;
+    if (n == 0u) {
+        out.append("[]", 2);
+        return;
+    }
+    out.push('[');
+    const json* elems = aa->elems();
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (i > 0u) {
+            out.push(',');
+        }
+        dump_compact_strict(out, elems[i]);
+    }
+    out.push(']');
+}
+
+inline void dump_arena_object_compact_strict(DumpBuffer& out, const ArenaObject* ao) {
+    const std::size_t n = ao->count;
+    if (n == 0u) {
+        out.append("{}", 2);
+        return;
+    }
+    out.push('{');
+    const std::string* const* ks = ao->keys();
+    const json* vs = ao->vals();
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (i > 0u) {
+            out.push(',');
+        }
+        utf8_impl::dump_key_colon_fast_strict(out, *ks[i]);
+        dump_compact_strict(out, vs[i]);
+    }
+    out.push('}');
+}
+
 void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const value_t type) {
     void* mat = node->materialized.load(std::memory_order_acquire);
     if (mat != nullptr) {
@@ -2932,6 +4080,14 @@ void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const valu
             dump_eager_array_compact_strict(out, *static_cast<const json::array_t*>(mat));
         } else {
             dump_eager_object_compact_strict(out, *static_cast<const json::object_t*>(mat));
+        }
+        return;
+    }
+    if (void* av = node->arena_view.load(std::memory_order_acquire)) {
+        if (type == value_t::array) {
+            dump_arena_array_compact_strict(out, static_cast<const ArenaArray*>(av));
+        } else {
+            dump_arena_object_compact_strict(out, static_cast<const ArenaObject*>(av));
         }
         return;
     }
@@ -3224,6 +4380,99 @@ void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
     }
 }
 
+inline void dump_arena_array_value(DumpBuffer& out, const ArenaArray* aa,
+                                   const bool pretty_print, const bool ensure_ascii,
+                                   const error_handler_t error_handler,
+                                   const unsigned int indent_step, std::string& indent_string,
+                                   const unsigned int current_indent) {
+    const std::size_t n = aa->count;
+    if (n == 0u) {
+        out.append("[]", 2);
+        return;
+    }
+    const json* elems = aa->elems();
+    if (pretty_print) {
+        out.append("[\n", 2);
+        const unsigned int new_indent = current_indent + indent_step;
+        if (indent_string.size() < new_indent) {
+            indent_string.resize(
+                (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
+        }
+        for (std::size_t i = 0u; i < n; ++i) {
+            out.append(indent_string.data(), new_indent);
+            dump_value(out, elems[i], true, ensure_ascii, error_handler, indent_step,
+                       indent_string, new_indent);
+            if (i + 1u < n) {
+                out.append(",\n", 2);
+            } else {
+                out.push('\n');
+            }
+        }
+        out.append(indent_string.data(), current_indent);
+        out.push(']');
+    } else {
+        out.push('[');
+        for (std::size_t i = 0u; i < n; ++i) {
+            if (i > 0u) {
+                out.push(',');
+            }
+            dump_value(out, elems[i], false, ensure_ascii, error_handler, indent_step,
+                       indent_string, current_indent);
+        }
+        out.push(']');
+    }
+}
+
+inline void dump_arena_object_value(DumpBuffer& out, const ArenaObject* ao,
+                                    const bool pretty_print, const bool ensure_ascii,
+                                    const error_handler_t error_handler,
+                                    const unsigned int indent_step, std::string& indent_string,
+                                    const unsigned int current_indent) {
+    const std::size_t n = ao->count;
+    if (n == 0u) {
+        out.append("{}", 2);
+        return;
+    }
+    const std::string* const* ks = ao->keys();
+    const json* vs = ao->vals();
+    if (pretty_print) {
+        out.append("{\n", 2);
+        const unsigned int new_indent = current_indent + indent_step;
+        if (indent_string.size() < new_indent) {
+            indent_string.resize(
+                (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
+        }
+        for (std::size_t i = 0u; i < n; ++i) {
+            out.append(indent_string.data(), new_indent);
+            out.push('"');
+            utf8_impl::dump_escaped(out, *ks[i], ensure_ascii, error_handler);
+            out.append("\": ", 3);
+            dump_value(out, vs[i], true, ensure_ascii, error_handler, indent_step, indent_string,
+                       new_indent);
+            if (i + 1u < n) {
+                out.append(",\n", 2);
+            } else {
+                out.push('\n');
+            }
+        }
+        out.append(indent_string.data(), current_indent);
+        out.push('}');
+    } else {
+        out.push('{');
+        for (std::size_t i = 0u; i < n; ++i) {
+            if (i > 0u) {
+                out.push(',');
+            }
+            out.push('"');
+            utf8_impl::dump_escaped(out, *ks[i], ensure_ascii, error_handler);
+            out.append("\":", 2);
+            dump_value(out, vs[i], false, ensure_ascii, error_handler, indent_step, indent_string,
+                       current_indent);
+        }
+        out.push('}');
+    }
+}
+
 void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
                       const bool pretty_print, const bool ensure_ascii,
                       const error_handler_t error_handler, const unsigned int indent_step,
@@ -3236,6 +4485,18 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
                                    current_indent);
         } else {
             dump_eager_object_value(out, *static_cast<const json::object_t*>(mat), pretty_print,
+                                    ensure_ascii, error_handler, indent_step, indent_string,
+                                    current_indent);
+        }
+        return;
+    }
+    if (void* av = node->arena_view.load(std::memory_order_acquire)) {
+        if (type == value_t::array) {
+            dump_arena_array_value(out, static_cast<const ArenaArray*>(av), pretty_print,
+                                   ensure_ascii, error_handler, indent_step, indent_string,
+                                   current_indent);
+        } else {
+            dump_arena_object_value(out, static_cast<const ArenaObject*>(av), pretty_print,
                                     ensure_ascii, error_handler, indent_step, indent_string,
                                     current_indent);
         }
@@ -3416,6 +4677,8 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
             if (json_access::is_lazy(val)) {
                 dump_yyjson_node_compact_strict(
                     out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::array);
+            } else if (json_access::is_arena_array(val)) {
+                dump_arena_array_compact_strict(out, json_access::arena_array_ptr(val));
             } else if (json_access::is_small_array(val)) {
                 dump_small_array_compact_strict(out, json_access::small_array_of(val));
             } else if (json_access::is_empty_container(val)) {
@@ -3429,6 +4692,8 @@ void dump_compact_strict(DumpBuffer& out, const json& val) {
             if (json_access::is_lazy(val)) {
                 dump_yyjson_node_compact_strict(
                     out, static_cast<LazyNode*>(json_access::lazy_node(val)), value_t::object);
+            } else if (json_access::is_arena_object(val)) {
+                dump_arena_object_compact_strict(out, json_access::arena_object_ptr(val));
             } else if (json_access::is_small_object(val)) {
                 dump_small_object_compact_strict(out, json_access::small_object_of(val));
             } else if (json_access::is_empty_container(val)) {
@@ -3488,6 +4753,10 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
                 dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
                                  value_t::array, pretty_print, ensure_ascii, error_handler,
                                  indent_step, indent_string, current_indent);
+            } else if (json_access::is_arena_array(val)) {
+                dump_arena_array_value(out, json_access::arena_array_ptr(val), pretty_print,
+                                       ensure_ascii, error_handler, indent_step, indent_string,
+                                       current_indent);
             } else if (json_access::is_small_array(val)) {
                 dump_small_array_value(out, json_access::small_array_of(val), pretty_print,
                                        ensure_ascii, error_handler, indent_step, indent_string,
@@ -3506,6 +4775,10 @@ void dump_value(DumpBuffer& out, const json& val, const bool pretty_print,
                 dump_yyjson_node(out, static_cast<LazyNode*>(json_access::lazy_node(val)),
                                  value_t::object, pretty_print, ensure_ascii, error_handler,
                                  indent_step, indent_string, current_indent);
+            } else if (json_access::is_arena_object(val)) {
+                dump_arena_object_value(out, json_access::arena_object_ptr(val), pretty_print,
+                                        ensure_ascii, error_handler, indent_step, indent_string,
+                                        current_indent);
             } else if (json_access::is_small_object(val)) {
                 dump_small_object_value(out, json_access::small_object_of(val), pretty_print,
                                         ensure_ascii, error_handler, indent_step, indent_string,
