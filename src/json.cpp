@@ -2310,6 +2310,9 @@ void* lazy_steal_owned_materialized(LazyNode* node, const value_t /*type*/) noex
         return nullptr;
     }
     void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
+    if (mat == nullptr) {
+        return nullptr;
+    }
     SharedYyDoc* sdoc = node->doc;
     node->~LazyNode();
     pool_free(node, sizeof(LazyNode));
@@ -2324,6 +2327,22 @@ void dump_value(DumpBuffer& out, const json& val, bool pretty_print, bool ensure
                 error_handler_t error_handler, unsigned int indent_step,
                 std::string& indent_string, unsigned int current_indent);
 json materialize_yyjson(yyjson_val* root, std::size_t max_depth, bool& depth_exceeded);
+
+NEOJSON_NOINLINE void dump_yyjson_dup_obj_compact_strict(DumpBuffer& out, yyjson_val* val) {
+    bool ignored = false;
+    json tmp = materialize_yyjson(val, (std::numeric_limits<std::size_t>::max)(), ignored);
+    dump_compact_strict(out, tmp);
+}
+
+NEOJSON_NOINLINE void dump_yyjson_dup_obj_value(
+    DumpBuffer& out, yyjson_val* val, const bool pretty_print, const bool ensure_ascii,
+    const error_handler_t error_handler, const unsigned int indent_step,
+    std::string& indent_string, const unsigned int current_indent) {
+    bool ignored = false;
+    json tmp = materialize_yyjson(val, (std::numeric_limits<std::size_t>::max)(), ignored);
+    dump_value(out, tmp, pretty_print, ensure_ascii, error_handler, indent_step, indent_string,
+               current_indent);
+}
 
 inline void dump_eager_array_compact_strict(DumpBuffer& out, const json::array_t& arr) {
     if (arr.empty()) {
@@ -2384,7 +2403,7 @@ inline void dump_yyjson_key_colon_compact_strict(DumpBuffer& out, yyjson_val* ke
 }
 
 void dump_yyjson_val_compact_strict(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
-                                    bool& saw_dup) {
+                                    bool& saw_dup, yyjson_val* preverified_obj = nullptr) {
     switch (yyjson_get_tag(val)) {
         case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
             out.append("null", 4);
@@ -2427,7 +2446,7 @@ void dump_yyjson_val_compact_strict(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_v
                 if (i > 0u) {
                     out.push(',');
                 }
-                dump_yyjson_val_compact_strict(out, sdoc, cur, saw_dup);
+                dump_yyjson_val_compact_strict(out, sdoc, cur, saw_dup, nullptr);
                 if (i + 1u < len) {
                     cur = unsafe_yyjson_get_next(cur);
                 }
@@ -2442,13 +2461,11 @@ void dump_yyjson_val_compact_strict(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_v
                 out.append("{}", 2);
                 return;
             }
-            if (!sdoc->tree_unique_verified.load(std::memory_order_acquire) &&
+            if (val != preverified_obj &&
+                !sdoc->tree_unique_verified.load(std::memory_order_acquire) &&
                 !is_yyjson_object_unique(val)) {
                 saw_dup = true;
-                bool ignored = false;
-                json tmp = materialize_yyjson(
-                    val, (std::numeric_limits<std::size_t>::max)(), ignored);
-                dump_compact_strict(out, tmp);
+                dump_yyjson_dup_obj_compact_strict(out, val);
                 return;
             }
             out.push('{');
@@ -2461,7 +2478,8 @@ void dump_yyjson_val_compact_strict(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_v
                 }
                 first = false;
                 dump_yyjson_key_colon_compact_strict(out, key);
-                dump_yyjson_val_compact_strict(out, sdoc, yyjson_obj_iter_get_val(key), saw_dup);
+                dump_yyjson_val_compact_strict(out, sdoc, yyjson_obj_iter_get_val(key), saw_dup,
+                                               nullptr);
             }
             out.push('}');
             return;
@@ -2494,7 +2512,8 @@ void dump_yyjson_node_compact_strict(DumpBuffer& out, LazyNode* node, const valu
         return;
     }
     bool saw_dup = false;
-    dump_yyjson_val_compact_strict(out, node->doc, node->val, saw_dup);
+    dump_yyjson_val_compact_strict(out, node->doc, node->val, saw_dup,
+                                   type == value_t::object ? node->val : nullptr);
     if (!saw_dup) {
         if (type == value_t::object) {
             node->dedup_state.store(1u, std::memory_order_release);
@@ -2596,7 +2615,8 @@ inline void dump_eager_object_value(DumpBuffer& out, const json::object_t& obj,
 void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
                      const bool pretty_print, const bool ensure_ascii,
                      const error_handler_t error_handler, const unsigned int indent_step,
-                     std::string& indent_string, const unsigned int current_indent, bool& saw_dup) {
+                     std::string& indent_string, const unsigned int current_indent, bool& saw_dup,
+                     yyjson_val* preverified_obj = nullptr) {
     switch (yyjson_get_tag(val)) {
         case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
             out.append("null", 4);
@@ -2657,7 +2677,7 @@ void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
                 for (std::size_t i = 0u; i < len; ++i) {
                     out.append(indent_string.data(), new_indent);
                     dump_yyjson_val(out, sdoc, cur, true, ensure_ascii, error_handler, indent_step,
-                                    indent_string, new_indent, saw_dup);
+                                    indent_string, new_indent, saw_dup, nullptr);
                     if (i + 1u < len) {
                         out.append(",\n", 2);
                         cur = unsafe_yyjson_get_next(cur);
@@ -2674,7 +2694,7 @@ void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
                         out.push(',');
                     }
                     dump_yyjson_val(out, sdoc, cur, false, ensure_ascii, error_handler,
-                                    indent_step, indent_string, current_indent, saw_dup);
+                                    indent_step, indent_string, current_indent, saw_dup, nullptr);
                     if (i + 1u < len) {
                         cur = unsafe_yyjson_get_next(cur);
                     }
@@ -2690,14 +2710,12 @@ void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
                 out.append("{}", 2);
                 return;
             }
-            if (!sdoc->tree_unique_verified.load(std::memory_order_acquire) &&
+            if (val != preverified_obj &&
+                !sdoc->tree_unique_verified.load(std::memory_order_acquire) &&
                 !is_yyjson_object_unique(val)) {
                 saw_dup = true;
-                bool ignored = false;
-                json tmp = materialize_yyjson(
-                    val, (std::numeric_limits<std::size_t>::max)(), ignored);
-                dump_value(out, tmp, pretty_print, ensure_ascii, error_handler, indent_step,
-                           indent_string, current_indent);
+                dump_yyjson_dup_obj_value(out, val, pretty_print, ensure_ascii, error_handler,
+                                          indent_step, indent_string, current_indent);
                 return;
             }
             yyjson_obj_iter iter = yyjson_obj_iter_with(val);
@@ -2728,7 +2746,7 @@ void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
                     }
                     dump_yyjson_val(out, sdoc, yyjson_obj_iter_get_val(key), true, ensure_ascii,
                                     error_handler, indent_step, indent_string, new_indent,
-                                    saw_dup);
+                                    saw_dup, nullptr);
                     if (idx + 1u < len) {
                         out.append(",\n", 2);
                     } else {
@@ -2761,7 +2779,7 @@ void dump_yyjson_val(DumpBuffer& out, SharedYyDoc* sdoc, yyjson_val* val,
                     }
                     dump_yyjson_val(out, sdoc, yyjson_obj_iter_get_val(key), false, ensure_ascii,
                                     error_handler, indent_step, indent_string, current_indent,
-                                    saw_dup);
+                                    saw_dup, nullptr);
                 }
                 out.push('}');
             }
@@ -2804,7 +2822,8 @@ void dump_yyjson_node(DumpBuffer& out, LazyNode* node, const value_t type,
     }
     bool saw_dup = false;
     dump_yyjson_val(out, node->doc, node->val, pretty_print, ensure_ascii, error_handler,
-                    indent_step, indent_string, current_indent, saw_dup);
+                    indent_step, indent_string, current_indent, saw_dup,
+                    type == value_t::object ? node->val : nullptr);
     if (!saw_dup) {
         if (type == value_t::object) {
             node->dedup_state.store(1u, std::memory_order_release);
