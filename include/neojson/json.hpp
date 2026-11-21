@@ -414,11 +414,18 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
     explicit ordered_map(const Allocator& alloc) noexcept(noexcept(Container(alloc)))
         : Container(alloc) {}
 
-    ordered_map(const ordered_map& other)
-        : Container(other),
-          m_index(other.m_index != nullptr ? copy_index(*other.m_index) : nullptr) {}
+    ~ordered_map() noexcept {
+        destroy_index(m_index.load(std::memory_order_acquire));
+    }
 
-    ordered_map(ordered_map&& other) noexcept = default;
+    ordered_map(const ordered_map& other)
+        : Container(other), m_index(nullptr) {}
+
+    ordered_map(ordered_map&& other) noexcept
+        : Container(std::move(other)),
+          m_index(other.m_index.load(std::memory_order_acquire)) {
+        other.m_index.store(nullptr, std::memory_order_relaxed);
+    }
 
     ordered_map& operator=(const ordered_map& other) {
         if (this != &other) {
@@ -428,31 +435,42 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         return *this;
     }
 
-    ordered_map& operator=(ordered_map&& other) noexcept = default;
+    ordered_map& operator=(ordered_map&& other) noexcept {
+        if (this != &other) {
+            reset_index();
+            Container::operator=(std::move(other));
+            m_index.store(other.m_index.load(std::memory_order_acquire),
+                          std::memory_order_relaxed);
+            other.m_index.store(nullptr, std::memory_order_relaxed);
+        }
+        return *this;
+    }
 
     template <class It, std::enable_if_t<detail::is_InputIt<It>::value, int> = 0>
     ordered_map(It first, It last, const Allocator& alloc = Allocator())
-        : Container(first, last, alloc) {
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
-    }
+        : Container(first, last, alloc), m_index(nullptr) {}
 
     ordered_map(std::initializer_list<value_type> init, const Allocator& alloc = Allocator())
-        : Container(init, alloc) {
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
-    }
+        : Container(init, alloc), m_index(nullptr) {}
 
     void swap(ordered_map& other) noexcept {
+        if (this == &other) {
+            return;
+        }
         Container::swap(other);
-        m_index.swap(other.m_index);
+        HashIndex* a = m_index.load(std::memory_order_acquire);
+        HashIndex* b = other.m_index.load(std::memory_order_acquire);
+        m_index.store(b, std::memory_order_relaxed);
+        other.m_index.store(a, std::memory_order_relaxed);
     }
 
     void clear() noexcept {
         Container::clear();
-        m_index.reset();
+        reset_index();
+    }
+
+    void reserve_vector_only(const std::size_t expected_len) {
+        Container::reserve(expected_len);
     }
 
     void reserve_for_build(const std::size_t expected_len) {
@@ -460,36 +478,43 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         if (expected_len > detail::kOrderedMapHashThreshold &&
             expected_len <= kMaxIndexedSize) {
             const std::size_t needed = next_pow2(expected_len * 2);
-            if (m_index == nullptr || m_index->cap < needed) {
+            HashIndex* cur = m_index.load(std::memory_order_relaxed);
+            if (cur == nullptr || cur->cap < needed) {
                 build_index_with_cap(needed);
             }
         }
     }
 
     void push_back(const value_type& value) {
-        ensure_index_for_next();
+        if (m_index.load(std::memory_order_relaxed) != nullptr) {
+            ensure_index_for_next();
+        }
         Container::push_back(value);
-        if (m_index != nullptr) {
+        if (HashIndex* idx = m_index.load(std::memory_order_relaxed)) {
             const auto& k = this->back().first;
-            insert_index_entry(this->size() - 1, detail::hash_bytes(k.data(), k.size()));
+            insert_index_entry(idx, this->size() - 1, detail::hash_bytes(k.data(), k.size()));
         }
     }
 
     void push_back(value_type&& value) {
-        ensure_index_for_next();
+        if (m_index.load(std::memory_order_relaxed) != nullptr) {
+            ensure_index_for_next();
+        }
         Container::push_back(std::move(value));
-        if (m_index != nullptr) {
+        if (HashIndex* idx = m_index.load(std::memory_order_relaxed)) {
             const auto& k = this->back().first;
-            insert_index_entry(this->size() - 1, detail::hash_bytes(k.data(), k.size()));
+            insert_index_entry(idx, this->size() - 1, detail::hash_bytes(k.data(), k.size()));
         }
     }
 
     template <class... Args>
     reference emplace_back(Args&&... args) {
-        ensure_index_for_next();
+        if (m_index.load(std::memory_order_relaxed) != nullptr) {
+            ensure_index_for_next();
+        }
         reference inserted = Container::emplace_back(std::forward<Args>(args)...);
-        if (m_index != nullptr) {
-            insert_index_entry(this->size() - 1,
+        if (HashIndex* idx = m_index.load(std::memory_order_relaxed)) {
+            insert_index_entry(idx, this->size() - 1,
                                detail::hash_bytes(inserted.first.data(), inserted.first.size()));
         }
         return inserted;
@@ -499,11 +524,11 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         if (this->empty()) {
             return;
         }
-        if (m_index != nullptr) {
+        if (HashIndex* idx = m_index.load(std::memory_order_relaxed)) {
             if (this->size() - 1 <= detail::kOrderedMapHashThreshold) {
-                m_index.reset();
+                reset_index();
             } else {
-                remove_index_entry(this->size() - 1);
+                remove_index_entry(idx, this->size() - 1);
             }
         }
         Container::pop_back();
@@ -518,17 +543,19 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         if (found != kNpos) {
             return {this->begin() + static_cast<difference_type>(found), false};
         }
-        const bool had_index = (m_index != nullptr);
+        const bool had_index = (m_index.load(std::memory_order_relaxed) != nullptr);
         ensure_index_for_next();
-        if (m_index != nullptr && !had_index) {
+        HashIndex* idx = m_index.load(std::memory_order_relaxed);
+        if (idx != nullptr && !had_index) {
             h = detail::hash_bytes(sv.data(), sv.size());
         }
         Container::emplace_back(
             std::piecewise_construct,
             std::forward_as_tuple(std::forward<KeyType>(key)),
             std::forward_as_tuple(std::forward<Args>(args)...));
-        if (m_index != nullptr) {
-            insert_index_entry(this->size() - 1, h);
+        idx = m_index.load(std::memory_order_relaxed);
+        if (idx != nullptr) {
+            insert_index_entry(idx, this->size() - 1, h);
         }
         return {std::prev(this->end()), true};
     }
@@ -540,29 +567,42 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
             (*this)[found].second = std::move(value);
             return (*this)[found].second;
         }
-        const bool had_index = (m_index != nullptr);
+        const bool had_index = (m_index.load(std::memory_order_relaxed) != nullptr);
         ensure_index_for_next();
-        if (m_index != nullptr && !had_index) {
+        HashIndex* idx = m_index.load(std::memory_order_relaxed);
+        if (idx != nullptr && !had_index) {
             h = detail::hash_bytes(sv.data(), sv.size());
         }
         Container::emplace_back(
             std::piecewise_construct,
             std::forward_as_tuple(sv),
             std::forward_as_tuple(std::move(value)));
-        if (m_index != nullptr) {
-            insert_index_entry(this->size() - 1, h);
+        idx = m_index.load(std::memory_order_relaxed);
+        if (idx != nullptr) {
+            insert_index_entry(idx, this->size() - 1, h);
         }
         return this->back().second;
     }
 
-    T& emplace_back_unique_key(const std::string_view sv, T&& value) {
-        ensure_index_for_next();
+    T& emplace_back_unindexed(const std::string_view sv, T&& value) {
+        assert(m_index.load(std::memory_order_relaxed) == nullptr);
         Container::emplace_back(
             std::piecewise_construct,
             std::forward_as_tuple(sv),
             std::forward_as_tuple(std::move(value)));
-        if (m_index != nullptr) {
-            insert_index_entry(this->size() - 1, detail::hash_bytes(sv.data(), sv.size()));
+        return this->back().second;
+    }
+
+    T& emplace_back_unique_key(const std::string_view sv, T&& value) {
+        if (m_index.load(std::memory_order_relaxed) != nullptr) {
+            ensure_index_for_next();
+        }
+        Container::emplace_back(
+            std::piecewise_construct,
+            std::forward_as_tuple(sv),
+            std::forward_as_tuple(std::move(value)));
+        if (HashIndex* idx = m_index.load(std::memory_order_relaxed)) {
+            insert_index_entry(idx, this->size() - 1, detail::hash_bytes(sv.data(), sv.size()));
         }
         return this->back().second;
     }
@@ -576,9 +616,10 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         if (found != kNpos) {
             return (*this)[found].second;
         }
-        const bool had_index = (m_index != nullptr);
+        const bool had_index = (m_index.load(std::memory_order_relaxed) != nullptr);
         ensure_index_for_next();
-        if (m_index != nullptr && !had_index) {
+        HashIndex* idx = m_index.load(std::memory_order_relaxed);
+        if (idx != nullptr && !had_index) {
             h = detail::hash_bytes(sv.data(), sv.size());
         }
         if (this->capacity() == 0) {
@@ -588,8 +629,9 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
             std::piecewise_construct,
             std::forward_as_tuple(std::forward<KeyType>(key)),
             std::forward_as_tuple());
-        if (m_index != nullptr) {
-            insert_index_entry(this->size() - 1, h);
+        idx = m_index.load(std::memory_order_relaxed);
+        if (idx != nullptr) {
+            insert_index_entry(idx, this->size() - 1, h);
         }
         return this->back().second;
     }
@@ -709,13 +751,7 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
             return this->begin() + offset;
         }
         Container::erase(this->begin() + offset, this->begin() + offset + count);
-        if (m_index != nullptr) {
-            if (this->size() <= detail::kOrderedMapHashThreshold) {
-                m_index.reset();
-            } else {
-                build_index_with_min_cap(this->size());
-            }
-        }
+        reset_index();
         return this->begin() + offset;
     }
 
@@ -795,44 +831,29 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
     }
 
     void resize(const size_type count) {
-        m_index.reset();
+        reset_index();
         Container::resize(count);
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
     }
 
     void resize(const size_type count, const value_type& value) {
-        m_index.reset();
+        reset_index();
         Container::resize(count, value);
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
     }
 
     void assign(const size_type count, const value_type& value) {
-        m_index.reset();
+        reset_index();
         Container::assign(count, value);
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
     }
 
     template <class InputIt, std::enable_if_t<detail::is_InputIt<InputIt>::value, int> = 0>
     void assign(InputIt first, InputIt last) {
-        m_index.reset();
+        reset_index();
         Container::assign(first, last);
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
     }
 
     void assign(std::initializer_list<value_type> ilist) {
-        m_index.reset();
+        reset_index();
         Container::assign(ilist);
-        if (this->size() > detail::kOrderedMapHashThreshold) {
-            build_index_with_min_cap(this->size());
-        }
     }
 
     friend bool operator==(const ordered_map& lhs, const ordered_map& rhs) {
@@ -884,18 +905,15 @@ private:
         return ptr;
     }
 
-    static IndexPtr copy_index(const HashIndex& other) {
-        auto* h = ::new (detail::pool_alloc(sizeof(HashIndex))) HashIndex{0, nullptr};
-        IndexPtr ptr(h);
-        const std::size_t c = other.cap;
-        const std::size_t bytes = c * sizeof(Slot);
-        auto* s = static_cast<Slot*>(detail::pool_alloc(bytes));
-        for (std::size_t i = 0; i < c; ++i) {
-            ::new (s + i) Slot{other.slots[i].idx_plus_one, other.slots[i].hash32};
+    static void destroy_index(HashIndex* idx) noexcept {
+        HashIndexDeleter{}(idx);
+    }
+
+    void reset_index() noexcept {
+        if (HashIndex* old = m_index.load(std::memory_order_acquire)) {
+            m_index.store(nullptr, std::memory_order_relaxed);
+            destroy_index(old);
         }
-        h->cap = c;
-        h->slots = s;
-        return ptr;
     }
 
     static constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
@@ -915,14 +933,61 @@ private:
         return cap;
     }
 
+    IndexPtr populate_index(const std::size_t target_cap, const std::size_t n) const {
+        IndexPtr next_idx = make_index(target_cap);
+        const std::size_t mask = target_cap - 1;
+        Slot* slots = next_idx->slots;
+        const value_type* elems = this->data();
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t h =
+                detail::hash_bytes(elems[i].first.data(), elems[i].first.size());
+            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+            std::size_t pos = static_cast<std::size_t>(h) & mask;
+            while (slots[pos].idx_plus_one != 0) {
+                pos = (pos + 1) & mask;
+            }
+            slots[pos] = {static_cast<std::uint32_t>(i + 1), h32};
+        }
+        return next_idx;
+    }
+
+    NEOJSON_NOINLINE HashIndex* build_index_lazy_slow(const std::size_t n) const noexcept {
+        try {
+            const std::size_t target_cap = next_pow2(n * 2);
+            IndexPtr next_idx = populate_index(target_cap, n);
+            HashIndex* expected = nullptr;
+            HashIndex* candidate = next_idx.get();
+            if (m_index.compare_exchange_strong(expected, candidate,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+                next_idx.release();
+                return candidate;
+            }
+            return expected;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    HashIndex* get_or_build_index() const noexcept {
+        if (HashIndex* idx = m_index.load(std::memory_order_acquire)) {
+            return idx;
+        }
+        const std::size_t n = this->size();
+        if (n <= detail::kOrderedMapHashThreshold || n > kMaxIndexedSize) {
+            return nullptr;
+        }
+        return build_index_lazy_slow(n);
+    }
+
     std::size_t find_pos_with_hash(const std::string_view sv, std::uint64_t& out_h) const noexcept {
-        if (m_index != nullptr) {
+        if (const HashIndex* hidx = get_or_build_index()) {
             const std::uint64_t h = detail::hash_bytes(sv.data(), sv.size());
             out_h = h;
             const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
-            const std::size_t mask = m_index->cap - 1;
+            const std::size_t mask = hidx->cap - 1;
             std::size_t pos = static_cast<std::size_t>(h) & mask;
-            const Slot* slots = m_index->slots;
+            const Slot* slots = hidx->slots;
             const value_type* elems = this->data();
             for (;;) {
                 const Slot s = slots[pos];
@@ -930,9 +995,9 @@ private:
                     return kNpos;
                 }
                 if (s.hash32 == h32) {
-                    const std::size_t idx = static_cast<std::size_t>(s.idx_plus_one - 1);
-                    if (key_equals(elems[idx].first, sv)) {
-                        return idx;
+                    const std::size_t elem_idx = static_cast<std::size_t>(s.idx_plus_one - 1);
+                    if (key_equals(elems[elem_idx].first, sv)) {
+                        return elem_idx;
                     }
                 }
                 pos = (pos + 1) & mask;
@@ -954,27 +1019,14 @@ private:
     }
 
     void build_index_with_cap(const std::size_t target_cap) {
-        const std::size_t n = this->size();
-        IndexPtr next_idx = make_index(target_cap);
-        const std::size_t mask = target_cap - 1;
-        Slot* slots = next_idx->slots;
-        const value_type* elems = this->data();
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::uint64_t h =
-                detail::hash_bytes(elems[i].first.data(), elems[i].first.size());
-            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
-            std::size_t pos = static_cast<std::size_t>(h) & mask;
-            while (slots[pos].idx_plus_one != 0) {
-                pos = (pos + 1) & mask;
-            }
-            slots[pos] = {static_cast<std::uint32_t>(i + 1), h32};
-        }
-        m_index = std::move(next_idx);
+        IndexPtr next_idx = populate_index(target_cap, this->size());
+        reset_index();
+        m_index.store(next_idx.release(), std::memory_order_release);
     }
 
     void build_index_with_min_cap(const std::size_t min_elements) {
         if (min_elements > kMaxIndexedSize) {
-            m_index.reset();
+            reset_index();
             return;
         }
         build_index_with_cap(next_pow2(min_elements * 2));
@@ -982,10 +1034,11 @@ private:
 
     void ensure_index_for_next() {
         const std::size_t next_n = this->size() + 1;
-        if (m_index != nullptr) {
+        HashIndex* cur = m_index.load(std::memory_order_relaxed);
+        if (cur != nullptr) {
             if (next_n > kMaxIndexedSize) {
-                m_index.reset();
-            } else if (next_n * 2 > m_index->cap) {
+                reset_index();
+            } else if (next_n * 2 > cur->cap) {
                 build_index_with_min_cap(next_n);
             }
         } else if (next_n > detail::kOrderedMapHashThreshold && next_n <= kMaxIndexedSize) {
@@ -993,24 +1046,25 @@ private:
         }
     }
 
-    void insert_index_entry(const std::size_t idx, const std::uint64_t h) noexcept {
-        const std::size_t mask = m_index->cap - 1;
+    static void insert_index_entry(HashIndex* idx, const std::size_t elem_idx,
+                                   const std::uint64_t h) noexcept {
+        const std::size_t mask = idx->cap - 1;
         const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
-        Slot* slots = m_index->slots;
+        Slot* slots = idx->slots;
         std::size_t pos = static_cast<std::size_t>(h) & mask;
         while (slots[pos].idx_plus_one != 0) {
             pos = (pos + 1) & mask;
         }
-        slots[pos] = {static_cast<std::uint32_t>(idx + 1), h32};
+        slots[pos] = {static_cast<std::uint32_t>(elem_idx + 1), h32};
     }
 
-    void remove_index_entry(const std::size_t idx) noexcept {
-        const std::size_t mask = m_index->cap - 1;
-        Slot* slots = m_index->slots;
-        const key_type& target_key = (*this)[idx].first;
+    void remove_index_entry(HashIndex* idx, const std::size_t elem_idx) noexcept {
+        const std::size_t mask = idx->cap - 1;
+        Slot* slots = idx->slots;
+        const key_type& target_key = (*this)[elem_idx].first;
         const std::uint64_t h = detail::hash_bytes(target_key.data(), target_key.size());
         std::size_t pos = static_cast<std::size_t>(h) & mask;
-        const std::uint32_t want = static_cast<std::uint32_t>(idx + 1);
+        const std::uint32_t want = static_cast<std::uint32_t>(elem_idx + 1);
         while (slots[pos].idx_plus_one != want) {
             pos = (pos + 1) & mask;
         }
@@ -1034,15 +1088,15 @@ private:
     }
 
     void erase_at(const std::size_t idx) {
-        if (m_index != nullptr) {
+        if (HashIndex* hidx = m_index.load(std::memory_order_relaxed)) {
             if (this->size() - 1 <= detail::kOrderedMapHashThreshold) {
-                m_index.reset();
+                reset_index();
             } else {
-                remove_index_entry(idx);
+                remove_index_entry(hidx, idx);
                 if (idx + 1 < this->size()) {
                     const std::uint32_t pivot = static_cast<std::uint32_t>(idx + 1);
-                    Slot* slots = m_index->slots;
-                    for (std::size_t i = 0; i < m_index->cap; ++i) {
+                    Slot* slots = hidx->slots;
+                    for (std::size_t i = 0; i < hidx->cap; ++i) {
                         if (slots[i].idx_plus_one > pivot) {
                             --slots[i].idx_plus_one;
                         }
@@ -1053,7 +1107,7 @@ private:
         Container::erase(this->begin() + static_cast<difference_type>(idx));
     }
 
-    IndexPtr m_index;
+    mutable std::atomic<HashIndex*> m_index{nullptr};
 };
 
 namespace detail {

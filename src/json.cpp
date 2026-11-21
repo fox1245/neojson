@@ -1631,6 +1631,14 @@ struct json_access {
         return ptr;
     }
 
+    static json::object_t* create_object_vec_cap(const std::size_t cap) {
+        auto* ptr = json::create_object();
+        if (cap > 0u) {
+            ptr->reserve_vector_only(cap);
+        }
+        return ptr;
+    }
+
     static json::array_t* clone_array(const json::array_t* src) {
         return json::create_array(*src);
     }
@@ -1753,15 +1761,17 @@ struct DupProbeEntry {
     std::size_t hash = 0;
     const char* ptr = nullptr;
     std::size_t len = 0;
+    std::uint32_t vec_idx = 0;
     std::uint32_t stamp = 0;
 };
+static_assert(sizeof(DupProbeEntry) == 32u, "DupProbeEntry should stay 32 bytes");
 
 struct DupProbeTable {
     // Standard heap vector so arbitrary reader/writer threads never depend on ThreadPool state.
     std::vector<DupProbeEntry> slots;
     std::uint32_t stamp = 1u;
 
-    bool check(yyjson_val* obj, const std::size_t len) {
+    void prepare(const std::size_t len) {
         std::size_t cap = 64u;
         const std::size_t need = len * 2u;
         while (cap < need) {
@@ -1770,7 +1780,7 @@ struct DupProbeTable {
         if (slots.size() < cap) {
             slots.assign(cap, DupProbeEntry{});
             stamp = 1u;
-        } else if (slots.size() > 4096u && cap <= 512u) {
+        } else if (slots.size() > 65536u && cap <= 512u) {
             slots.assign(cap, DupProbeEntry{});
             stamp = 1u;
         } else {
@@ -1780,6 +1790,10 @@ struct DupProbeTable {
                 stamp = 1u;
             }
         }
+    }
+
+    bool check(yyjson_val* obj, const std::size_t len) {
+        prepare(len);
         const std::size_t mask = slots.size() - 1u;
         yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
         yyjson_val* key = nullptr;
@@ -1792,7 +1806,7 @@ struct DupProbeTable {
             for (;;) {
                 auto& e = slots[pos];
                 if (e.stamp != stamp) {
-                    e = DupProbeEntry{h, kptr, klen, stamp};
+                    e = DupProbeEntry{h, kptr, klen, 0u, stamp};
                     break;
                 }
                 if (e.hash == h && e.len == klen &&
@@ -1808,6 +1822,11 @@ struct DupProbeTable {
         return true;
     }
 };
+
+inline DupProbeTable& tls_dup_probe_table() {
+    thread_local DupProbeTable table;
+    return table;
+}
 
 NEOJSON_NOINLINE bool check_small_object_unique(yyjson_val* obj, const std::size_t len) noexcept {
     std::string_view seen[16];
@@ -1828,8 +1847,7 @@ NEOJSON_NOINLINE bool check_small_object_unique(yyjson_val* obj, const std::size
 }
 
 NEOJSON_NOINLINE bool check_large_object_unique(yyjson_val* obj, const std::size_t len) {
-    thread_local DupProbeTable table;
-    return table.check(obj, len);
+    return tls_dup_probe_table().check(obj, len);
 }
 
 inline bool is_yyjson_object_unique(yyjson_val* obj) {
@@ -2032,7 +2050,7 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool 
         guard.p = nullptr;
         return arr;
     }
-    json::object_t* obj = json_access::create_object_cap(len);
+    json::object_t* obj = json_access::create_object_vec_cap(len);
     struct ObjGuard {
         json::object_t* p;
         ~ObjGuard() {
@@ -2048,14 +2066,60 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool 
         while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
             yyjson_val* cval = yyjson_obj_iter_get_val(key);
             const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
-            obj->emplace_back_unique_key(k, make_lazy_child(sdoc, cval, batch, rem));
+            obj->emplace_back_unindexed(k, make_lazy_child(sdoc, cval, batch, rem));
             --rem;
         }
-    } else {
+    } else if (len <= detail::kOrderedMapHashThreshold) {
         while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
             yyjson_val* cval = yyjson_obj_iter_get_val(key);
             const std::string_view k(unsafe_yyjson_get_str(key), unsafe_yyjson_get_len(key));
             obj->emplace_or_assign_key(k, make_lazy_child(sdoc, cval, batch, rem));
+            --rem;
+        }
+    } else {
+        DupProbeTable& table = tls_dup_probe_table();
+        table.prepare(len);
+        const std::size_t mask = table.slots.size() - 1u;
+        const std::uint32_t st = table.stamp;
+        bool use_probe = true;
+        while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
+            yyjson_val* cval = yyjson_obj_iter_get_val(key);
+            const char* kptr = unsafe_yyjson_get_str(key);
+            const std::size_t klen = unsafe_yyjson_get_len(key);
+            json child = make_lazy_child(sdoc, cval, batch, rem);
+            if (!use_probe) {
+                obj->emplace_or_assign_key(std::string_view(kptr, klen), std::move(child));
+                --rem;
+                continue;
+            }
+            const std::size_t h = hash_bytes(kptr, klen);
+            std::size_t pos = h & mask;
+            std::size_t probes = 0u;
+            for (;;) {
+                auto& e = table.slots[pos];
+                if (e.stamp != st) {
+                    if (obj->size() <= 0xFFFFFFFFu) {
+                        const auto vec_idx = static_cast<std::uint32_t>(obj->size());
+                        obj->emplace_back_unindexed(std::string_view(kptr, klen), std::move(child));
+                        e = DupProbeEntry{h, kptr, klen, vec_idx, st};
+                    } else {
+                        use_probe = false;
+                        obj->emplace_or_assign_key(std::string_view(kptr, klen), std::move(child));
+                    }
+                    break;
+                }
+                if (e.hash == h && e.len == klen &&
+                    (klen == 0u || std::memcmp(e.ptr, kptr, klen) == 0)) {
+                    (*obj)[e.vec_idx].second = std::move(child);
+                    break;
+                }
+                if (++probes >= 64u) {
+                    use_probe = false;
+                    obj->emplace_or_assign_key(std::string_view(kptr, klen), std::move(child));
+                    break;
+                }
+                pos = (pos + 1u) & mask;
+            }
             --rem;
         }
     }

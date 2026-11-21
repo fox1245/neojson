@@ -1,6 +1,7 @@
 // Differential and thread-safety tests for ordered_map's hash index across size thresholds, overwrites,
 // deletions, copies, moves, swaps, and special keys.
 
+#include <atomic>
 #include <cstddef>
 #include <random>
 #include <string>
@@ -220,6 +221,105 @@ TEST(OrderedMapIndex, ResizeAssignAndPopBackKeepIndexConsistent) {
     EXPECT_EQ(obj.size(), 1u);
     EXPECT_FALSE(j.contains("r23"));
     EXPECT_EQ(j.at("solo"), 7);
+}
+
+TEST(OrderedMapIndex, LazyIndexConcurrentFirstLookupIsRaceFree) {
+    auto build_raw = [](const bool with_dups) {
+        std::string s = "{";
+        for (int i = 0; i < 200; ++i) {
+            if (i > 0) {
+                s.push_back(',');
+            }
+            s += "\"field_" + std::to_string(i) + "\":" + std::to_string(i * 3);
+        }
+        if (with_dups) {
+            s += R"(,"field_0":9000,"field_100":9100,"field_199":9199)";
+        }
+        s.push_back('}');
+        return s;
+    };
+
+    for (const bool with_dups : {false, true}) {
+        const std::string raw = build_raw(with_dups);
+        const oj oracle = oj::parse(raw);
+        const jk doc = jk::parse(raw);
+
+        // Materialize via const iteration without performing any key lookups (no HashIndex yet).
+        std::size_t visited = 0;
+        for (auto it = doc.cbegin(); it != doc.cend(); ++it) {
+            (void)it.key();
+            (void)it.value().get<int>();
+            ++visited;
+        }
+        ASSERT_EQ(visited, 200u);
+
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&, t]() {
+                while (!go.load(std::memory_order_acquire)) {
+                }
+                for (int rep = 0; rep < 300; ++rep) {
+                    const int idx = (rep + t * 29) % 200;
+                    const std::string k = "field_" + std::to_string(idx);
+                    int expected = idx * 3;
+                    if (with_dups && (idx == 0 || idx == 100 || idx == 199)) {
+                        expected = 9000 + idx;
+                    }
+                    ASSERT_TRUE(doc.contains(k));
+                    ASSERT_FALSE(doc.contains("missing_" + std::to_string(idx)));
+                    ASSERT_EQ(doc.at(k).get<int>(), expected);
+                    auto fit = doc.find(k);
+                    ASSERT_NE(fit, doc.cend());
+                    ASSERT_EQ(fit.value().get<int>(), expected);
+                }
+            });
+        }
+        go.store(true, std::memory_order_release);
+        for (auto& th : threads) {
+            th.join();
+        }
+        assert_equivalent(oracle, doc);
+    }
+}
+
+TEST(OrderedMapIndex, LargeObjectDuplicateKeysMaterializePreservesOrderAndLastWins) {
+    std::string raw = "{";
+    for (int i = 0; i < 64; ++i) {
+        if (i > 0) {
+            raw.push_back(',');
+        }
+        raw += "\"k_" + std::to_string(i) + "\":" + std::to_string(i);
+    }
+    raw += R"(,"k_0":1000,"k_31":{"nested":[1,2]},"k_63":"last_win","k_17":true)";
+    raw.push_back('}');
+
+    const oj oracle = oj::parse(raw);
+    const jk doc = jk::parse(raw);
+
+    // Iterate first (single-pass DupProbeTable path without HashIndex).
+    std::vector<std::string> got_keys;
+    for (auto it = doc.cbegin(); it != doc.cend(); ++it) {
+        got_keys.push_back(it.key());
+    }
+    std::vector<std::string> exp_keys;
+    for (auto it = oracle.cbegin(); it != oracle.cend(); ++it) {
+        exp_keys.push_back(it.key());
+    }
+    EXPECT_EQ(got_keys, exp_keys);
+
+    // Trigger lazy HashIndex construction on lookups after iteration.
+    EXPECT_TRUE(doc.contains("k_0"));
+    EXPECT_TRUE(doc.contains("k_31"));
+    EXPECT_TRUE(doc.contains("k_63"));
+    EXPECT_TRUE(doc.contains("k_17"));
+    EXPECT_FALSE(doc.contains("k_64"));
+    EXPECT_EQ(doc.at("k_0").get<int>(), 1000);
+    EXPECT_EQ(doc.find("k_31").value().at("nested").at(1).get<int>(), 2);
+    EXPECT_EQ(doc.at("k_63").get<std::string>(), "last_win");
+    EXPECT_TRUE(doc.at("k_17").get<bool>());
+    EXPECT_EQ(doc.dump(), oracle.dump());
+    assert_equivalent(oracle, doc);
 }
 
 }  // namespace
