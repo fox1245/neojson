@@ -60,11 +60,13 @@ namespace {
 
 inline constexpr std::size_t kSlabSize = 65536;
 inline constexpr std::uintptr_t kSlabMask = ~std::uintptr_t{kSlabSize - 1};
-inline constexpr std::uint32_t kNumSizeClasses = 10;
+inline constexpr std::uint32_t kNumSizeClasses = 16;
+inline constexpr std::size_t kMaxPooledSize = 4096u;
 inline constexpr std::uint32_t kMaxCachedEmptySlabs = 4;
 inline constexpr std::uint32_t kReclaimScanLimit = 8;
 inline constexpr std::array<std::uint32_t, kNumSizeClasses> kSizeClasses = {{
-    16u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u
+    16u,   32u,   48u,   64u,   96u,   128u,  192u,  256u,
+    384u,  512u,  768u,  1024u, 1536u, 2048u, 3072u, 4096u
 }};
 
 struct FreeNode {
@@ -139,21 +141,30 @@ struct SlabHeader {
 
 inline constexpr std::size_t kSlabHeaderBytes = (sizeof(SlabHeader) + 63u) & ~std::size_t{63};
 static_assert(kSlabHeaderBytes % 64u == 0u, "slab header must preserve slot alignment");
+static_assert((kSlabSize - kSlabHeaderBytes) / kMaxPooledSize >= 15u,
+              "largest pooled class must fit at least 15 slots per 64 KiB slab");
+
+constexpr std::array<std::uint8_t, 256> make_class_lut() noexcept {
+    std::array<std::uint8_t, 256> lut{};
+    for (std::size_t q = 0; q < 256u; ++q) {
+        const std::uint32_t req = static_cast<std::uint32_t>((q + 1u) * 16u);
+        std::uint8_t cls = 0;
+        while (cls + 1u < kNumSizeClasses && kSizeClasses[cls] < req) {
+            ++cls;
+        }
+        lut[q] = cls;
+    }
+    return lut;
+}
+
+inline constexpr std::array<std::uint8_t, 256> kClassLut = make_class_lut();
 
 inline std::uint32_t class_for_size(const std::size_t n) noexcept {
-    if (n <= 16u) {
+    if (n == 0u) {
         return 0u;
     }
-    if (n <= 64u) {
-        return static_cast<std::uint32_t>((n - 1u) >> 4u);
-    }
-    if (n <= 128u) {
-        return (n <= 96u) ? 4u : 5u;
-    }
-    if (n <= 256u) {
-        return (n <= 192u) ? 6u : 7u;
-    }
-    return (n <= 384u) ? 8u : 9u;
+    assert(n <= kMaxPooledSize);
+    return static_cast<std::uint32_t>(kClassLut[(n - 1u) >> 4u]);
 }
 
 inline void* alloc_aligned_64k() {
@@ -485,7 +496,7 @@ inline void remote_or_orphan_free(SlabHeader* s, void* p) noexcept {
 } // namespace
 
 void* pool_alloc(const std::size_t n) {
-    if (n > 512u) {
+    if (n > kMaxPooledSize) {
         return ::operator new(n);
     }
     const std::uint32_t cls = class_for_size(n);
@@ -509,7 +520,7 @@ void pool_free(void* p, const std::size_t n) noexcept {
     if (p == nullptr) {
         return;
     }
-    if (n > 512u) {
+    if (n > kMaxPooledSize) {
         ::operator delete(p);
         return;
     }
