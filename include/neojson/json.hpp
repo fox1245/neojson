@@ -96,6 +96,51 @@ inline constexpr int kNestingLimitErrorId = 120;
 // To be set from the benchmark.
 inline constexpr std::size_t kDumpInitialBufferCapacity = 256;
 
+void* pool_alloc(std::size_t n);
+void pool_free(void* p, std::size_t n) noexcept;
+
+template <typename T>
+class pool_allocator {
+public:
+    using value_type = T;
+    using propagate_on_container_copy_assignment = std::true_type;
+    using propagate_on_container_move_assignment = std::true_type;
+    using propagate_on_container_swap = std::true_type;
+    using is_always_equal = std::true_type;
+
+    pool_allocator() noexcept = default;
+
+    template <typename U>
+    pool_allocator(const pool_allocator<U>&) noexcept {}
+
+    T* allocate(const std::size_t n) {
+        if (n == 0) {
+            return nullptr;
+        }
+        constexpr std::size_t kMaxCount = (std::numeric_limits<std::size_t>::max)() / sizeof(T);
+        if (n > kMaxCount) {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(pool_alloc(n * sizeof(T)));
+    }
+
+    void deallocate(T* p, const std::size_t n) noexcept {
+        if (p != nullptr) {
+            pool_free(p, n * sizeof(T));
+        }
+    }
+
+    template <typename U>
+    bool operator==(const pool_allocator<U>&) const noexcept {
+        return true;
+    }
+
+    template <typename U>
+    bool operator!=(const pool_allocator<U>&) const noexcept {
+        return false;
+    }
+};
+
 enum class value_t : std::uint8_t {
     null,
     object,
@@ -325,8 +370,7 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
 
     ordered_map(const ordered_map& other)
         : Container(other),
-          m_index(other.m_index != nullptr ? std::make_unique<HashIndex>(*other.m_index)
-                                           : nullptr) {}
+          m_index(other.m_index != nullptr ? copy_index(*other.m_index) : nullptr) {}
 
     ordered_map(ordered_map&& other) noexcept = default;
 
@@ -679,22 +723,53 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
 
 private:
     struct Slot {
-        std::uint32_t idx_plus_one = 0;
-        std::uint32_t hash32 = 0;
+        std::uint32_t idx_plus_one;
+        std::uint32_t hash32;
     };
 
     struct HashIndex {
         std::size_t cap = 0;
-        std::unique_ptr<Slot[]> slots;
+        Slot* slots = nullptr;
+    };
 
-        explicit HashIndex(const std::size_t c)
-            : cap(c), slots(std::make_unique<Slot[]>(c)) {}
-
-        HashIndex(const HashIndex& other)
-            : cap(other.cap), slots(std::make_unique<Slot[]>(other.cap)) {
-            std::memcpy(slots.get(), other.slots.get(), cap * sizeof(Slot));
+    struct HashIndexDeleter {
+        void operator()(HashIndex* idx) const noexcept {
+            if (idx != nullptr) {
+                if (idx->slots != nullptr) {
+                    detail::pool_free(idx->slots, idx->cap * sizeof(Slot));
+                }
+                detail::pool_free(idx, sizeof(HashIndex));
+            }
         }
     };
+
+    using IndexPtr = std::unique_ptr<HashIndex, HashIndexDeleter>;
+
+    static IndexPtr make_index(const std::size_t c) {
+        auto* h = static_cast<HashIndex*>(detail::pool_alloc(sizeof(HashIndex)));
+        h->cap = 0;
+        h->slots = nullptr;
+        IndexPtr ptr(h);
+        const std::size_t bytes = c * sizeof(Slot);
+        auto* s = static_cast<Slot*>(detail::pool_alloc(bytes));
+        std::memset(s, 0, bytes);
+        h->cap = c;
+        h->slots = s;
+        return ptr;
+    }
+
+    static IndexPtr copy_index(const HashIndex& other) {
+        auto* h = static_cast<HashIndex*>(detail::pool_alloc(sizeof(HashIndex)));
+        h->cap = 0;
+        h->slots = nullptr;
+        IndexPtr ptr(h);
+        const std::size_t bytes = other.cap * sizeof(Slot);
+        auto* s = static_cast<Slot*>(detail::pool_alloc(bytes));
+        std::memcpy(s, other.slots, bytes);
+        h->cap = other.cap;
+        h->slots = s;
+        return ptr;
+    }
 
     static constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
     static constexpr std::size_t kMaxIndexedSize = 0xFFFFFFFEu;
@@ -719,7 +794,7 @@ private:
             const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
             const std::size_t mask = m_index->cap - 1;
             std::size_t pos = static_cast<std::size_t>(h) & mask;
-            const Slot* slots = m_index->slots.get();
+            const Slot* slots = m_index->slots;
             const value_type* elems = this->data();
             for (;;) {
                 const Slot s = slots[pos];
@@ -752,9 +827,9 @@ private:
 
     void build_index_with_cap(const std::size_t target_cap) {
         const std::size_t n = this->size();
-        auto next_idx = std::make_unique<HashIndex>(target_cap);
+        IndexPtr next_idx = make_index(target_cap);
         const std::size_t mask = target_cap - 1;
-        Slot* slots = next_idx->slots.get();
+        Slot* slots = next_idx->slots;
         const value_type* elems = this->data();
         for (std::size_t i = 0; i < n; ++i) {
             const std::uint64_t h =
@@ -793,7 +868,7 @@ private:
     void insert_index_entry(const std::size_t idx, const std::uint64_t h) noexcept {
         const std::size_t mask = m_index->cap - 1;
         const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
-        Slot* slots = m_index->slots.get();
+        Slot* slots = m_index->slots;
         std::size_t pos = static_cast<std::size_t>(h) & mask;
         while (slots[pos].idx_plus_one != 0) {
             pos = (pos + 1) & mask;
@@ -803,7 +878,7 @@ private:
 
     void remove_index_entry(const std::size_t idx) noexcept {
         const std::size_t mask = m_index->cap - 1;
-        Slot* slots = m_index->slots.get();
+        Slot* slots = m_index->slots;
         const key_type& target_key = (*this)[idx].first;
         const std::uint64_t h = detail::hash_bytes(target_key.data(), target_key.size());
         std::size_t pos = static_cast<std::size_t>(h) & mask;
@@ -838,7 +913,7 @@ private:
                 remove_index_entry(idx);
                 if (idx + 1 < this->size()) {
                     const std::uint32_t pivot = static_cast<std::uint32_t>(idx + 1);
-                    Slot* slots = m_index->slots.get();
+                    Slot* slots = m_index->slots;
                     for (std::size_t i = 0; i < m_index->cap; ++i) {
                         if (slots[i].idx_plus_one > pivot) {
                             --slots[i].idx_plus_one;
@@ -850,7 +925,7 @@ private:
         Container::erase(this->begin() + static_cast<difference_type>(idx));
     }
 
-    std::unique_ptr<HashIndex> m_index;
+    IndexPtr m_index;
 };
 
 namespace detail {
@@ -1785,15 +1860,15 @@ struct external_constructor<value_t::string> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::string_t& s) {
         j.m_value.destroy(j.m_type);
+        j.m_value.string = BasicJsonType::create_string(s);
         j.m_type = value_t::string;
-        j.m_value.string = new typename BasicJsonType::string_t(s);
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::string_t&& s) {
         j.m_value.destroy(j.m_type);
+        j.m_value.string = BasicJsonType::create_string(std::move(s));
         j.m_type = value_t::string;
-        j.m_value.string = new typename BasicJsonType::string_t(std::move(s));
     }
 
     template <typename BasicJsonType, typename CompatibleStringType,
@@ -1802,8 +1877,8 @@ struct external_constructor<value_t::string> {
                           int> = 0>
     static void construct(BasicJsonType& j, const CompatibleStringType& str) {
         j.m_value.destroy(j.m_type);
+        j.m_value.string = BasicJsonType::create_string(str);
         j.m_type = value_t::string;
-        j.m_value.string = new typename BasicJsonType::string_t(str);
     }
 };
 
@@ -1844,15 +1919,15 @@ struct external_constructor<value_t::array> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::array_t& arr) {
         j.m_value.destroy(j.m_type);
+        j.m_value.array = BasicJsonType::create_array(arr);
         j.m_type = value_t::array;
-        j.m_value.array = new typename BasicJsonType::array_t(arr);
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::array_t&& arr) {
         j.m_value.destroy(j.m_type);
+        j.m_value.array = BasicJsonType::create_array(std::move(arr));
         j.m_type = value_t::array;
-        j.m_value.array = new typename BasicJsonType::array_t(std::move(arr));
     }
 
     template <typename BasicJsonType, typename CompatibleArrayType,
@@ -1863,18 +1938,19 @@ struct external_constructor<value_t::array> {
         using std::begin;
         using std::end;
         j.m_value.destroy(j.m_type);
+        j.m_value.array = BasicJsonType::create_array(begin(arr), end(arr));
         j.m_type = value_t::array;
-        j.m_value.array = new typename BasicJsonType::array_t(begin(arr), end(arr));
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const std::vector<bool>& b) {
         j.m_value.destroy(j.m_type);
+        auto* arr = BasicJsonType::create_array();
+        j.m_value.array = arr;
         j.m_type = value_t::array;
-        j.m_value.array = new typename BasicJsonType::array_t();
-        j.m_value.array->reserve(b.size());
+        arr->reserve(b.size());
         for (const bool x : b) {
-            j.m_value.array->emplace_back(x);
+            arr->emplace_back(x);
         }
     }
 
@@ -1882,8 +1958,8 @@ struct external_constructor<value_t::array> {
               enable_if_t<std::is_convertible<T, BasicJsonType>::value, int> = 0>
     static void construct(BasicJsonType& j, const std::valarray<T>& arr) {
         j.m_value.destroy(j.m_type);
+        j.m_value.array = BasicJsonType::create_array(std::begin(arr), std::end(arr));
         j.m_type = value_t::array;
-        j.m_value.array = new typename BasicJsonType::array_t(std::begin(arr), std::end(arr));
     }
 };
 
@@ -1892,15 +1968,15 @@ struct external_constructor<value_t::object> {
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, const typename BasicJsonType::object_t& obj) {
         j.m_value.destroy(j.m_type);
+        j.m_value.object = BasicJsonType::create_object(obj);
         j.m_type = value_t::object;
-        j.m_value.object = new typename BasicJsonType::object_t(obj);
     }
 
     template <typename BasicJsonType>
     static void construct(BasicJsonType& j, typename BasicJsonType::object_t&& obj) {
         j.m_value.destroy(j.m_type);
+        j.m_value.object = BasicJsonType::create_object(std::move(obj));
         j.m_type = value_t::object;
-        j.m_value.object = new typename BasicJsonType::object_t(std::move(obj));
     }
 
     template <typename BasicJsonType, typename CompatibleObjectType,
@@ -1911,10 +1987,11 @@ struct external_constructor<value_t::object> {
         using std::begin;
         using std::end;
         j.m_value.destroy(j.m_type);
+        auto* o = BasicJsonType::create_object();
+        j.m_value.object = o;
         j.m_type = value_t::object;
-        j.m_value.object = new typename BasicJsonType::object_t();
         for (auto it = begin(obj); it != end(obj); ++it) {
-            j.m_value.object->emplace(it->first, it->second);
+            o->emplace(it->first, it->second);
         }
     }
 };
@@ -2950,9 +3027,10 @@ public:
     using const_reverse_iterator = detail::json_reverse_iterator<const_iterator>;
 
     using object_comparator_t = std::less<std::string>;
-    using object_t = ordered_map<std::string, json, object_comparator_t,
-                                 std::allocator<std::pair<std::string, json>>>;
-    using array_t = std::vector<json, std::allocator<json>>;
+    using object_t =
+        ordered_map<std::string, json, object_comparator_t,
+                    detail::pool_allocator<std::pair<std::string, json>>>;
+    using array_t = std::vector<json, detail::pool_allocator<json>>;
     using string_t = std::string;
     using boolean_t = bool;
     using number_integer_t = std::int64_t;
@@ -2964,6 +3042,60 @@ public:
     using parse_options = ::neojson::parse_options;
 
 private:
+    template <typename... Args>
+    static string_t* create_string(Args&&... args) {
+        void* mem = detail::pool_alloc(sizeof(string_t));
+        try {
+            return ::new (mem) string_t(std::forward<Args>(args)...);
+        } catch (...) {
+            detail::pool_free(mem, sizeof(string_t));
+            throw;
+        }
+    }
+
+    static void destroy_string(string_t* s) noexcept {
+        if (s != nullptr) {
+            s->~string_t();
+            detail::pool_free(s, sizeof(string_t));
+        }
+    }
+
+    template <typename... Args>
+    static array_t* create_array(Args&&... args) {
+        void* mem = detail::pool_alloc(sizeof(array_t));
+        try {
+            return ::new (mem) array_t(std::forward<Args>(args)...);
+        } catch (...) {
+            detail::pool_free(mem, sizeof(array_t));
+            throw;
+        }
+    }
+
+    static void destroy_array(array_t* a) noexcept {
+        if (a != nullptr) {
+            a->~array_t();
+            detail::pool_free(a, sizeof(array_t));
+        }
+    }
+
+    template <typename... Args>
+    static object_t* create_object(Args&&... args) {
+        void* mem = detail::pool_alloc(sizeof(object_t));
+        try {
+            return ::new (mem) object_t(std::forward<Args>(args)...);
+        } catch (...) {
+            detail::pool_free(mem, sizeof(object_t));
+            throw;
+        }
+    }
+
+    static void destroy_object(object_t* o) noexcept {
+        if (o != nullptr) {
+            o->~object_t();
+            detail::pool_free(o, sizeof(object_t));
+        }
+    }
+
     union json_value {
         object_t* object;
         array_t* array;
@@ -2981,13 +3113,13 @@ private:
         json_value(value_t t) {
             switch (t) {
                 case value_t::object:
-                    object = new object_t();
+                    object = create_object();
                     break;
                 case value_t::array:
-                    array = new array_t();
+                    array = create_array();
                     break;
                 case value_t::string:
-                    string = new string_t("");
+                    string = create_string();
                     break;
                 case value_t::boolean:
                     boolean = false;
@@ -3070,6 +3202,14 @@ private:
         // destroyed on this thread, one inside the other, it deletes it, which destroys its elements by recursion.
         // Below that depth nothing is allocated and the elements are not looked at twice. At that depth the
         // containers below `c` are taken apart on the heap stack first, so that the recursion stops there.
+        static void free_container(object_t* c) noexcept {
+            destroy_object(c);
+        }
+
+        static void free_container(array_t* c) noexcept {
+            destroy_array(c);
+        }
+
         template <typename Container>
         static void destroy_container(Container*& c) noexcept {
             if (c == nullptr) {
@@ -3077,11 +3217,11 @@ private:
             }
             if (detail::t_destroy_depth < detail::kMaxRecursiveDestroyDepth) {
                 const detail::destroy_depth_guard guard;
-                delete c;
+                free_container(c);
             } else {
                 ++detail::t_destroy_heap_stack_uses;
                 release_containers(*c);
-                delete c;
+                free_container(c);
             }
             c = nullptr;
         }
@@ -3095,7 +3235,7 @@ private:
                     destroy_container(array);
                     break;
                 case value_t::string:
-                    delete string;
+                    destroy_string(string);
                     string = nullptr;
                     break;
                 default:
@@ -3145,8 +3285,8 @@ public:
         }
 
         if (is_an_object) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
             m_value.object->reserve(init.size());
             for (auto& element_ref : init) {
                 auto element = element_ref.moved_or_copied();
@@ -3155,8 +3295,8 @@ public:
                     std::move((*element.m_value.array)[1]));
             }
         } else {
+            m_value.array = create_array();
             m_type = value_t::array;
-            m_value.array = new array_t();
             m_value.array->reserve(init.size());
             for (auto const& element_ref : init) {
                 m_value.array->emplace_back(element_ref.moved_or_copied());
@@ -3164,8 +3304,9 @@ public:
         }
     }
 
-    json(size_type cnt, const json& val) : m_type(value_t::array) {
-        m_value.array = new array_t(cnt, val);
+    json(size_type cnt, const json& val) {
+        m_value.array = create_array(cnt, val);
+        m_type = value_t::array;
     }
 
     template <class InputIT,
@@ -3192,7 +3333,7 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (m_type == value_t::string) {
-                    m_value.string = new string_t(*(first.m_object->m_value.string));
+                    m_value.string = create_string(*(first.m_object->m_value.string));
                 } else {
                     m_value = first.m_object->m_value;
                 }
@@ -3204,7 +3345,7 @@ public:
                     m_type = value_t::null;
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.array = new array_t(
+                m_value.array = create_array(
                     first.m_object->m_value.array->begin() + first.idx_,
                     first.m_object->m_value.array->begin() + last.idx_);
                 break;
@@ -3216,7 +3357,7 @@ public:
                     m_type = value_t::null;
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
-                m_value.object = new object_t(
+                m_value.object = create_object(
                     first.m_object->m_value.object->begin() + first.idx_,
                     first.m_object->m_value.object->begin() + last.idx_);
                 break;
@@ -3243,13 +3384,13 @@ public:
     json(const json& other) : m_type(other.m_type) {
         switch (m_type) {
             case value_t::object:
-                m_value.object = new object_t(*(other.m_value.object));
+                m_value.object = create_object(*(other.m_value.object));
                 break;
             case value_t::array:
-                m_value.array = new array_t(*(other.m_value.array));
+                m_value.array = create_array(*(other.m_value.array));
                 break;
             case value_t::string:
-                m_value.string = new string_t(*(other.m_value.string));
+                m_value.string = create_string(*(other.m_value.string));
                 break;
             case value_t::boolean:
                 m_value.boolean = other.m_value.boolean;
@@ -3500,8 +3641,8 @@ public:
 
     reference operator[](size_type idx) {
         if (is_null()) {
+            m_value.array = create_array();
             m_type = value_t::array;
-            m_value.array = new array_t();
         }
         if (is_array()) {
             if (idx >= m_value.array->size()) {
@@ -3523,8 +3664,8 @@ public:
 
     reference operator[](const typename object_t::key_type& key) {
         if (is_null()) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
         }
         if (is_object()) {
             return (*m_value.object)[key];
@@ -3547,8 +3688,8 @@ public:
               std::enable_if_t<std::is_same<std::remove_cv_t<CharT>, char>::value, int> = 0>
     reference operator[](CharT* key) {
         if (is_null()) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
         }
         if (is_object()) {
             return (*m_value.object)[std::string_view(key)];
@@ -3579,8 +3720,8 @@ public:
                   int> = 0>
     reference operator[](const KeyType& key) {
         if (is_null()) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
         }
         if (is_object()) {
             return (*m_value.object)[std::string_view(key)];
@@ -3872,8 +4013,8 @@ public:
             throw type_error::create(308, std::string("cannot use push_back() with ") + type_name());
         }
         if (is_null()) {
+            m_value.array = create_array();
             m_type = value_t::array;
-            m_value.array = new array_t();
         }
         json tmp(std::move(val));
         m_value.array->push_back(std::move(tmp));
@@ -3884,8 +4025,8 @@ public:
             throw type_error::create(308, std::string("cannot use push_back() with ") + type_name());
         }
         if (is_null()) {
+            m_value.array = create_array();
             m_type = value_t::array;
-            m_value.array = new array_t();
         }
         json tmp(val);
         m_value.array->push_back(std::move(tmp));
@@ -3896,8 +4037,8 @@ public:
             throw type_error::create(308, std::string("cannot use push_back() with ") + type_name());
         }
         if (is_null()) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
         }
         typename object_t::value_type tmp(val);
         m_value.object->insert(std::move(tmp));
@@ -3940,8 +4081,8 @@ public:
                 311, std::string("cannot use emplace_back() with ") + type_name());
         }
         if (is_null()) {
+            m_value.array = create_array();
             m_type = value_t::array;
-            m_value.array = new array_t();
         }
         json tmp(std::forward<Args>(args)...);
         m_value.array->emplace_back(std::move(tmp));
@@ -3954,8 +4095,8 @@ public:
             throw type_error::create(311, std::string("cannot use emplace() with ") + type_name());
         }
         if (is_null()) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
         }
         auto res = m_value.object->emplace(std::forward<Args>(args)...);
         const auto idx =
@@ -4055,8 +4196,8 @@ public:
 
     void update(const_iterator first, const_iterator last, bool merge_objects = false) {
         if (is_null()) {
+            m_value.object = create_object();
             m_type = value_t::object;
-            m_value.object = new object_t();
         }
         if (!is_object()) {
             throw type_error::create(312, std::string("cannot use update() with ") + type_name());
@@ -4149,7 +4290,7 @@ public:
                     throw invalid_iterator::create(205, "iterator out of range");
                 }
                 if (is_string()) {
-                    delete m_value.string;
+                    destroy_string(m_value.string);
                     m_value.string = nullptr;
                 }
                 m_type = value_t::null;
@@ -4195,7 +4336,7 @@ public:
                     throw invalid_iterator::create(204, "iterators out of range");
                 }
                 if (is_string()) {
-                    delete m_value.string;
+                    destroy_string(m_value.string);
                     m_value.string = nullptr;
                 }
                 m_type = value_t::null;

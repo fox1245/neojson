@@ -1,15 +1,33 @@
 #include "neojson/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <new>
 #include <random>
+#include <thread>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
+#endif
+
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+#define NEOJSON_HAS_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define NEOJSON_HAS_ASAN 1
+#endif
+#endif
+
+#if defined(NEOJSON_HAS_ASAN)
+#include <sanitizer/asan_interface.h>
 #endif
 
 #include "yyjson.h"
@@ -27,6 +45,486 @@ std::uint64_t hash_seed_init() noexcept {
     }
     s ^= reinterpret_cast<std::uintptr_t>(&hash_seed_init);
     return fmix64(s) | 1ULL;
+}
+
+namespace {
+
+inline constexpr std::size_t kSlabSize = 65536;
+inline constexpr std::uintptr_t kSlabMask = ~std::uintptr_t{kSlabSize - 1};
+inline constexpr std::uint32_t kNumSizeClasses = 10;
+inline constexpr std::uint32_t kMaxCachedEmptySlabs = 4;
+inline constexpr std::uint32_t kReclaimScanLimit = 8;
+inline constexpr std::array<std::uint32_t, kNumSizeClasses> kSizeClasses = {{
+    16u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u
+}};
+
+struct FreeNode {
+    FreeNode* next;
+};
+
+struct ThreadPool;
+
+struct SlabHeader {
+    SlabHeader* prev;
+    SlabHeader* next;
+    FreeNode* local_free;
+    std::uint32_t class_idx;
+    std::uint32_t slot_size;
+    std::uint32_t slot_count;
+    std::uint32_t bump_off;
+    std::uint32_t local_used;
+    bool in_full;
+    char cache_pad[16];
+
+    std::atomic<ThreadPool*> owner;
+    std::atomic<std::uint32_t> remote_lock;
+    FreeNode* remote_free;
+    std::atomic<std::uint32_t> remote_count;
+    std::uint32_t orphan_live;
+
+    SlabHeader(const std::uint32_t cls, const std::uint32_t ssz, const std::uint32_t scnt,
+               ThreadPool* own, const std::uint32_t bump, const std::uint32_t used,
+               const std::uint32_t orphan) noexcept
+        : prev(nullptr),
+          next(nullptr),
+          local_free(nullptr),
+          class_idx(cls),
+          slot_size(ssz),
+          slot_count(scnt),
+          bump_off(bump),
+          local_used(used),
+          in_full(false),
+          cache_pad{},
+          owner(own),
+          remote_lock(0),
+          remote_free(nullptr),
+          remote_count(0),
+          orphan_live(orphan) {}
+
+    void lock_remote() noexcept {
+        while (remote_lock.exchange(1u, std::memory_order_acquire) != 0u) {
+            while (remote_lock.load(std::memory_order_relaxed) != 0u) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(_MSC_VER)
+                _mm_pause();
+#else
+                __builtin_ia32_pause();
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_MSC_VER)
+                __yield();
+#else
+                __asm__ volatile("yield" ::: "memory");
+#endif
+#else
+                std::this_thread::yield();
+#endif
+            }
+        }
+    }
+
+    void unlock_remote() noexcept {
+        remote_lock.store(0u, std::memory_order_release);
+    }
+};
+
+inline constexpr std::size_t kSlabHeaderBytes = (sizeof(SlabHeader) + 63u) & ~std::size_t{63};
+static_assert(kSlabHeaderBytes % 64u == 0u, "slab header must preserve slot alignment");
+
+inline std::uint32_t class_for_size(const std::size_t n) noexcept {
+    if (n <= 16u) {
+        return 0u;
+    }
+    if (n <= 64u) {
+        return static_cast<std::uint32_t>((n - 1u) >> 4u);
+    }
+    if (n <= 128u) {
+        return (n <= 96u) ? 4u : 5u;
+    }
+    if (n <= 256u) {
+        return (n <= 192u) ? 6u : 7u;
+    }
+    return (n <= 384u) ? 8u : 9u;
+}
+
+inline void* alloc_aligned_64k() {
+#if defined(_WIN32)
+    void* p = _aligned_malloc(kSlabSize, kSlabSize);
+#else
+    void* p = nullptr;
+    if (::posix_memalign(&p, kSlabSize, kSlabSize) != 0) {
+        p = nullptr;
+    }
+#endif
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+
+inline void free_aligned_64k(void* slab) noexcept {
+    if (slab == nullptr) {
+        return;
+    }
+#if defined(NEOJSON_HAS_ASAN)
+    ASAN_UNPOISON_MEMORY_REGION(slab, kSlabSize);
+#endif
+#if defined(_WIN32)
+    _aligned_free(slab);
+#else
+    std::free(slab);
+#endif
+}
+
+inline void poison_region(void* p, const std::size_t bytes) noexcept {
+#if defined(NEOJSON_HAS_ASAN)
+    if (bytes > 0u) {
+        ASAN_POISON_MEMORY_REGION(p, bytes);
+    }
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
+inline void poison_slot_tail(void* p, const std::size_t slot_size) noexcept {
+#if defined(NEOJSON_HAS_ASAN)
+    if (slot_size > sizeof(FreeNode)) {
+        ASAN_POISON_MEMORY_REGION(static_cast<char*>(p) + sizeof(FreeNode),
+                                  slot_size - sizeof(FreeNode));
+    }
+#else
+    (void)p;
+    (void)slot_size;
+#endif
+}
+
+inline void unpoison_slot(void* p, const std::size_t slot_size) noexcept {
+#if defined(NEOJSON_HAS_ASAN)
+    ASAN_UNPOISON_MEMORY_REGION(p, slot_size);
+#else
+    (void)p;
+    (void)slot_size;
+#endif
+}
+
+inline SlabHeader* slab_from_ptr(void* p) noexcept {
+    return reinterpret_cast<SlabHeader*>(reinterpret_cast<std::uintptr_t>(p) & kSlabMask);
+}
+
+inline void list_push(SlabHeader*& list_head, SlabHeader* s) noexcept {
+    s->prev = nullptr;
+    s->next = list_head;
+    if (list_head != nullptr) {
+        list_head->prev = s;
+    }
+    list_head = s;
+}
+
+inline void list_erase(SlabHeader*& list_head, SlabHeader* s) noexcept {
+    if (s->prev != nullptr) {
+        s->prev->next = s->next;
+    } else {
+        list_head = s->next;
+    }
+    if (s->next != nullptr) {
+        s->next->prev = s->prev;
+    }
+    s->prev = nullptr;
+    s->next = nullptr;
+}
+
+inline void queue_push_back(SlabHeader*& qhead, SlabHeader*& qtail, SlabHeader* s) noexcept {
+    s->next = nullptr;
+    s->prev = qtail;
+    if (qtail != nullptr) {
+        qtail->next = s;
+    } else {
+        qhead = s;
+    }
+    qtail = s;
+}
+
+inline void queue_erase(SlabHeader*& qhead, SlabHeader*& qtail, SlabHeader* s) noexcept {
+    if (s->prev != nullptr) {
+        s->prev->next = s->next;
+    } else {
+        qhead = s->next;
+    }
+    if (s->next != nullptr) {
+        s->next->prev = s->prev;
+    } else {
+        qtail = s->prev;
+    }
+    s->prev = nullptr;
+    s->next = nullptr;
+}
+
+inline void drain_remote(SlabHeader* s) noexcept {
+    if (s->remote_count.load(std::memory_order_acquire) == 0u) {
+        return;
+    }
+    s->lock_remote();
+    FreeNode* drained = s->remote_free;
+    s->remote_free = nullptr;
+    const std::uint32_t count = s->remote_count.load(std::memory_order_relaxed);
+    s->remote_count.store(0u, std::memory_order_relaxed);
+    s->unlock_remote();
+
+    if (drained != nullptr) {
+        FreeNode* tail = drained;
+        while (tail->next != nullptr) {
+            tail = tail->next;
+        }
+        tail->next = s->local_free;
+        s->local_free = drained;
+        assert(s->local_used >= count);
+        s->local_used -= count;
+    }
+}
+
+struct SlabBin {
+    SlabHeader* head = nullptr;
+    SlabHeader* full_head = nullptr;
+    SlabHeader* full_tail = nullptr;
+};
+
+struct ThreadPool {
+    std::array<SlabBin, kNumSizeClasses> bins{};
+    SlabHeader* empty_slabs = nullptr;
+    std::uint32_t empty_count = 0;
+
+    void recycle_empty_slab(SlabHeader* s) noexcept {
+        if (empty_count < kMaxCachedEmptySlabs) {
+            s->next = empty_slabs;
+            empty_slabs = s;
+            ++empty_count;
+        } else {
+            s->~SlabHeader();
+            free_aligned_64k(s);
+        }
+    }
+
+    void teardown() noexcept {
+        while (empty_slabs != nullptr) {
+            SlabHeader* s = empty_slabs;
+            empty_slabs = s->next;
+            s->~SlabHeader();
+            free_aligned_64k(s);
+        }
+        empty_count = 0;
+
+        auto release_list = [](SlabHeader* cur) noexcept {
+            while (cur != nullptr) {
+                SlabHeader* next = cur->next;
+                cur->lock_remote();
+                const std::uint32_t rc = cur->remote_count.load(std::memory_order_relaxed);
+                assert(cur->local_used >= rc);
+                const std::uint32_t live = cur->local_used - rc;
+                cur->remote_free = nullptr;
+                cur->remote_count.store(0u, std::memory_order_relaxed);
+                cur->orphan_live = live;
+                cur->owner.store(nullptr, std::memory_order_release);
+                cur->unlock_remote();
+                if (live == 0u) {
+                    cur->~SlabHeader();
+                    free_aligned_64k(cur);
+                }
+                cur = next;
+            }
+        };
+
+        for (SlabBin& bin : bins) {
+            release_list(bin.head);
+            release_list(bin.full_head);
+            bin.head = nullptr;
+            bin.full_head = nullptr;
+            bin.full_tail = nullptr;
+        }
+    }
+
+    void* alloc(const std::uint32_t cls) {
+        SlabBin& bin = bins[cls];
+        while (bin.head != nullptr) {
+            SlabHeader* s = bin.head;
+            if (FreeNode* node = s->local_free) {
+                s->local_free = node->next;
+                ++s->local_used;
+                unpoison_slot(node, s->slot_size);
+                return node;
+            }
+            if (s->bump_off + s->slot_size <= static_cast<std::uint32_t>(kSlabSize)) {
+                void* p = reinterpret_cast<char*>(s) + s->bump_off;
+                s->bump_off += s->slot_size;
+                ++s->local_used;
+                unpoison_slot(p, s->slot_size);
+                return p;
+            }
+            drain_remote(s);
+            if (FreeNode* node = s->local_free) {
+                s->local_free = node->next;
+                ++s->local_used;
+                unpoison_slot(node, s->slot_size);
+                return node;
+            }
+            list_erase(bin.head, s);
+            s->in_full = true;
+            queue_push_back(bin.full_head, bin.full_tail, s);
+        }
+
+        for (std::uint32_t scan = 0; scan < kReclaimScanLimit && bin.full_head != nullptr; ++scan) {
+            SlabHeader* s = bin.full_head;
+            if (s->remote_count.load(std::memory_order_acquire) != 0u) {
+                drain_remote(s);
+                if (FreeNode* node = s->local_free) {
+                    s->local_free = node->next;
+                    ++s->local_used;
+                    queue_erase(bin.full_head, bin.full_tail, s);
+                    s->in_full = false;
+                    list_push(bin.head, s);
+                    unpoison_slot(node, s->slot_size);
+                    return node;
+                }
+            }
+            if (bin.full_head != bin.full_tail) {
+                queue_erase(bin.full_head, bin.full_tail, s);
+                queue_push_back(bin.full_head, bin.full_tail, s);
+            } else {
+                break;
+            }
+        }
+
+        const std::uint32_t ssz = kSizeClasses[cls];
+        const std::uint32_t scnt =
+            static_cast<std::uint32_t>((kSlabSize - kSlabHeaderBytes) / ssz);
+        void* slab_mem = nullptr;
+        if (empty_slabs != nullptr) {
+            SlabHeader* reused = empty_slabs;
+            empty_slabs = reused->next;
+            --empty_count;
+            reused->~SlabHeader();
+            slab_mem = reused;
+#if defined(NEOJSON_HAS_ASAN)
+            ASAN_UNPOISON_MEMORY_REGION(slab_mem, kSlabSize);
+#endif
+        } else {
+            slab_mem = alloc_aligned_64k();
+        }
+        auto* s = ::new (slab_mem) SlabHeader(
+            cls, ssz, scnt, this, static_cast<std::uint32_t>(kSlabHeaderBytes) + ssz, 1u, 0u);
+        poison_region(static_cast<char*>(slab_mem) + kSlabHeaderBytes + ssz,
+                      kSlabSize - kSlabHeaderBytes - ssz);
+        list_push(bin.head, s);
+        return static_cast<char*>(slab_mem) + kSlabHeaderBytes;
+    }
+};
+
+struct ThreadPoolGuard {
+    bool armed = false;
+    ~ThreadPoolGuard();
+};
+
+inline thread_local ThreadPool* t_pool = nullptr;
+inline thread_local bool t_pool_dead = false;
+inline thread_local ThreadPoolGuard t_pool_guard{};
+
+ThreadPoolGuard::~ThreadPoolGuard() {
+    armed = false;
+    t_pool_dead = true;
+    ThreadPool* tp = t_pool;
+    t_pool = nullptr;
+    if (tp != nullptr) {
+        tp->teardown();
+        tp->~ThreadPool();
+        std::free(tp);
+    }
+}
+
+inline void* alloc_standalone_slab(const std::uint32_t cls) {
+    const std::uint32_t ssz = kSizeClasses[cls];
+    const std::uint32_t scnt = static_cast<std::uint32_t>((kSlabSize - kSlabHeaderBytes) / ssz);
+    void* mem = alloc_aligned_64k();
+    ::new (mem) SlabHeader(cls, ssz, scnt, nullptr, static_cast<std::uint32_t>(kSlabSize), 0u, 1u);
+    poison_region(static_cast<char*>(mem) + kSlabHeaderBytes + ssz,
+                  kSlabSize - kSlabHeaderBytes - ssz);
+    return static_cast<char*>(mem) + kSlabHeaderBytes;
+}
+
+inline void remote_or_orphan_free(SlabHeader* s, void* p) noexcept {
+    s->lock_remote();
+    if (s->owner.load(std::memory_order_acquire) != nullptr) {
+        auto* node = static_cast<FreeNode*>(p);
+        node->next = s->remote_free;
+        poison_slot_tail(p, s->slot_size);
+        s->remote_free = node;
+        const std::uint32_t rc = s->remote_count.load(std::memory_order_relaxed);
+        s->remote_count.store(rc + 1u, std::memory_order_release);
+        s->unlock_remote();
+        return;
+    }
+    assert(s->orphan_live > 0u);
+    const std::uint32_t rem = --s->orphan_live;
+    if (rem > 0u) {
+        poison_region(p, s->slot_size);
+    }
+    s->unlock_remote();
+    if (rem == 0u) {
+        s->~SlabHeader();
+        free_aligned_64k(s);
+    }
+}
+
+} // namespace
+
+void* pool_alloc(const std::size_t n) {
+    if (n > 512u) {
+        return ::operator new(n);
+    }
+    const std::uint32_t cls = class_for_size(n);
+    ThreadPool* tp = t_pool;
+    if (tp == nullptr) {
+        if (t_pool_dead) {
+            return alloc_standalone_slab(cls);
+        }
+        t_pool_guard.armed = true;
+        void* raw = std::malloc(sizeof(ThreadPool));
+        if (raw == nullptr) {
+            throw std::bad_alloc();
+        }
+        tp = ::new (raw) ThreadPool();
+        t_pool = tp;
+    }
+    return tp->alloc(cls);
+}
+
+void pool_free(void* p, const std::size_t n) noexcept {
+    if (p == nullptr) {
+        return;
+    }
+    if (n > 512u) {
+        ::operator delete(p);
+        return;
+    }
+    SlabHeader* s = slab_from_ptr(p);
+    ThreadPool* const cur = t_pool;
+    if (cur != nullptr && s->owner.load(std::memory_order_relaxed) == cur) {
+        auto* node = static_cast<FreeNode*>(p);
+        node->next = s->local_free;
+        poison_slot_tail(p, s->slot_size);
+        s->local_free = node;
+        --s->local_used;
+        SlabBin& bin = cur->bins[s->class_idx];
+        if (s->in_full) {
+            queue_erase(bin.full_head, bin.full_tail, s);
+            s->in_full = false;
+            list_push(bin.head, s);
+        } else if (s->local_used == 0u && (bin.head != s || s->next != nullptr)) {
+            list_erase(bin.head, s);
+            cur->recycle_empty_slab(s);
+        }
+        return;
+    }
+    remote_or_orphan_free(s, p);
 }
 
 class DumpBuffer {
@@ -858,26 +1356,26 @@ inline void dump_quoted_fast_strict(DumpBuffer& out, const std::string& s) {
 
 struct json_access {
     static json make_string(const char* s, const std::size_t len) {
-        auto ptr = std::make_unique<json::string_t>(s, len);
+        json::string_t* ptr = json::create_string(s, len);
         json j;
         j.m_type = json::value_t::string;
-        j.m_value.string = ptr.release();
+        j.m_value.string = ptr;
         return j;
     }
 
     static json make_array() {
-        auto ptr = std::make_unique<json::array_t>();
+        json::array_t* ptr = json::create_array();
         json j;
         j.m_type = json::value_t::array;
-        j.m_value.array = ptr.release();
+        j.m_value.array = ptr;
         return j;
     }
 
     static json make_object() {
-        auto ptr = std::make_unique<json::object_t>();
+        json::object_t* ptr = json::create_object();
         json j;
         j.m_type = json::value_t::object;
-        j.m_value.object = ptr.release();
+        j.m_value.object = ptr;
         return j;
     }
 
