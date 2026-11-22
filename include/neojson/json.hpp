@@ -79,6 +79,15 @@
 #endif
 #endif
 
+#ifndef NEOJSON_DESTROY_INLINE
+#if defined(NEOJSON_HEADER_HAS_ASAN) || \
+    ((defined(__GNUC__) || defined(__clang__)) && !defined(__OPTIMIZE__)) || defined(_DEBUG)
+#define NEOJSON_DESTROY_INLINE NEOJSON_NOINLINE inline
+#else
+#define NEOJSON_DESTROY_INLINE NEOJSON_ALWAYS_INLINE
+#endif
+#endif
+
 namespace neojson {
 
 // Forward declarations
@@ -4175,7 +4184,7 @@ private:
     static detail::SmallArray2* clone_small_array(const detail::SmallArray2* sa);
     NEOJSON_NOINLINE inline static void destroy_small_array_slow(
         detail::SmallArray2*& sa) noexcept;
-    NEOJSON_ALWAYS_INLINE static void destroy_small_array(detail::SmallArray2*& sa) noexcept;
+    NEOJSON_DESTROY_INLINE static void destroy_small_array(detail::SmallArray2*& sa) noexcept;
     static std::size_t small_arr_size(const detail::SmallArray2* sa) noexcept;
     static json& small_arr_elem(detail::SmallArray2* sa, std::size_t idx) noexcept;
     static const json& small_arr_elem(const detail::SmallArray2* sa, std::size_t idx) noexcept;
@@ -4204,7 +4213,7 @@ private:
     static void drop_small_object_aux(detail::SmallObject4* so) noexcept;
     NEOJSON_NOINLINE inline static void destroy_small_object_slow(
         detail::SmallObject4*& so) noexcept;
-    NEOJSON_ALWAYS_INLINE static void destroy_small_object(detail::SmallObject4*& so) noexcept;
+    NEOJSON_DESTROY_INLINE static void destroy_small_object(detail::SmallObject4*& so) noexcept;
     static std::size_t small_obj_size(const detail::SmallObject4* so) noexcept;
     static const string_t& small_obj_key(const detail::SmallObject4* so, std::size_t idx);
     static json& small_obj_val(detail::SmallObject4* so, std::size_t idx) noexcept;
