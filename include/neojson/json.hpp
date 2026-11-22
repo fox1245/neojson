@@ -61,6 +61,16 @@
 #endif
 #endif
 
+#ifndef NEOJSON_LIKELY
+#if defined(__GNUC__) || defined(__clang__)
+#define NEOJSON_LIKELY(x) __builtin_expect(!!(x), 1)
+#define NEOJSON_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define NEOJSON_LIKELY(x) (x)
+#define NEOJSON_UNLIKELY(x) (x)
+#endif
+#endif
+
 #if defined(__SANITIZE_ADDRESS__)
 #define NEOJSON_HEADER_HAS_ASAN 1
 #elif defined(__has_feature)
@@ -361,6 +371,7 @@ struct ArenaHashIndex;
 inline constexpr std::size_t kSmallArrInitCap = 2u;
 inline constexpr std::size_t kSmallArrMaxCap = 16u;
 inline constexpr std::size_t kSmallObjInitCap = 2u;
+inline constexpr std::size_t kSmallObjInitKeyCap = 64u;
 inline constexpr std::size_t kSmallObjCap = 4u;
 inline constexpr std::size_t kSmallObjMaxCap = 64u;
 inline constexpr std::uint32_t kArenaStringRef = 0xC0000000u;
@@ -4413,6 +4424,8 @@ private:
     static detail::SmallObject4* create_small_object_empty_for(std::size_t n,
                                                                std::size_t key_bytes);
     static detail::SmallObject4* create_small_object1(std::string_view key, json&& val);
+    NEOJSON_ALWAYS_INLINE static detail::SmallObject4* create_small_object1_default_inline(
+        std::string_view key);
     static detail::SmallObject4* create_small_object1_default(std::string_view key);
     static detail::SmallObject4* create_small_object_copy_range(
         const typename object_t::value_type* data, std::size_t n);
@@ -5514,6 +5527,15 @@ public:
             if (m_storage == 0u) {
                 return (*m_value.object)[key];
             }
+            if (m_storage == 3u) {
+                const std::string_view sv(key);
+                if (NEOJSON_LIKELY(sv.size() <= detail::kSmallObjInitKeyCap)) {
+                    detail::SmallObject4* const so = create_small_object1_default_inline(sv);
+                    m_storage = 2u;
+                    m_value.small_obj = so;
+                    return small_obj_val(so, 0u);
+                }
+            }
         }
         return object_index_slow(std::string_view(key));
     }
@@ -5551,6 +5573,14 @@ public:
             }
             if (m_storage == 0u) {
                 return (*m_value.object)[sv];
+            }
+            if (m_storage == 3u) {
+                if (NEOJSON_LIKELY(sv.size() <= detail::kSmallObjInitKeyCap)) {
+                    detail::SmallObject4* const so = create_small_object1_default_inline(sv);
+                    m_storage = 2u;
+                    m_value.small_obj = so;
+                    return small_obj_val(so, 0u);
+                }
             }
         }
         return object_index_slow(sv);
@@ -5598,6 +5628,14 @@ public:
             }
             if (m_storage == 0u) {
                 return (*m_value.object)[sv];
+            }
+            if (m_storage == 3u) {
+                if (NEOJSON_LIKELY(sv.size() <= detail::kSmallObjInitKeyCap)) {
+                    detail::SmallObject4* const so = create_small_object1_default_inline(sv);
+                    m_storage = 2u;
+                    m_value.small_obj = so;
+                    return small_obj_val(so, 0u);
+                }
             }
         }
         return object_index_slow(sv);
@@ -7394,6 +7432,8 @@ static_assert(sizeof(SmallObject4) == 16u && alignof(SmallObject4) == alignof(vo
 static_assert(SmallObject4::desc_off_for(2u) == 24u && SmallObject4::vals_off_for(2u) == 32u &&
                   SmallObject4::key_cap_for(2u) == 64u,
               "CompactObject cap 2 layout");
+static_assert(kSmallObjInitKeyCap == SmallObject4::key_cap_for(SmallObject4::kInitCap),
+              "kSmallObjInitKeyCap must match SmallObject4::kInitCap key capacity");
 static_assert(SmallObject4::vals_off_for(4u) == 40u && SmallObject4::key_cap_for(4u) == 152u,
               "CompactObject cap 4 layout");
 static_assert(SmallObject4::vals_off_for(8u) == 56u && SmallObject4::key_cap_for(8u) == 200u,
@@ -7792,33 +7832,38 @@ inline detail::SmallObject4* json::create_small_object1(const std::string_view k
     return so;
 }
 
-inline detail::SmallObject4* json::create_small_object1_default(const std::string_view key) {
-    if (key.size() <= detail::SmallObject4::key_cap_for(detail::SmallObject4::kInitCap)) {
-        constexpr std::size_t kCap = detail::SmallObject4::kInitCap;
-        constexpr std::size_t kAllocBytes = detail::SmallObject4::slab_bytes_for(kCap);
-        constexpr std::uint8_t kCls = detail::SmallObject4::slab_cls_for_cap(kCap);
-        void* mem = detail::tcache_alloc_fixed<kAllocBytes>();
-        auto* so = ::new (mem) detail::SmallObject4();
-        so->cap = static_cast<std::uint8_t>(kCap);
-        so->slab_cls = kCls;
-        so->desc_off = static_cast<std::uint8_t>(detail::SmallObject4::desc_off_for(kCap));
-        so->key_used = static_cast<std::uint16_t>(key.size());
-        so->key_cap = static_cast<std::uint16_t>(detail::SmallObject4::key_cap_for(kCap));
-        const std::uint8_t tag = detail::small_obj_key_tag(key);
+NEOJSON_ALWAYS_INLINE detail::SmallObject4* json::create_small_object1_default_inline(
+    const std::string_view key) {
+    constexpr std::size_t kCap = detail::SmallObject4::kInitCap;
+    constexpr std::size_t kAllocBytes = detail::SmallObject4::slab_bytes_for(kCap);
+    constexpr std::uint8_t kCls = detail::SmallObject4::slab_cls_for_cap(kCap);
+    void* mem = detail::tcache_alloc_fixed<kAllocBytes>();
+    auto* so = ::new (mem) detail::SmallObject4();
+    so->cap = static_cast<std::uint8_t>(kCap);
+    so->slab_cls = kCls;
+    so->desc_off = static_cast<std::uint8_t>(detail::SmallObject4::desc_off_for(kCap));
+    so->key_used = static_cast<std::uint16_t>(key.size());
+    so->key_cap = static_cast<std::uint16_t>(detail::SmallObject4::key_cap_for(kCap));
+    const std::uint8_t tag = detail::small_obj_key_tag(key);
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-        std::memset(so->tags_ptr(), 0, 8u);
-        so->tags_ptr()[0u] = tag;
+    std::memset(so->tags_ptr(), 0, 8u);
+    so->tags_ptr()[0u] = tag;
 #else
-        const std::uint64_t tword = static_cast<std::uint64_t>(tag);
-        std::memcpy(so->tags_ptr(), &tword, 8u);
+    const std::uint64_t tword = static_cast<std::uint64_t>(tag);
+    std::memcpy(so->tags_ptr(), &tword, 8u);
 #endif
-        so->descs_ptr()[0u] = static_cast<std::uint32_t>(key.size());
-        if (!key.empty()) {
-            std::memcpy(so->kbuf_ptr(), key.data(), key.size());
-        }
-        ::new (so->slot_ptr(0u)) json();
-        so->count = 1u;
-        return so;
+    so->descs_ptr()[0u] = static_cast<std::uint32_t>(key.size());
+    if (!key.empty()) {
+        std::memcpy(so->kbuf_ptr(), key.data(), key.size());
+    }
+    ::new (so->slot_ptr(0u)) json();
+    so->count = 1u;
+    return so;
+}
+
+inline detail::SmallObject4* json::create_small_object1_default(const std::string_view key) {
+    if (key.size() <= detail::kSmallObjInitKeyCap) {
+        return create_small_object1_default_inline(key);
     }
     const std::size_t cap = detail::SmallObject4::cap_for_size_and_keys(1u, key.size());
     if (cap == 0u) {
@@ -8001,10 +8046,23 @@ NEOJSON_ALWAYS_INLINE std::size_t json::small_obj_find_with_tag(
         return 0u;
     }
     const std::size_t n = so->count;
+    if (n == 0u) {
+        return 0u;
+    }
     const std::uint8_t* tags = so->tags_ptr();
+    if (n == 1u) {
+        if (tags[0u] == tag) {
+            const std::uint32_t d = so->descs_ptr()[0u];
+            const std::size_t kl = static_cast<std::size_t>(d & 0xFFFFu);
+            if (kl == key.size() && detail::fast_memeq(so->kbuf_ptr() + (d >> 16u), key.data(), kl)) {
+                return 0u;
+            }
+        }
+        return 1u;
+    }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     const std::uint32_t* descs = so->descs_ptr();
     const char* kbuf = so->kbuf_ptr();
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     for (std::size_t i = 0u; i < n; ++i) {
         if (tags[i] == tag) {
             const std::uint32_t d = descs[i];
@@ -8022,36 +8080,48 @@ NEOJSON_ALWAYS_INLINE std::size_t json::small_obj_find_with_tag(
         std::memcpy(&w, tags, 8u);
         const std::uint64_t x = w ^ needle;
         std::uint64_t m = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
-        while (m != 0u) {
-            const std::size_t idx = static_cast<std::size_t>(detail::ctz64(m) >> 3u);
-            if (idx >= n) {
-                return n;
-            }
-            const std::uint32_t d = descs[idx];
-            const std::size_t kl = static_cast<std::size_t>(d & 0xFFFFu);
-            if (kl == key.size() && detail::fast_memeq(kbuf + (d >> 16u), key.data(), kl)) {
-                return idx;
-            }
-            m &= (m - 1u);
+        if (m != 0u) {
+            const std::uint32_t* descs = so->descs_ptr();
+            const char* kbuf = so->kbuf_ptr();
+            do {
+                const std::size_t idx = static_cast<std::size_t>(detail::ctz64(m) >> 3u);
+                if (idx >= n) {
+                    return n;
+                }
+                const std::uint32_t d = descs[idx];
+                const std::size_t kl = static_cast<std::size_t>(d & 0xFFFFu);
+                if (kl == key.size() && detail::fast_memeq(kbuf + (d >> 16u), key.data(), kl)) {
+                    return idx;
+                }
+                m &= (m - 1u);
+            } while (m != 0u);
         }
         return n;
     }
+    const std::uint32_t* descs = nullptr;
+    const char* kbuf = nullptr;
     for (std::size_t base = 0u; base < n; base += 8u) {
         std::uint64_t w = 0u;
         std::memcpy(&w, tags + base, 8u);
         const std::uint64_t x = w ^ needle;
         std::uint64_t m = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
-        while (m != 0u) {
-            const std::size_t idx = base + static_cast<std::size_t>(detail::ctz64(m) >> 3u);
-            if (idx >= n) {
-                return n;
+        if (m != 0u) {
+            if (descs == nullptr) {
+                descs = so->descs_ptr();
+                kbuf = so->kbuf_ptr();
             }
-            const std::uint32_t d = descs[idx];
-            const std::size_t kl = static_cast<std::size_t>(d & 0xFFFFu);
-            if (kl == key.size() && detail::fast_memeq(kbuf + (d >> 16u), key.data(), kl)) {
-                return idx;
-            }
-            m &= (m - 1u);
+            do {
+                const std::size_t idx = base + static_cast<std::size_t>(detail::ctz64(m) >> 3u);
+                if (idx >= n) {
+                    return n;
+                }
+                const std::uint32_t d = descs[idx];
+                const std::size_t kl = static_cast<std::size_t>(d & 0xFFFFu);
+                if (kl == key.size() && detail::fast_memeq(kbuf + (d >> 16u), key.data(), kl)) {
+                    return idx;
+                }
+                m &= (m - 1u);
+            } while (m != 0u);
         }
     }
     return n;
@@ -8476,7 +8546,7 @@ json::reference json::small_obj_grow_and_insert(const std::string_view sv,
     for (std::size_t i = 0u; i < n; ++i) {
         live_key_bytes += static_cast<std::size_t>(old_descs[i] & 0xFFFFu);
     }
-    const std::size_t min_cap = (n < old_cap) ? old_cap : (old_cap * 2u);
+    const std::size_t min_cap = (n < old_cap) ? old_cap : ((old_cap == 2u) ? 8u : (old_cap * 2u));
     const std::size_t new_cap =
         (min_cap <= detail::SmallObject4::kMaxCap)
             ? detail::SmallObject4::cap_for_size_and_keys(min_cap, live_key_bytes + sv.size())
@@ -8665,7 +8735,7 @@ std::pair<json::iterator, bool> json::object_emplace_slow(typename object_t::val
             for (std::size_t i = 0u; i < n; ++i) {
                 live_key_bytes += static_cast<std::size_t>(old_descs[i] & 0xFFFFu);
             }
-            const std::size_t min_cap = (n < so->cap) ? so->cap : (so->cap * 2u);
+            const std::size_t min_cap = (n < so->cap) ? so->cap : ((so->cap == 2u) ? 8u : (so->cap * 2u));
             const std::size_t new_cap =
                 (min_cap <= detail::SmallObject4::kMaxCap)
                     ? detail::SmallObject4::cap_for_size_and_keys(

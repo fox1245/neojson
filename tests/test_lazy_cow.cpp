@@ -2401,4 +2401,188 @@ TEST(LazyCow, CompactObjectArrayAndDocCreditStress) {
     }
 }
 
+TEST(LazyCow, SimdDirectDumpAndHomogeneousArenaRunEdgeCases) {
+    // 1. SIMD verbatim/escape boundaries across 0..130 bytes and non-ASCII UTF-8.
+    std::string built_s = "{";
+    for (std::size_t len = 0; len <= 130u; ++len) {
+        if (len > 0u) {
+            built_s.push_back(',');
+        }
+        std::string v(len, 'a');
+        if (len > 0u) {
+            v[len - 1u] = (len % 3u == 0u) ? '"' : ((len % 3u == 1u) ? '\\' : '\n');
+        }
+        if (len >= 20u && (len % 5u) == 0u) {
+            v.replace(len / 2u - 3u, 3u, "\xED\x95\x9C");
+        }
+        built_s += "\"k" + std::to_string(len) + "\":\"";
+        for (unsigned char c : v) {
+            if (c == '"') {
+                built_s += "\\\"";
+            } else if (c == '\\') {
+                built_s += "\\\\";
+            } else if (c == '\n') {
+                built_s += "\\n";
+            } else {
+                built_s.push_back(static_cast<char>(c));
+            }
+        }
+        built_s.push_back('"');
+    }
+    built_s.push_back('}');
+    const oj o_simd = oj::parse(built_s);
+    const jk l_simd = jk::parse(built_s);
+    EXPECT_EQ(l_simd.dump(), o_simd.dump());
+
+    // Exercise DumpBuffer direct/spilled dump > 8 KB and non-UTF8 / escaped built strings.
+    jk big_built = jk::object();
+    oj ref_built = oj::object();
+    for (int i = 0; i < 400; ++i) {
+        std::string val = "payload_" + std::to_string(i) + "_with_\"quotes\"_and_\\slash\\_" +
+                          std::string(35u, static_cast<char>('a' + (i % 26))) + "\xEA\xB0\x80";
+        big_built["entry_" + std::to_string(i)] = val;
+        ref_built["entry_" + std::to_string(i)] = val;
+    }
+    EXPECT_EQ(big_built.dump(), ref_built.dump());
+
+    // Verify 2-number pair fused dump + mixed numeric/int types + mid-array scalar switch.
+    const std::string mixed_pairs =
+        "[[1.25,-2.5],[0,42],[-0.0,1e-5],[3.5,4.5],[\"str\",true],[7,8],[9.0,10.0]]";
+    EXPECT_EQ(jk::parse(mixed_pairs).dump(), oj::parse(mixed_pairs).dump());
+
+    // 2. Depth 1200 lazy direct dump on 512 KiB thread stack and duplicate-key fallback.
+    constexpr std::size_t kDepth = 1200u;
+    std::string deep_raw;
+    for (std::size_t i = 0; i < kDepth; ++i) {
+        deep_raw += (i % 2u == 0u) ? "[" : R"({"n":)";
+    }
+    deep_raw += "42";
+    for (std::size_t i = kDepth; i > 0; --i) {
+        deep_raw += ((i - 1u) % 2u == 0u) ? "]" : "}";
+    }
+    jk::parse_options opts;
+    opts.max_depth = kDepth + 16u;
+    const std::string err = neojson::test::run_with_stack(512u * 1024u, [&]() {
+        const jk doc = jk::parse(deep_raw, nullptr, true, false, opts);
+        EXPECT_EQ(doc.dump(), deep_raw);
+    });
+    ASSERT_TRUE(err.empty()) << err;
+
+    const std::string nested_dup =
+        R"({"arr":[{"x":1,"y":2},{"x":3,"x":4},{"x":5,"y":6}]})";
+    EXPECT_EQ(jk::parse(nested_dup).dump(), oj::parse(nested_dup).dump());
+
+    // 3. Homogeneous object-array shape runs 2..200 + mid-array shape changes + concurrent reads.
+    std::string arr_src = "[";
+    for (int i = 0; i < 200; ++i) {
+        if (i > 0) {
+            arr_src.push_back(',');
+        }
+        if (i == 47) {
+            arr_src += R"({"areaId":999,"blockIds":[1,2],"extra":"tag_)" + std::to_string(i) + R"("})";
+        } else if (i == 48) {
+            arr_src += R"({"blockIds":[3],"areaId":888})";
+        } else if (i == 49) {
+            arr_src += R"({"areaId":777,"areaId":778,"blockIds":[]})";
+        } else {
+            arr_src += R"({"areaId":)" + std::to_string(i) + R"(,"blockIds":)" +
+                       ((i % 3 == 0) ? "[]" : ("[10," + std::to_string(i * 2) + "]")) + "}";
+        }
+    }
+    arr_src.push_back(']');
+    const oj o_arr = oj::parse(arr_src);
+    const jk l_arr = jk::parse(arr_src);
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&]() {
+            for (std::size_t i = 0; i < o_arr.size(); ++i) {
+                const auto& item = l_arr.at(i);
+                const auto& ref = o_arr.at(i);
+                EXPECT_EQ(item.at("areaId").get<int>(), ref.at("areaId").get<int>());
+                EXPECT_EQ(item.at("blockIds").size(), ref.at("blockIds").size());
+                if (i == 47u) {
+                    EXPECT_EQ(item.at("extra").get<std::string>(), "tag_47");
+                }
+            }
+        });
+    }
+    for (auto& th : readers) {
+        th.join();
+    }
+
+    // 4. CompactObject m_storage==3u first-key inline, n==1u fast lookup, >64B fallback, 2->8 growth.
+    jk obj = jk::object();
+    obj["k0"] = 10;
+    EXPECT_EQ(obj["k0"].get<int>(), 10);
+    obj["k1"] = 20;
+    obj["k2"] = 30;
+    obj["k3"] = 40;
+    EXPECT_EQ(obj.dump(), R"({"k0":10,"k1":20,"k2":30,"k3":40})");
+
+    jk long_first = jk::object();
+    const std::string k65(65u, 'z');
+    long_first[k65] = 99;
+    EXPECT_EQ(long_first[k65].get<int>(), 99);
+
+    // 5. Trailing >300B NOESC strings exercising cur == stage -> out.back() = close_ch.
+    const std::string big_noesc(320u, 'q');
+    const std::string tail_arr = "[\"x\",\"" + big_noesc + "\"]";
+    const std::string tail_obj = "{\"a\":1,\"b\":\"" + big_noesc + "\"}";
+    EXPECT_EQ(jk::parse(tail_arr).dump(), tail_arr);
+    EXPECT_EQ(jk::parse(tail_obj).dump(), tail_obj);
+    const std::string nested_tail = "{\"arr\":" + tail_arr + ",\"obj\":" + tail_obj + "}";
+    EXPECT_EQ(jk::parse(nested_tail).dump(), nested_tail);
+
+    // 6. 50,000-double parity sweep across exp_raw in [1005, 1075] plus boundary doubles.
+    std::vector<double> sweep = {-0.0, 0.0, 1.0, -1.0, 2.0, 42.0, 100.0, 12.5,
+                                 1e-4, 1e-5, 999999999999999.0, 1e15,
+                                 -75.6971930656385, 45.42152960000001};
+    sweep.reserve(50050u);
+    std::uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    for (int idx = 0; idx < 50000; ++idx) {
+        rng ^= rng >> 12u;
+        rng ^= rng << 25u;
+        rng ^= rng >> 27u;
+        const std::uint64_t z = rng * 0x2545F4914F6CDD1DULL;
+        const std::uint64_t exp_raw = 1005ULL + (static_cast<std::uint64_t>(idx) % 71ULL);
+        const std::uint64_t bits =
+            ((z >> 63u) << 63u) | (exp_raw << 52u) | (z & ((1ULL << 52u) - 1u));
+        double d = 0.0;
+        std::memcpy(&d, &bits, sizeof(d));
+        sweep.push_back(d);
+    }
+    jk built_sweep = jk::array();
+    for (double d : sweep) {
+        built_sweep.push_back(d);
+    }
+    const std::string built_dump = built_sweep.dump();
+    const jk lazy_sweep = jk::parse(built_dump);
+    EXPECT_EQ(lazy_sweep.dump(), built_dump);
+    const jk reparsed_sweep = jk::parse(lazy_sweep.dump());
+    ASSERT_EQ(reparsed_sweep.size(), sweep.size());
+    for (std::size_t idx = 0u; idx < sweep.size(); ++idx) {
+        const double got = reparsed_sweep.at(idx).get<double>();
+        std::uint64_t b_in = 0u;
+        std::uint64_t b_out = 0u;
+        std::memcpy(&b_in, &sweep[idx], sizeof(b_in));
+        std::memcpy(&b_out, &got, sizeof(b_out));
+        ASSERT_EQ(b_out, b_in) << "idx=" << idx;
+    }
+
+    // 7. Integer boundary formatting across all digit tiers, >300B key+value, and pair inside object.
+    const std::string int_tiers =
+        "[0,9,10,99,100,999,1000,9999,10000,99999999,100000000,1381363200000,"
+        "9999999999999999,10000000000000000,18446744073709551615,"
+        "-1,-9999,-100000000,-9223372036854775808,9223372036854775807]";
+    EXPECT_EQ(jk::parse(int_tiers).dump(), int_tiers);
+
+    const std::string k310(310u, 'k');
+    const std::string v310(310u, 'v');
+    const std::string long_kv = "{\"" + k310 + "\":\"" + v310 + "\"}";
+    EXPECT_EQ(jk::parse(long_kv).dump(), long_kv);
+
+    const std::string obj_pair_mix = R"({"p":[1.25,-2.5],"e":[],"o":{}})";
+    EXPECT_EQ(jk::parse(obj_pair_mix).dump(), obj_pair_mix);
+}
+
 } // namespace
