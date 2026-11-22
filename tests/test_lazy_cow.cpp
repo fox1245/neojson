@@ -2585,4 +2585,221 @@ TEST(LazyCow, SimdDirectDumpAndHomogeneousArenaRunEdgeCases) {
     EXPECT_EQ(jk::parse(obj_pair_mix).dump(), obj_pair_mix);
 }
 
+TEST(LazyCow, NativeSimdParserParityAndEdgeCases) {
+    // 1. 50,000-double parser parity sweep against oracle + extreme boundaries & integers.
+    std::string num_json = "[0,-0,0.0,-0.0,1e-324,5e-324,2.2250738585072014e-308,"
+                           "1.7976931348623157e308,-9223372036854775808,9223372036854775807,"
+                           "18446744073709551615,0.0000001234567890123,1234567890123456.7,"
+                           "1.00000000000000000005,1e0000,1.5e00002";
+    num_json.reserve(1024u * 1024u);
+    std::uint64_t rng = 0xD1B54A32D192ED03ULL;
+    for (int i = 0; i < 50000; ++i) {
+        rng ^= rng >> 12u;
+        rng ^= rng << 25u;
+        rng ^= rng >> 27u;
+        const std::uint64_t z = rng * 0x2545F4914F6CDD1DULL;
+        const int sig_len = 1 + static_cast<int>(z % 19u);
+        std::string item;
+        if ((z >> 63u) != 0u) {
+            item.push_back('-');
+        }
+        std::uint64_t val = z >> 5u;
+        item.push_back(static_cast<char>('1' + (val % 9u)));
+        val /= 9u;
+        const int dot_pos = 1 + static_cast<int>((z >> 10u) % static_cast<std::uint64_t>(sig_len));
+        for (int d = 1; d < sig_len; ++d) {
+            if (d == dot_pos) {
+                item.push_back('.');
+            }
+            item.push_back(static_cast<char>('0' + (val % 10u)));
+            val = val / 10u + 3u;
+        }
+        if ((i % 3) == 0) {
+            const int exp_val = static_cast<int>((z >> 20u) % 61u) - 30;
+            item += ((i % 6) == 0 ? "e" : "E");
+            item += std::to_string(exp_val);
+        }
+        num_json.push_back(',');
+        num_json += item;
+    }
+    num_json.push_back(']');
+
+    const oj o_num = oj::parse(num_json);
+    const jk l_num = jk::parse(num_json);
+    EXPECT_TRUE(jk::accept(num_json));
+    ASSERT_EQ(l_num.size(), o_num.size());
+    for (std::size_t idx = 0u; idx < o_num.size(); ++idx) {
+        const auto& lv = l_num.at(idx);
+        const auto& ov = o_num.at(idx);
+        if (ov.is_number_unsigned()) {
+            ASSERT_EQ(lv.get<std::uint64_t>(), ov.get<std::uint64_t>()) << "idx=" << idx;
+        } else if (ov.is_number_integer()) {
+            ASSERT_EQ(lv.get<std::int64_t>(), ov.get<std::int64_t>()) << "idx=" << idx;
+        } else {
+            const double ld = lv.get<double>();
+            const double od = ov.get<double>();
+            std::uint64_t lb = 0u;
+            std::uint64_t ob = 0u;
+            std::memcpy(&lb, &ld, sizeof(lb));
+            std::memcpy(&ob, &od, sizeof(ob));
+            ASSERT_EQ(lb, ob) << "idx=" << idx << " ld=" << ld << " od=" << od;
+        }
+    }
+    const std::string dumped_num = l_num.dump();
+    const jk reparsed_num = jk::parse(dumped_num);
+    EXPECT_EQ(reparsed_num.dump(), dumped_num);
+    neojson::test::assert_tree_equal(oj::parse(o_num.dump()), reparsed_num);
+    neojson::test::assert_tree_equal(oj::parse(dumped_num), reparsed_num);
+    for (std::size_t idx = 0u; idx < o_num.size(); ++idx) {
+        const auto& rv = reparsed_num.at(idx);
+        const auto& ov = o_num.at(idx);
+        if (ov.is_number_float()) {
+            const double rd = rv.get<double>();
+            const double od = ov.get<double>();
+            std::uint64_t rb = 0u;
+            std::uint64_t ob = 0u;
+            std::memcpy(&rb, &rd, sizeof(rb));
+            std::memcpy(&ob, &od, sizeof(ob));
+            ASSERT_EQ(rb, ob) << "roundtrip idx=" << idx;
+        }
+    }
+
+    // 2. Heavy whitespace (>200 bytes) + 2-number array runs + mixed container transitions.
+    const std::string ws_heavy(210u, ' ');
+    const std::string mixed = "{\n" + ws_heavy + "\"coords\":" + ws_heavy +
+                              "[[1.25,-2.5],[-75.6971930656385,45.42152960000001],"
+                              "[0,1],[2,3,4],[5],{\"k\":\t\r\n" +
+                              ws_heavy + "true,\"n\":null,\"f\":false,\"e\":[]}]}";
+    EXPECT_EQ(jk::parse(mixed).dump(), oj::parse(mixed).dump());
+
+    // 3. Escapes, embedded NUL, surrogate pairs, 2/3/4-byte UTF-8 runs, and strict rejections.
+    std::string esc_json = "{\"ascii\":\"hello_012345678901234567890123456789012345\","
+                           "\"esc\":\"a\\\"b\\\\c\\/d\\be\\ff\\ng\\rh\\ti\\u0041\","
+                           "\"nul\":\"x\\u0000y\","
+                           "\"emoji\":\"\\uD83D\\uDE00\","
+                           "\"utf8\":\"\xED\x95\x9C\xEA\xB8\x80_\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E_"
+                           "\xD8\xA7\xD9\x84\xD8\xB9\xD8\xB1\xD8\xA8\xD9\x8A\xD8\xA9_\xF0\x9F\x98\x80\"}";
+    const oj o_esc = oj::parse(esc_json);
+    const jk l_esc = jk::parse(esc_json);
+    EXPECT_EQ(l_esc.dump(), o_esc.dump());
+    EXPECT_EQ(l_esc.at("utf8").get<std::string>(), o_esc.at("utf8").get<std::string>());
+    EXPECT_EQ(l_esc.at("emoji").get<std::string>(), o_esc.at("emoji").get<std::string>());
+    EXPECT_EQ(l_esc.at("nul").get<std::string>().size(), 3u);
+
+    const std::vector<std::string> bad_inputs = {
+        std::string(40u, ' ') + "{\"bad\":\"\\uD800\"}",
+        std::string(40u, ' ') + "{\"bad\":\"\\uDC00\"}",
+        std::string(40u, ' ') + "{\"bad\":\"\xFF\xFE\x80\"}",
+        std::string(40u, ' ') + "{\"bad\":\"\xED\xA0\x80\"}",
+        std::string(40u, ' ') + "{\"bad\":\"line\nbreak\"}",
+        std::string(40u, ' ') + "[1, 2,]                         ",
+        std::string(40u, ' ') + "[01]                            ",
+        std::string(40u, ' ') + "[[1,2]] trailing_garbage        ",
+    };
+    for (const std::string& bad : bad_inputs) {
+        EXPECT_FALSE(jk::accept(bad)) << bad;
+        EXPECT_TRUE(jk::parse(bad, nullptr, false).is_discarded()) << bad;
+        EXPECT_THROW((void)jk::parse(bad), jk::parse_error) << bad;
+    }
+
+    // 4. Dense array reallocation (2000 elems), exact max_depth boundary, and non-NUL heap view.
+    std::string dense = "[0";
+    for (int i = 1; i < 2000; ++i) {
+        dense += "," + std::to_string(i);
+    }
+    dense.push_back(']');
+    auto heap_buf = std::make_unique<char[]>(dense.size());
+    std::memcpy(heap_buf.get(), dense.data(), dense.size());
+    const std::string_view non_nul_view(heap_buf.get(), dense.size());
+    const jk l_dense = jk::parse(non_nul_view);
+    EXPECT_TRUE(jk::accept(non_nul_view));
+    EXPECT_EQ(l_dense.dump(), dense);
+
+    const std::string depth_test = R"({"a":[1,2,3],"b":[4,5,6],"pad":"01234567890123456789012345"})";
+    jk::parse_options opt_ok;
+    opt_ok.max_depth = 2u;
+    EXPECT_EQ(jk::parse(depth_test, nullptr, true, false, opt_ok).dump(),
+              oj::parse(depth_test).dump());
+    jk::parse_options opt_fail;
+    opt_fail.max_depth = 1u;
+    EXPECT_THROW((void)jk::parse(depth_test, nullptr, true, false, opt_fail), jk::parse_error);
+
+    // 5. Valid multi-byte UTF-8 across 32-byte SIMD chunk boundaries (1..70 bytes, with & without escapes).
+    const std::string u2 = "\xC2\x80\xDF\xBF";
+    const std::string u3 = "\xE0\xA0\x80\xED\x9F\xBF\xEE\x80\x80\xEF\xBF\xBF\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88";
+    const std::string u4 = "\xF0\x90\x80\x80\xF4\x8F\xBF\xBF\xF0\x9F\x98\x80";
+    const std::string utf8_pattern = u2 + u3 + u4 + u2 + u3 + u4;
+    for (int pad = 0; pad <= 36; ++pad) {
+        for (int take = 0; take <= 40; ++take) {
+            std::string body(static_cast<std::size_t>(pad), 'a');
+            // Build valid whole code points up to approx `take` bytes from `utf8_pattern`
+            std::size_t pos = 0u;
+            while (pos < static_cast<std::size_t>(take) && pos < utf8_pattern.size()) {
+                const unsigned char lead = static_cast<unsigned char>(utf8_pattern[pos]);
+                std::size_t cp_len = 1u;
+                if (lead >= 0xF0u) {
+                    cp_len = 4u;
+                } else if (lead >= 0xE0u) {
+                    cp_len = 3u;
+                } else if (lead >= 0xC0u) {
+                    cp_len = 2u;
+                }
+                body.append(utf8_pattern, pos, cp_len);
+                pos += cp_len;
+            }
+            const std::string doc_plain =
+                "{\"u\":\"" + body + "\",\"tail\":\"" + std::string(40u, 'z') + "\"}";
+            EXPECT_EQ(jk::parse(doc_plain).dump(), oj::parse(doc_plain).dump())
+                << "pad=" << pad << " take=" << take;
+            const std::string doc_esc =
+                "{\"u\":\"" + body + "\\n\\u0041" + body + "\",\"tail\":\"" + std::string(40u, 'z') +
+                "\"}";
+            EXPECT_EQ(jk::parse(doc_esc).dump(), oj::parse(doc_esc).dump())
+                << "esc pad=" << pad << " take=" << take;
+        }
+    }
+
+    // 6. Invalid UTF-8 sequences at SIMD chunk offsets (0, 1, 15, 16, 28..32) + before "/\n/a.
+    const std::vector<std::string> bad_utf8_seqs = {
+        "\xC0\x80",
+        "\xC1\xBF",
+        "\xE0\x80\x80",
+        "\xE0\x9F\xBF",
+        "\xED\xA0\x80",
+        "\xED\xBF\xBF",
+        "\xF0\x80\x80\x80",
+        "\xF0\x8F\xBF\xBF",
+        "\xF4\x90\x80\x80",
+        "\xF5\x80\x80\x80",
+        "\xFE\x80",
+        "\xFF",
+        "\x80",
+        "\xBF",
+        "\xC2\x80\x80",
+        "\xE1\x80\x80\x80",
+        "\xF0\x90\x80\x80\x80",
+        "\xC2",
+        "\xE1\x80",
+        "\xF0\x90\x80",
+    };
+    const std::vector<int> offsets = {0, 1, 15, 16, 28, 29, 30, 31, 32};
+    const std::vector<std::string> suffixes = {
+        "",
+        "\\n" + std::string(40u, 'b'),
+        std::string(40u, 'a'),
+    };
+    for (int off : offsets) {
+        const std::string pre(static_cast<std::size_t>(off), 'a');
+        for (const std::string& seq : bad_utf8_seqs) {
+            for (const std::string& suf : suffixes) {
+                const std::string bad_doc =
+                    "{\"k\":\"" + pre + seq + suf + "\",\"p\":\"" + std::string(40u, 'x') + "\"}";
+                EXPECT_THROW((void)jk::parse(bad_doc), jk::parse_error)
+                    << "off=" << off << " suf=" << suf.size();
+                EXPECT_FALSE(jk::accept(bad_doc)) << "off=" << off;
+            }
+        }
+    }
+}
+
 } // namespace
