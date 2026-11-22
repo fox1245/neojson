@@ -355,11 +355,8 @@ inline bool operator<(const value_t lhs, const value_t rhs) noexcept {
 struct SharedDocHeader {
     std::atomic<std::uint32_t> refcount{1u};
     std::atomic<bool> tree_unique_verified{false};
-#if __cplusplus >= 202002L || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
-    std::atomic_flag arena_lock{};
-#else
-    std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
-#endif
+    std::atomic<std::uint8_t> arena_lock{0u};
+    bool str_pool_padded_32 = false;
 };
 static_assert(sizeof(SharedDocHeader) <= 8u, "SharedDocHeader must stay 8 bytes");
 
@@ -682,6 +679,93 @@ NEOJSON_ALWAYS_INLINE bool fast_memeq(const char* a, const char* b,
     if (((f0 ^ f1) | (l0 ^ l1)) != 0u) {
         return false;
     }
+    if (n <= 32u) {
+        std::uint64_t m0 = 0u, m1 = 0u, n0 = 0u, n1 = 0u;
+        std::memcpy(&m0, a + 8u, 8u);
+        std::memcpy(&m1, b + 8u, 8u);
+        std::memcpy(&n0, a + n - 16u, 8u);
+        std::memcpy(&n1, b + n - 16u, 8u);
+        return ((m0 ^ m1) | (n0 ^ n1)) == 0u;
+    }
+    if (n <= 48u) {
+        std::uint64_t a1 = 0u, b1 = 0u, a2 = 0u, b2 = 0u;
+        std::uint64_t a3 = 0u, b3 = 0u, a4 = 0u, b4 = 0u;
+        std::memcpy(&a1, a + 8u, 8u);
+        std::memcpy(&b1, b + 8u, 8u);
+        std::memcpy(&a2, a + 16u, 8u);
+        std::memcpy(&b2, b + 16u, 8u);
+        std::memcpy(&a3, a + n - 24u, 8u);
+        std::memcpy(&b3, b + n - 24u, 8u);
+        std::memcpy(&a4, a + n - 16u, 8u);
+        std::memcpy(&b4, b + n - 16u, 8u);
+        return ((a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3) | (a4 ^ b4)) == 0u;
+    }
+    return std::memcmp(a + 8u, b + 8u, n - 16u) == 0;
+}
+
+NEOJSON_ALWAYS_INLINE bool fast_memeq_le15(const char* a, const char* b,
+                                           const std::size_t n) noexcept {
+    if (n >= 8u) {
+        std::uint64_t a0 = 0u, a1 = 0u, b0 = 0u, b1 = 0u;
+        std::memcpy(&a0, a, 8u);
+        std::memcpy(&b0, b, 8u);
+        std::memcpy(&a1, a + n - 8u, 8u);
+        std::memcpy(&b1, b + n - 8u, 8u);
+        return ((a0 ^ b0) | (a1 ^ b1)) == 0u;
+    }
+    if (n >= 4u) {
+        std::uint32_t a0 = 0u, a1 = 0u, b0 = 0u, b1 = 0u;
+        std::memcpy(&a0, a, 4u);
+        std::memcpy(&b0, b, 4u);
+        std::memcpy(&a1, a + n - 4u, 4u);
+        std::memcpy(&b1, b + n - 4u, 4u);
+        return ((a0 ^ b0) | (a1 ^ b1)) == 0u;
+    }
+    if (n >= 2u) {
+        std::uint16_t a0 = 0u, a1 = 0u, b0 = 0u, b1 = 0u;
+        std::memcpy(&a0, a, 2u);
+        std::memcpy(&b0, b, 2u);
+        std::memcpy(&a1, a + n - 2u, 2u);
+        std::memcpy(&b1, b + n - 2u, 2u);
+        return ((a0 ^ b0) | (a1 ^ b1)) == 0u;
+    }
+    return n == 0u || *a == *b;
+}
+
+NEOJSON_ALWAYS_INLINE bool fast_memeq_ge16(const char* a, const char* b,
+                                           const std::size_t n) noexcept {
+    std::uint64_t f0 = 0u, f1 = 0u, l0 = 0u, l1 = 0u;
+    std::memcpy(&f0, a, 8u);
+    std::memcpy(&f1, b, 8u);
+    std::memcpy(&l0, a + n - 8u, 8u);
+    std::memcpy(&l1, b + n - 8u, 8u);
+    if (((f0 ^ f1) | (l0 ^ l1)) != 0u) {
+        return false;
+    }
+    if (n <= 16u) {
+        return true;
+    }
+    if (n <= 32u) {
+        std::uint64_t m0 = 0u, m1 = 0u, n0 = 0u, n1 = 0u;
+        std::memcpy(&m0, a + 8u, 8u);
+        std::memcpy(&m1, b + 8u, 8u);
+        std::memcpy(&n0, a + n - 16u, 8u);
+        std::memcpy(&n1, b + n - 16u, 8u);
+        return ((m0 ^ m1) | (n0 ^ n1)) == 0u;
+    }
+    if (n <= 48u) {
+        std::uint64_t a1 = 0u, b1 = 0u, a2 = 0u, b2 = 0u;
+        std::uint64_t a3 = 0u, b3 = 0u, a4 = 0u, b4 = 0u;
+        std::memcpy(&a1, a + 8u, 8u);
+        std::memcpy(&b1, b + 8u, 8u);
+        std::memcpy(&a2, a + 16u, 8u);
+        std::memcpy(&b2, b + 16u, 8u);
+        std::memcpy(&a3, a + n - 24u, 8u);
+        std::memcpy(&b3, b + n - 24u, 8u);
+        std::memcpy(&a4, a + n - 16u, 8u);
+        std::memcpy(&b4, b + n - 16u, 8u);
+        return ((a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3) | (a4 ^ b4)) == 0u;
+    }
     return std::memcmp(a + 8u, b + 8u, n - 16u) == 0;
 }
 
@@ -691,11 +775,15 @@ NEOJSON_ALWAYS_INLINE bool fast_key_equals(const std::string& k,
     return n == sv.size() && fast_memeq(k.data(), sv.data(), n);
 }
 
-struct ArenaArray {
+struct ArenaCtnHeader {
     std::uint32_t count = 0u;
     std::uint32_t pad = 0u;
     SharedDocHeader* doc = nullptr;
+};
+static_assert(sizeof(ArenaCtnHeader) == 16u && alignof(ArenaCtnHeader) == alignof(void*),
+              "ArenaCtnHeader must stay 16-byte pointer-aligned");
 
+struct ArenaArray : ArenaCtnHeader {
     json* elems() noexcept {
         return std::launder(
             reinterpret_cast<json*>(reinterpret_cast<unsigned char*>(this) + sizeof(ArenaArray)));
@@ -719,14 +807,11 @@ struct ArenaHashIndex {
     ArenaHashSlot* slots = nullptr;
 };
 
-struct ArenaObject {
-    std::uint32_t count = 0u;
-    std::uint32_t pad = 0u;
-    SharedDocHeader* doc = nullptr;
-    const std::string* const* keys_ptr = nullptr;
+struct ArenaObject : ArenaCtnHeader {
+    const std::string* keys_ptr = nullptr;
     mutable std::atomic<ArenaHashIndex*> index{nullptr};
 
-    const std::string* const* keys() const noexcept {
+    const std::string* keys() const noexcept {
         return keys_ptr;
     }
 
@@ -742,11 +827,14 @@ struct ArenaObject {
 };
 static_assert(sizeof(ArenaObject) == 32u && alignof(ArenaObject) == alignof(void*),
               "ArenaObject must stay 32-byte pointer-aligned");
+static_assert(static_cast<std::uint8_t>(value_t::object) == 1u &&
+                  static_cast<std::uint8_t>(value_t::array) == 2u,
+              "Arena tagged iterators rely on object=1, array=2");
 
 NEOJSON_ALWAYS_INLINE std::size_t arena_obj_find(const ArenaObject* ao,
                                                  const std::string_view sv) noexcept {
     const std::size_t n = ao->count;
-    const std::string* const* ks = ao->keys();
+    const std::string* ks = ao->keys();
     if (n > kOrderedMapHashThreshold) {
         const ArenaHashIndex* hidx = ao->index.load(std::memory_order_acquire);
         if (hidx == nullptr) {
@@ -765,7 +853,7 @@ NEOJSON_ALWAYS_INLINE std::size_t arena_obj_find(const ArenaObject* ao,
                 }
                 if (s.hash32 == h32) {
                     const std::size_t elem_idx = static_cast<std::size_t>(s.idx_plus_one - 1u);
-                    if (fast_key_equals(*ks[elem_idx], sv)) {
+                    if (fast_key_equals(ks[elem_idx], sv)) {
                         return elem_idx;
                     }
                 }
@@ -774,7 +862,7 @@ NEOJSON_ALWAYS_INLINE std::size_t arena_obj_find(const ArenaObject* ao,
         }
     }
     for (std::size_t i = 0u; i < n; ++i) {
-        if (fast_key_equals(*ks[i], sv)) {
+        if (fast_key_equals(ks[i], sv)) {
             return i;
         }
     }
@@ -1688,9 +1776,9 @@ private:
         const std::uintptr_t tag = raw & std::uintptr_t{3u};
         value_t t = value_t::null;
         if (tag == std::uintptr_t{1u}) {
-            t = value_t::array;
-        } else if (tag == std::uintptr_t{2u}) {
             t = value_t::object;
+        } else if (tag == std::uintptr_t{2u}) {
+            t = value_t::array;
         } else {
             t = reinterpret_cast<typename IteratorType::pointer>(raw)->type();
         }
@@ -1784,7 +1872,7 @@ private:
 
     NEOJSON_ALWAYS_INLINE static bool is_object_raw(const std::uintptr_t raw) noexcept {
         const std::uintptr_t tag = raw & std::uintptr_t{3u};
-        if (tag == std::uintptr_t{2u}) {
+        if (tag == std::uintptr_t{1u}) {
             return true;
         }
         if (tag != std::uintptr_t{0u} || raw == std::uintptr_t{0u}) {
@@ -1797,11 +1885,20 @@ private:
         return raw_handle() == reinterpret_cast<std::uintptr_t>(p);
     }
 
+    static iter_impl from_arena_ctn(const detail::ArenaCtnHeader* hdr, const std::uintptr_t tag,
+                                     const difference_type idx = 0) noexcept {
+        static_assert(kIsConst, "tagged arena iterators are const-only");
+        iter_impl it;
+        it.m_handle = reinterpret_cast<std::uintptr_t>(hdr) | tag;
+        it.idx_ = idx;
+        return it;
+    }
+
     static iter_impl from_arena_array(const detail::ArenaArray* aa,
                                       const difference_type idx = 0) noexcept {
         static_assert(kIsConst, "tagged arena iterators are const-only");
         iter_impl it;
-        it.m_handle = reinterpret_cast<std::uintptr_t>(aa) | std::uintptr_t{1u};
+        it.m_handle = reinterpret_cast<std::uintptr_t>(aa) | std::uintptr_t{2u};
         it.idx_ = idx;
         return it;
     }
@@ -1810,7 +1907,7 @@ private:
                                        const difference_type idx = 0) noexcept {
         static_assert(kIsConst, "tagged arena iterators are const-only");
         iter_impl it;
-        it.m_handle = reinterpret_cast<std::uintptr_t>(ao) | std::uintptr_t{2u};
+        it.m_handle = reinterpret_cast<std::uintptr_t>(ao) | std::uintptr_t{1u};
         it.idx_ = idx;
         return it;
     }
@@ -1852,8 +1949,8 @@ public:
         return result;
     }
 
-    iter_impl& operator++() {
-        if (m_handle != handle_t{}) {
+    NEOJSON_ALWAYS_INLINE iter_impl& operator++() noexcept {
+        if (NEOJSON_LIKELY(m_handle != handle_t{})) {
             ++idx_;
         }
         return *this;
@@ -1865,8 +1962,8 @@ public:
         return result;
     }
 
-    iter_impl& operator--() {
-        if (m_handle != handle_t{}) {
+    NEOJSON_ALWAYS_INLINE iter_impl& operator--() noexcept {
+        if (NEOJSON_LIKELY(m_handle != handle_t{})) {
             --idx_;
         }
         return *this;
@@ -1979,9 +2076,11 @@ public:
     }
 
 private:
-    static bool equal_at(const std::uintptr_t lhs_obj, difference_type lhs_idx,
-                         const std::uintptr_t rhs_obj, difference_type rhs_idx) {
-        if (lhs_obj != rhs_obj) {
+    NEOJSON_ALWAYS_INLINE static bool equal_at(const std::uintptr_t lhs_obj,
+                                               difference_type lhs_idx,
+                                               const std::uintptr_t rhs_obj,
+                                               difference_type rhs_idx) {
+        if (NEOJSON_UNLIKELY(lhs_obj != rhs_obj)) {
             throw_invalid_iterator(212, "cannot compare iterators of different containers");
         }
         return lhs_idx == rhs_idx;
@@ -2169,92 +2268,19 @@ private:
 
     NEOJSON_ALWAYS_INLINE static reference element_at(handle_t handle, difference_type idx) {
         if constexpr (kIsConst) {
-            if (idx >= 0) {
-                const auto u_idx = static_cast<std::size_t>(idx);
-                const std::uintptr_t tag = handle & std::uintptr_t{3u};
-                if (tag == std::uintptr_t{1u}) {
-                    const auto* aa = reinterpret_cast<const detail::ArenaArray*>(
-                        handle - std::uintptr_t{1u});
-                    if (u_idx < aa->count) {
-                        return aa->elems()[u_idx];
-                    }
-                    return element_at_slow(handle, idx);
+            const auto u_idx = static_cast<std::size_t>(idx);
+            const std::uintptr_t tag = handle & std::uintptr_t{3u};
+            if (tag == std::uintptr_t{1u}) {
+                const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
+                    handle - std::uintptr_t{1u});
+                if (NEOJSON_LIKELY(u_idx < ao->count)) {
+                    return ao->vals()[u_idx];
                 }
-                if (tag == std::uintptr_t{2u}) {
-                    const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
-                        handle - std::uintptr_t{2u});
-                    if (u_idx < ao->count) {
-                        return ao->vals()[u_idx];
-                    }
-                    return element_at_slow(handle, idx);
-                }
-                if (handle != std::uintptr_t{0u}) {
-                    const pointer object = reinterpret_cast<pointer>(handle);
-                    if (object->m_type == value_t::object) {
-                        if (object->m_storage == 4u) {
-                            const auto* ao = object->m_value.arena_obj;
-                            if (u_idx < ao->count) {
-                                return ao->vals()[u_idx];
-                            }
-                        } else if (object->m_storage == 0u) {
-                            const auto* obj = object->m_value.object;
-                            if (u_idx < obj->size()) {
-                                return (*obj)[u_idx].second;
-                            }
-                        } else if (object->m_storage == 2u) {
-                            const auto* so = object->m_value.small_obj;
-                            if (u_idx < BasicJsonType::small_obj_size(so)) {
-                                return BasicJsonType::small_obj_val(so, u_idx);
-                            }
-                        } else if (object->m_storage == 1u) {
-                            if (void* av = object->m_value.lazy->arena_view.load(
-                                    std::memory_order_acquire)) {
-                                const auto* ao = static_cast<const detail::ArenaObject*>(av);
-                                if (u_idx < ao->count) {
-                                    return ao->vals()[u_idx];
-                                }
-                            } else if (void* mat = object->m_value.lazy->materialized.load(
-                                           std::memory_order_acquire)) {
-                                const auto* obj =
-                                    static_cast<const typename BasicJsonType::object_t*>(mat);
-                                if (u_idx < obj->size()) {
-                                    return (*obj)[u_idx].second;
-                                }
-                            }
-                        }
-                    } else if (object->m_type == value_t::array) {
-                        if (object->m_storage == 4u) {
-                            const auto* aa = object->m_value.arena_arr;
-                            if (u_idx < aa->count) {
-                                return aa->elems()[u_idx];
-                            }
-                        } else if (object->m_storage == 0u) {
-                            const auto* arr = object->m_value.array;
-                            if (u_idx < arr->size()) {
-                                return (*arr)[u_idx];
-                            }
-                        } else if (object->m_storage == 2u) {
-                            const auto* sa = object->m_value.small_arr;
-                            if (u_idx < BasicJsonType::small_arr_size(sa)) {
-                                return BasicJsonType::small_arr_elem(sa, u_idx);
-                            }
-                        } else if (object->m_storage == 1u) {
-                            if (void* av = object->m_value.lazy->arena_view.load(
-                                    std::memory_order_acquire)) {
-                                const auto* aa = static_cast<const detail::ArenaArray*>(av);
-                                if (u_idx < aa->count) {
-                                    return aa->elems()[u_idx];
-                                }
-                            } else if (void* mat = object->m_value.lazy->materialized.load(
-                                           std::memory_order_acquire)) {
-                                const auto* arr =
-                                    static_cast<const typename BasicJsonType::array_t*>(mat);
-                                if (u_idx < arr->size()) {
-                                    return (*arr)[u_idx];
-                                }
-                            }
-                        }
-                    }
+            } else if (tag == std::uintptr_t{2u}) {
+                const auto* aa = reinterpret_cast<const detail::ArenaArray*>(
+                    handle - std::uintptr_t{2u});
+                if (NEOJSON_LIKELY(u_idx < aa->count)) {
+                    return aa->elems()[u_idx];
                 }
             }
             return element_at_slow(handle, idx);
@@ -2299,10 +2325,10 @@ private:
         const std::uintptr_t raw = to_raw(handle);
         if constexpr (kIsConst) {
             const std::uintptr_t tag = raw & std::uintptr_t{3u};
-            if (tag == std::uintptr_t{1u}) {
+            if (tag == std::uintptr_t{2u}) {
                 throw_invalid_iterator(207, "cannot use key() for non-object iterators");
             }
-            if (tag == std::uintptr_t{2u}) {
+            if (tag == std::uintptr_t{1u}) {
                 throw_invalid_iterator(214, "cannot get value");
             }
         }
@@ -2315,7 +2341,7 @@ private:
             if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
                 throw_invalid_iterator(214, "cannot get value");
             }
-            return *ao->keys()[static_cast<std::size_t>(idx)];
+            return ao->keys()[static_cast<std::size_t>(idx)];
         }
         if (object->m_storage == 2u) {
             const auto* cso = object->m_value.small_obj;
@@ -2344,7 +2370,7 @@ private:
                     if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
                         throw_invalid_iterator(214, "cannot get value");
                     }
-                    return *ao->keys()[static_cast<std::size_t>(idx)];
+                    return ao->keys()[static_cast<std::size_t>(idx)];
                 }
             } else {
                 void* mat = object->m_value.lazy->materialized.load(std::memory_order_acquire);
@@ -2363,52 +2389,13 @@ private:
     NEOJSON_ALWAYS_INLINE static const typename BasicJsonType::object_t::key_type& key_at(
         handle_t handle, difference_type idx) {
         if constexpr (kIsConst) {
-            if (idx >= 0) {
-                const auto u_idx = static_cast<std::size_t>(idx);
-                const std::uintptr_t tag = handle & std::uintptr_t{3u};
-                if (tag == std::uintptr_t{2u}) {
-                    const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
-                        handle - std::uintptr_t{2u});
-                    if (u_idx < ao->count) {
-                        return *ao->keys()[u_idx];
-                    }
-                    return key_at_slow(handle, idx);
-                }
-                if (tag == std::uintptr_t{0u} && handle != std::uintptr_t{0u}) {
-                    const pointer object = reinterpret_cast<pointer>(handle);
-                    if (object->m_type == value_t::object) {
-                        if (object->m_storage == 4u) {
-                            const auto* ao = object->m_value.arena_obj;
-                            if (u_idx < ao->count) {
-                                return *ao->keys()[u_idx];
-                            }
-                        } else if (object->m_storage == 0u) {
-                            const auto* obj = object->m_value.object;
-                            if (u_idx < obj->size()) {
-                                return (*obj)[u_idx].first;
-                            }
-                        } else if (object->m_storage == 2u) {
-                            const auto* so = object->m_value.small_obj;
-                            if (u_idx < BasicJsonType::small_obj_size(so)) {
-                                return BasicJsonType::small_obj_key(so, u_idx);
-                            }
-                        } else if (object->m_storage == 1u) {
-                            if (void* av = object->m_value.lazy->arena_view.load(
-                                    std::memory_order_acquire)) {
-                                const auto* ao = static_cast<const detail::ArenaObject*>(av);
-                                if (u_idx < ao->count) {
-                                    return *ao->keys()[u_idx];
-                                }
-                            } else if (void* mat = object->m_value.lazy->materialized.load(
-                                           std::memory_order_acquire)) {
-                                const auto* obj =
-                                    static_cast<const typename BasicJsonType::object_t*>(mat);
-                                if (u_idx < obj->size()) {
-                                    return (*obj)[u_idx].first;
-                                }
-                            }
-                        }
-                    }
+            const auto u_idx = static_cast<std::size_t>(idx);
+            const std::uintptr_t tag = handle & std::uintptr_t{3u};
+            if (tag == std::uintptr_t{1u}) {
+                const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
+                    handle - std::uintptr_t{1u});
+                if (NEOJSON_LIKELY(u_idx < ao->count)) {
+                    return ao->keys()[u_idx];
                 }
             }
             return key_at_slow(handle, idx);
@@ -4727,6 +4714,8 @@ private:
     NEOJSON_NOINLINE inline array_t* mutable_array_slow();
     NEOJSON_NOINLINE inline const object_t* const_object_slow() const;
     NEOJSON_NOINLINE inline const array_t* const_array_slow() const;
+    NEOJSON_NOINLINE inline size_type size_slow() const noexcept;
+    NEOJSON_NOINLINE inline const_iterator cend_slow() const noexcept;
 
     NEOJSON_ALWAYS_INLINE object_t* mutable_object() {
         if (m_storage == 0u) {
@@ -4994,14 +4983,14 @@ private:
         }
         m_type = value_t::object;
         const difference_type slice = last_idx - first_idx;
-        const std::string* const* ks = ao->keys();
+        const std::string* ks = ao->keys();
         const json* vs = ao->vals();
         if (slice > 0) {
             const auto uslice = static_cast<std::size_t>(slice);
             std::size_t total_key_bytes = 0u;
             if (uslice <= detail::kSmallObjMaxCap) {
                 for (difference_type i = first_idx; i < last_idx; ++i) {
-                    total_key_bytes += ks[i]->size();
+                    total_key_bytes += ks[i].size();
                 }
             }
             if (detail::SmallObject4* so = create_small_object_empty_for(uslice, total_key_bytes)) {
@@ -5015,7 +5004,7 @@ private:
                 } guard{so};
                 for (difference_type i = first_idx; i < last_idx; ++i) {
                     json copy_v(vs[i]);
-                    small_obj_append_unique_entry(so, std::string_view(*ks[i]), std::move(copy_v));
+                    small_obj_append_unique_entry(so, std::string_view(ks[i]), std::move(copy_v));
                 }
                 guard.p = nullptr;
                 m_value.small_obj = so;
@@ -5032,7 +5021,7 @@ private:
                 } guard{obj};
                 obj->reserve_vector_only(uslice);
                 for (difference_type i = first_idx; i < last_idx; ++i) {
-                    obj->emplace_back_unindexed(std::string_view(*ks[i]), json(vs[i]));
+                    obj->emplace_back_unindexed(std::string_view(ks[i]), json(vs[i]));
                 }
                 guard.p = nullptr;
                 m_value.object = obj;
@@ -5056,15 +5045,15 @@ public:
             throw invalid_iterator::create(206, "cannot construct with iterators from null");
         }
         const std::uintptr_t src_tag = src_raw & std::uintptr_t{3u};
-        if (src_tag == std::uintptr_t{1u}) {
+        if (src_tag == std::uintptr_t{2u}) {
             init_slice_from_arena_array(
-                reinterpret_cast<const detail::ArenaArray*>(src_raw - std::uintptr_t{1u}),
+                reinterpret_cast<const detail::ArenaArray*>(src_raw - std::uintptr_t{2u}),
                 first.idx_, last.idx_);
             return;
         }
-        if (src_tag == std::uintptr_t{2u}) {
+        if (src_tag == std::uintptr_t{1u}) {
             init_slice_from_arena_object(
-                reinterpret_cast<const detail::ArenaObject*>(src_raw - std::uintptr_t{2u}),
+                reinterpret_cast<const detail::ArenaObject*>(src_raw - std::uintptr_t{1u}),
                 first.idx_, last.idx_);
             return;
         }
@@ -5986,13 +5975,12 @@ public:
     NEOJSON_ALWAYS_INLINE const_iterator begin() const noexcept { return cbegin(); }
 
     NEOJSON_ALWAYS_INLINE const_iterator cbegin() const noexcept {
-        if (m_storage == 4u) {
-            if (m_type == value_t::array) {
-                return const_iterator::from_arena_array(m_value.arena_arr, 0);
-            }
-            if (m_type == value_t::object) {
-                return const_iterator::from_arena_object(m_value.arena_obj, 0);
-            }
+        if (NEOJSON_LIKELY(m_storage == 4u &&
+                           static_cast<unsigned>(static_cast<std::uint8_t>(m_type) - 1u) <= 1u)) {
+            const auto* hdr = (m_type == value_t::object)
+                                  ? static_cast<const detail::ArenaCtnHeader*>(m_value.arena_obj)
+                                  : static_cast<const detail::ArenaCtnHeader*>(m_value.arena_arr);
+            return const_iterator::from_arena_ctn(hdr, static_cast<std::uintptr_t>(m_type), 0);
         }
         return const_iterator(this, 0);
     }
@@ -6012,25 +6000,18 @@ public:
     NEOJSON_ALWAYS_INLINE const_iterator end() const noexcept { return cend(); }
 
     NEOJSON_ALWAYS_INLINE const_iterator cend() const noexcept {
-        if (m_storage == 4u) {
-            if (m_type == value_t::array) {
-                return const_iterator::from_arena_array(
-                    m_value.arena_arr, static_cast<difference_type>(m_value.arena_arr->count));
-            }
-            if (m_type == value_t::object) {
-                return const_iterator::from_arena_object(
-                    m_value.arena_obj, static_cast<difference_type>(m_value.arena_obj->count));
-            }
+        if (NEOJSON_LIKELY(m_storage == 4u &&
+                           static_cast<unsigned>(static_cast<std::uint8_t>(m_type) - 1u) <= 1u)) {
+            const auto* hdr = (m_type == value_t::object)
+                                  ? static_cast<const detail::ArenaCtnHeader*>(m_value.arena_obj)
+                                  : static_cast<const detail::ArenaCtnHeader*>(m_value.arena_arr);
+            return const_iterator::from_arena_ctn(hdr, static_cast<std::uintptr_t>(m_type),
+                                                  static_cast<difference_type>(hdr->count));
         }
-        switch (m_type) {
-            case value_t::null:
-                return const_iterator(this, 0);
-            case value_t::object:
-            case value_t::array:
-                return const_iterator(this, static_cast<difference_type>(size()));
-            default:
-                return const_iterator(this, 1);
+        if (m_storage == 3u) {
+            return const_iterator(this, 0);
         }
+        return cend_slow();
     }
 
     reverse_iterator rbegin() noexcept { return reverse_iterator(end()); }
@@ -6173,12 +6154,12 @@ public:
         }
         const std::uintptr_t src_raw = first.raw_handle();
         const std::uintptr_t src_tag = src_raw & std::uintptr_t{3u};
-        if (src_raw == std::uintptr_t{0u} || src_tag == std::uintptr_t{2u}) {
+        if (src_raw == std::uintptr_t{0u} || src_tag == std::uintptr_t{1u}) {
             throw invalid_iterator::create(204, "iterators out of range");
         }
-        if (src_tag == std::uintptr_t{1u}) {
+        if (src_tag == std::uintptr_t{2u}) {
             const auto* aa = reinterpret_cast<const detail::ArenaArray*>(
-                src_raw - std::uintptr_t{1u});
+                src_raw - std::uintptr_t{2u});
             if (first.idx_ < 0 || last.idx_ < first.idx_ ||
                 static_cast<std::size_t>(last.idx_) > aa->count) {
                 throw invalid_iterator::create(204, "iterators out of range");
@@ -6237,23 +6218,23 @@ public:
         }
         const std::uintptr_t src_raw = first.raw_handle();
         const std::uintptr_t src_tag = src_raw & std::uintptr_t{3u};
-        if (src_tag == std::uintptr_t{2u}) {
+        if (src_tag == std::uintptr_t{1u}) {
             const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
-                src_raw - std::uintptr_t{2u});
+                src_raw - std::uintptr_t{1u});
             if (first.idx_ < 0 || last.idx_ < first.idx_ ||
                 static_cast<std::size_t>(last.idx_) > ao->count) {
                 throw invalid_iterator::create(204, "iterators out of range");
             }
             auto* obj = mutable_object();
-            const std::string* const* ks = ao->keys();
+            const std::string* ks = ao->keys();
             const json* vs = ao->vals();
             for (difference_type i = first.idx_; i < last.idx_; ++i) {
                 const auto ui = static_cast<std::size_t>(i);
-                obj->insert(std::make_pair(*ks[ui], vs[ui]));
+                obj->insert(std::make_pair(ks[ui], vs[ui]));
             }
             return;
         }
-        if (src_raw == std::uintptr_t{0u} || src_tag == std::uintptr_t{1u}) {
+        if (src_raw == std::uintptr_t{0u} || src_tag == std::uintptr_t{2u}) {
             throw invalid_iterator::create(202, "iterators first and last must point to objects");
         }
         const auto* src = reinterpret_cast<const json*>(src_raw);
@@ -6288,19 +6269,19 @@ public:
         }
         const std::uintptr_t src_raw = first.raw_handle();
         const std::uintptr_t src_tag = src_raw & std::uintptr_t{3u};
-        if (src_tag == std::uintptr_t{2u}) {
+        if (src_tag == std::uintptr_t{1u}) {
             const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
-                src_raw - std::uintptr_t{2u});
+                src_raw - std::uintptr_t{1u});
             if (first.idx_ < 0 || last.idx_ < first.idx_ ||
                 static_cast<std::size_t>(last.idx_) > ao->count) {
                 throw invalid_iterator::create(204, "iterators out of range");
             }
             auto* obj = mutable_object();
-            const std::string* const* ks = ao->keys();
+            const std::string* ks = ao->keys();
             const json* vs = ao->vals();
             for (difference_type i = first.idx_; i < last.idx_; ++i) {
                 const auto ui = static_cast<std::size_t>(i);
-                const std::string& k = *ks[ui];
+                const std::string& k = ks[ui];
                 const json& v = vs[ui];
                 if (merge_objects && v.is_object()) {
                     auto existing = obj->find(k);
@@ -6313,7 +6294,7 @@ public:
             }
             return;
         }
-        if (src_raw == std::uintptr_t{0u} || src_tag == std::uintptr_t{1u}) {
+        if (src_raw == std::uintptr_t{0u} || src_tag == std::uintptr_t{2u}) {
             throw type_error::create(
                 312, std::string("cannot use update() with ") +
                          (src_raw == std::uintptr_t{0u} ? "null" : "array"));
@@ -8930,11 +8911,23 @@ bool json::empty() const noexcept {
     return m_type == value_t::null;
 }
 
-json::size_type json::size() const noexcept {
+json::const_iterator json::cend_slow() const noexcept {
+    if (m_storage == 3u) {
+        return const_iterator(this, 0);
+    }
+    switch (m_type) {
+        case value_t::null:
+            return const_iterator(this, 0);
+        case value_t::object:
+        case value_t::array:
+            return const_iterator(this, static_cast<difference_type>(size()));
+        default:
+            return const_iterator(this, 1);
+    }
+}
+
+json::size_type json::size_slow() const noexcept {
     if (m_type == value_t::array) {
-        if (m_storage == 4u) {
-            return m_value.arena_arr->count;
-        }
         if (m_storage == 0u) {
             return m_value.array->size();
         }
@@ -8944,9 +8937,6 @@ json::size_type json::size() const noexcept {
         return (m_storage == 2u) ? m_value.small_arr->count : 0u;
     }
     if (m_type == value_t::object) {
-        if (m_storage == 4u) {
-            return m_value.arena_obj->count;
-        }
         if (m_storage == 0u) {
             return m_value.object->size();
         }
@@ -8965,6 +8955,20 @@ json::size_type json::size() const noexcept {
         return (m_storage == 2u) ? m_value.small_obj->count : 0u;
     }
     return (m_type == value_t::null) ? 0u : 1u;
+}
+
+json::size_type json::size() const noexcept {
+    if (NEOJSON_LIKELY(m_storage == 4u &&
+                       static_cast<unsigned>(static_cast<std::uint8_t>(m_type) - 1u) <= 1u)) {
+        const auto* hdr = (m_type == value_t::object)
+                              ? static_cast<const detail::ArenaCtnHeader*>(m_value.arena_obj)
+                              : static_cast<const detail::ArenaCtnHeader*>(m_value.arena_arr);
+        return hdr->count;
+    }
+    if (m_storage == 3u) {
+        return 0u;
+    }
+    return size_slow();
 }
 
 inline json::reference json::at(const size_type idx) {

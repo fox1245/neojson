@@ -6,6 +6,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <random>
 #include <thread>
@@ -85,7 +86,10 @@ std::uint64_t hash_seed() noexcept {
 [[maybe_unused]] const bool g_hash_seed_eager_init = (hash_seed_slow(), true);
 
 #if NEOJSON_X86_SIMD
-inline const bool g_has_avx2 = __builtin_cpu_supports("avx2");
+inline bool has_avx2() noexcept {
+    static const bool ok = __builtin_cpu_supports("avx2");
+    return ok;
+}
 #endif
 
 std::uint64_t hash_bytes_long(const char* data, const std::size_t len,
@@ -1737,7 +1741,7 @@ inline std::size_t find_non_verbatim_utf8(const char* p, std::size_t pos,
                                           const std::size_t len) noexcept {
     const std::size_t rem = len - pos;
 #if NEOJSON_X86_SIMD
-    if (rem >= 32u && g_has_avx2) {
+    if (rem >= 32u && has_avx2()) {
         return find_non_verbatim_utf8_avx2(p, pos, len);
     }
 #endif
@@ -1753,7 +1757,7 @@ inline std::size_t find_non_verbatim_valid_utf8(const char* p, std::size_t pos,
                                                 const std::size_t len) noexcept {
     const std::size_t rem = len - pos;
 #if NEOJSON_X86_SIMD
-    if (rem >= 32u && g_has_avx2) {
+    if (rem >= 32u && has_avx2()) {
         return find_non_verbatim_valid_utf8_avx2(p, pos, len);
     }
 #endif
@@ -1769,7 +1773,7 @@ inline std::size_t find_non_verbatim_ascii(const char* p, std::size_t pos,
                                            const std::size_t len) noexcept {
     const std::size_t rem = len - pos;
 #if NEOJSON_X86_SIMD
-    if (rem >= 32u && g_has_avx2) {
+    if (rem >= 32u && has_avx2()) {
         return find_non_verbatim_ascii_avx2(p, pos, len);
     }
 #endif
@@ -2605,6 +2609,53 @@ struct json_access {
         dst->m_value.arena_obj = ao;
     }
 
+    struct ArenaConstLeaf {
+        json::value_t type;
+        std::uint8_t storage;
+        bool bval;
+    };
+
+    static constexpr std::array<ArenaConstLeaf, 16u> make_arena_const_leaf_table() noexcept {
+        constexpr std::uint8_t kNullTag = YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE;
+        constexpr std::uint8_t kFalseTag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE;
+        constexpr std::uint8_t kTrueTag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE;
+        constexpr std::uint8_t kArrTag = YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE;
+        constexpr std::uint8_t kObjTag = YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE;
+        std::array<ArenaConstLeaf, 16u> tbl{};
+        for (std::size_t i = 0u; i < 16u; ++i) {
+            tbl[i] = ArenaConstLeaf{json::value_t::null, 0u, false};
+        }
+        tbl[kNullTag] = ArenaConstLeaf{json::value_t::null, 0u, false};
+        tbl[kFalseTag] = ArenaConstLeaf{json::value_t::boolean, 0u, false};
+        tbl[kTrueTag] = ArenaConstLeaf{json::value_t::boolean, 0u, true};
+        tbl[kArrTag] = ArenaConstLeaf{json::value_t::array, 3u, false};
+        tbl[kObjTag] = ArenaConstLeaf{json::value_t::object, 3u, false};
+        return tbl;
+    }
+
+    static void init_arena_const_leaf(json* dst, const std::uint8_t tag) noexcept {
+        constexpr std::uint8_t kNullTag = YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE;
+        constexpr std::uint8_t kFalseTag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE;
+        constexpr std::uint8_t kTrueTag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE;
+        constexpr std::uint8_t kArrTag = YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE;
+        constexpr std::uint8_t kObjTag = YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE;
+        static_assert(kNullTag < 16u && kFalseTag < 16u && kTrueTag < 16u && kArrTag < 16u &&
+                          kObjTag < 16u,
+                      "constant yyjson leaf tags must fit in 16-entry table");
+        static_assert(kNullTag != kFalseTag && kNullTag != kTrueTag && kNullTag != kArrTag &&
+                          kNullTag != kObjTag && kFalseTag != kTrueTag && kFalseTag != kArrTag &&
+                          kFalseTag != kObjTag && kTrueTag != kArrTag && kTrueTag != kObjTag &&
+                          kArrTag != kObjTag,
+                      "constant yyjson leaf tags must be distinct");
+        static constexpr std::array<ArenaConstLeaf, 16u> kConstLeafTable =
+            make_arena_const_leaf_table();
+        const ArenaConstLeaf e = kConstLeafTable[tag & 15u];
+        ::new (dst) json();
+        dst->m_type = e.type;
+        dst->m_storage = e.storage;
+        dst->m_value.boolean = e.bval;
+    }
+
     // Shallowly copies an m_storage == 4u container/scalar slot into sdoc->compat_cache
     // without incrementing SharedYyDoc refcount or deep-cloning nested subtrees; safe because
     // destroy_shared_doc tears down compat_cache before destroying sdoc->arena.
@@ -2667,11 +2718,6 @@ inline bool string_is_inline(const std::string& s) noexcept {
     return !lt(p, base) && lt(p, base + sizeof(std::string));
 }
 
-inline const std::string& empty_key_string_singleton() noexcept {
-    static const std::string kEmpty;
-    return kEmpty;
-}
-
 inline SharedString& empty_arena_string_singleton() noexcept {
     struct Holder {
         SharedString ss;
@@ -2682,6 +2728,136 @@ inline SharedString& empty_arena_string_singleton() noexcept {
     };
     static Holder h;
     return h.ss;
+}
+
+NEOJSON_ALWAYS_INLINE void copy_str_ge16(char* dst, const char* src,
+                                         const std::size_t len) noexcept {
+    if (len <= 32u) {
+        std::memcpy(dst, src, 16u);
+        std::memcpy(dst + len - 16u, src + len - 16u, 16u);
+        return;
+    }
+    if (len <= 64u) {
+        std::memcpy(dst, src, 16u);
+        std::memcpy(dst + 16u, src + 16u, 16u);
+        std::memcpy(dst + len - 32u, src + len - 32u, 16u);
+        std::memcpy(dst + len - 16u, src + len - 16u, 16u);
+        return;
+    }
+    std::memcpy(dst, src, len);
+}
+
+inline thread_local bool t_str_pool_init = false;
+inline thread_local bool t_str_pool_dead = false;
+
+struct ThreadStrPool {
+    static constexpr std::size_t kNumBuckets = 8u; // 32, 64, 128, 256, 512, 1024, 2048, 4096+
+    static constexpr std::array<std::uint32_t, kNumBuckets> kBucketCaps = {
+        1280u, 1024u, 768u, 512u, 768u, 768u, 512u, 64u};
+
+    struct BucketStack {
+        std::vector<std::string> slots;
+        std::uint32_t count = 0u;
+    };
+
+    std::array<BucketStack, kNumBuckets> buckets;
+    bool dead = false;
+
+    ThreadStrPool() noexcept {
+        t_str_pool_init = true;
+    }
+
+    ~ThreadStrPool() noexcept {
+        dead = true;
+        t_str_pool_dead = true;
+        for (auto& st : buckets) {
+            st.slots.clear();
+            st.slots.shrink_to_fit();
+            st.count = 0u;
+        }
+    }
+
+    static std::size_t bucket_for_len(const std::size_t len) noexcept {
+        if (len <= 32u) {
+            return 0u;
+        }
+#if defined(__GNUC__) || defined(__clang__)
+        const unsigned lg = 63u - static_cast<unsigned>(__builtin_clzll(len - 1u));
+        const std::size_t b = (lg >= 5u) ? static_cast<std::size_t>(lg - 4u) : 0u;
+        return (b < kNumBuckets) ? b : (kNumBuckets - 1u);
+#else
+        std::size_t b = 1u;
+        std::size_t cap = 64u;
+        while (b + 1u < kNumBuckets && cap < len) {
+            cap <<= 1u;
+            ++b;
+        }
+        return b;
+#endif
+    }
+
+    static std::size_t bucket_for_cap(const std::size_t cap) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+        const unsigned lg = 63u - static_cast<unsigned>(__builtin_clzll(cap));
+        const std::size_t b = (lg >= 5u) ? static_cast<std::size_t>(lg - 5u) : 0u;
+        return (b < kNumBuckets) ? b : (kNumBuckets - 1u);
+#else
+        std::size_t b = 0u;
+        std::size_t thr = 64u;
+        while (b + 1u < kNumBuckets && thr <= cap) {
+            thr <<= 1u;
+            ++b;
+        }
+        return b;
+#endif
+    }
+
+    NEOJSON_NOINLINE void acquire_into_cold(std::string& dst, const char* p, const std::size_t len) {
+        if (!dead && len >= 16u && len <= 4096u) {
+            dst.reserve(std::size_t{32u} << bucket_for_len(len));
+        }
+        dst.assign(p, len);
+    }
+
+    NEOJSON_NOINLINE static void assign_grow_cold(std::string& dst, const char* p,
+                                                  const std::size_t len) {
+        dst.assign(p, len);
+    }
+
+    void release(std::string& s) noexcept {
+        if (dead) {
+            return;
+        }
+        const std::size_t cap = s.capacity();
+        if (cap >= 32u && cap <= 8192u) {
+            const std::size_t b = bucket_for_cap(cap);
+            const std::uint32_t bcap = kBucketCaps[b];
+            BucketStack& st = buckets[b];
+            if (NEOJSON_UNLIKELY(st.slots.empty())) {
+                try {
+                    st.slots.resize(bcap);
+                } catch (...) {
+                    return;
+                }
+            }
+            if (NEOJSON_LIKELY(st.count < bcap)) {
+                st.slots[st.count++] = std::move(s);
+            }
+        }
+    }
+};
+
+inline ThreadStrPool& tls_str_pool() noexcept {
+    thread_local ThreadStrPool pool;
+    return pool;
+}
+
+inline ThreadStrPool* try_tls_str_pool_existing() noexcept {
+    return (t_str_pool_init && !t_str_pool_dead) ? &tls_str_pool() : nullptr;
+}
+
+inline ThreadStrPool* try_tls_str_pool() noexcept {
+    return !t_str_pool_dead ? &tls_str_pool() : nullptr;
 }
 
 struct HeapStrBlock {
@@ -2759,24 +2935,106 @@ struct DocArena {
         b->ptrs[b->count++] = s;
     }
 
-    const std::string* alloc_key_string_nonempty(const char* p, const std::size_t len) {
-        void* mem = alloc(sizeof(std::string));
-        auto* s = ::new (mem) std::string(p, len);
-        if (!string_is_inline(*s)) {
-            track_heap_string(s);
+    NEOJSON_ALWAYS_INLINE void track_heap_string_fast(std::string* s) {
+        HeapStrBlock* b = heap_str_head;
+        if (NEOJSON_LIKELY(b != nullptr && b->count < HeapStrBlock::kCap)) {
+            b->ptrs[b->count++] = s;
+            return;
         }
-        return s;
+        track_heap_string(s);
+    }
+
+    void construct_key_in_place(std::string* dst, const char* p, const std::size_t len,
+                                ThreadStrPool* pool) {
+        if (len == 0u) {
+            ::new (static_cast<void*>(dst)) std::string();
+            return;
+        }
+        if (len <= 15u) {
+            ::new (static_cast<void*>(dst)) std::string(p, len);
+#if !(defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1) && \
+    !defined(_LIBCPP_VERSION) && !defined(_MSVC_STL_VERSION)
+            if (!string_is_inline(*dst)) {
+                try {
+                    track_heap_string_fast(dst);
+                } catch (...) {
+                    using StringT = std::string;
+                    dst->~StringT();
+                    throw;
+                }
+            }
+#endif
+            return;
+        }
+        if (NEOJSON_LIKELY(pool != nullptr && !pool->dead && len <= 4096u)) {
+            const std::size_t b = ThreadStrPool::bucket_for_len(len);
+            auto& st = pool->buckets[b];
+            if (NEOJSON_LIKELY(st.count != 0u)) {
+                std::string& slot = st.slots[--st.count];
+                ::new (static_cast<void*>(dst)) std::string(std::move(slot));
+                try {
+                    const std::size_t cur_sz = dst->size();
+                    if (NEOJSON_LIKELY(len <= cur_sz)) {
+                        if (NEOJSON_UNLIKELY(len != cur_sz)) {
+                            dst->erase(len);
+                        }
+                        copy_str_ge16(dst->data(), p, len);
+                    } else {
+                        ThreadStrPool::assign_grow_cold(*dst, p, len);
+                    }
+#if defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1
+                    track_heap_string_fast(dst);
+#else
+                    if (!string_is_inline(*dst)) {
+                        track_heap_string_fast(dst);
+                    }
+#endif
+                } catch (...) {
+                    using StringT = std::string;
+                    dst->~StringT();
+                    throw;
+                }
+                return;
+            }
+        }
+        ::new (static_cast<void*>(dst)) std::string();
+        try {
+            if (pool != nullptr) {
+                pool->acquire_into_cold(*dst, p, len);
+            } else {
+                ThreadStrPool::assign_grow_cold(*dst, p, len);
+            }
+#if defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1
+            track_heap_string_fast(dst);
+#else
+            if (!string_is_inline(*dst)) {
+                track_heap_string_fast(dst);
+            }
+#endif
+        } catch (...) {
+            using StringT = std::string;
+            dst->~StringT();
+            throw;
+        }
     }
 
     void destroy_all() noexcept {
         using StringT = std::string;
         HeapStrBlock* b = heap_str_head;
         heap_str_head = nullptr;
+        ThreadStrPool* const pool = (b != nullptr) ? try_tls_str_pool_existing() : nullptr;
         while (b != nullptr) {
             HeapStrBlock* next = b->next;
             const std::uint32_t cnt = b->count;
-            for (std::uint32_t i = 0u; i < cnt; ++i) {
-                b->ptrs[i]->~StringT();
+            if (pool != nullptr && !pool->dead) {
+                for (std::uint32_t i = cnt; i-- > 0u;) {
+                    pool->release(*b->ptrs[i]);
+                    b->ptrs[i]->~StringT();
+                }
+            } else {
+                for (std::uint32_t i = cnt; i-- > 0u;) {
+                    b->ptrs[i]->~StringT();
+                }
             }
             b = next;
         }
@@ -2867,11 +3125,13 @@ inline void destroy_shared_doc(SharedYyDoc* sdoc) noexcept {
     }
     // 2. Free all DocArena heap strings and chunks back to ThreadLargeCache / OS.
     sdoc->arena.destroy_all();
-    // 3. Free yyjson document and SharedYyDoc slab object last.
+    // 3. Free yyjson document (if present) and SharedYyDoc slab object last.
     yyjson_doc* d = sdoc->doc;
     sdoc->~SharedYyDoc();
     tcache_free_fixed<sizeof(SharedYyDoc)>(sdoc);
-    yyjson_doc_free(d);
+    if (d != nullptr) {
+        yyjson_doc_free(d);
+    }
 }
 
 struct LazyNode : LazyHeader {
@@ -2886,7 +3146,7 @@ struct LazyNode : LazyHeader {
 
     LazyNode(SharedYyDoc* d, yyjson_val* v) noexcept
         : LazyHeader(), doc(d), val(v) {
-        raw_len = unsafe_yyjson_get_len(v);
+        raw_len = (v != nullptr) ? unsafe_yyjson_get_len(v) : 0u;
     }
 };
 static_assert(sizeof(LazyNode) <= 64u, "LazyNode should fit in small pooled slab");
@@ -2910,6 +3170,25 @@ struct SpinGuard {
     SpinGuard& operator=(const SpinGuard&) = delete;
 };
 
+struct U8SpinGuard {
+    std::atomic<std::uint8_t>& flag;
+    explicit U8SpinGuard(std::atomic<std::uint8_t>& f) noexcept : flag(f) {
+        std::uint32_t spins = 0u;
+        while (flag.exchange(1u, std::memory_order_acquire) != 0u) {
+            if (++spins < 64u) {
+                cpu_relax();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
+    ~U8SpinGuard() {
+        flag.store(0u, std::memory_order_release);
+    }
+    U8SpinGuard(const U8SpinGuard&) = delete;
+    U8SpinGuard& operator=(const U8SpinGuard&) = delete;
+};
+
 NEOJSON_NOINLINE bool check_large_object_unique_sorted(yyjson_val* obj, const std::size_t len) {
     std::vector<std::string_view> keys;
     keys.reserve(len);
@@ -2925,6 +3204,56 @@ NEOJSON_NOINLINE bool check_large_object_unique_sorted(yyjson_val* obj, const st
         }
     }
     return true;
+}
+
+NEOJSON_ALWAYS_INLINE std::uint64_t hash_bytes_seeded(const char* data, const std::size_t len,
+                                                      const std::uint64_t seed) noexcept {
+    std::uint64_t h = seed ^ (static_cast<std::uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
+    const auto* p = reinterpret_cast<const unsigned char*>(data);
+    if (len <= 16u) {
+        if (len >= 8u) {
+            std::uint64_t a = 0u;
+            std::uint64_t b = 0u;
+            std::memcpy(&a, p, 8u);
+            std::memcpy(&b, p + len - 8u, 8u);
+            h = (h ^ a) * 0xbf58476d1ce4e5b9ULL;
+            h = (rotl64(h, 27u) ^ b) * 0x94d049bb133111ebULL;
+            return fmix64(h);
+        }
+        if (len >= 4u) {
+            std::uint32_t a = 0u;
+            std::uint32_t b = 0u;
+            std::memcpy(&a, p, 4u);
+            std::memcpy(&b, p + len - 4u, 4u);
+            h ^= (static_cast<std::uint64_t>(a) << 32u) | b;
+            return fmix64(h);
+        }
+        if (len > 0u) {
+            const std::uint64_t v = (static_cast<std::uint64_t>(p[0]) << 16u) |
+                                    (static_cast<std::uint64_t>(p[len >> 1u]) << 8u) |
+                                    static_cast<std::uint64_t>(p[len - 1u]);
+            h ^= v * 0x9e3779b97f4a7c15ULL;
+            return fmix64(h);
+        }
+        return fmix64(h);
+    }
+    return hash_bytes_long(data, len, h);
+}
+
+// Precondition: len >= 16u. O(1) three-window hash for string-value interning and dup probing.
+NEOJSON_ALWAYS_INLINE std::uint64_t hash_str_sample(const char* p, const std::size_t len,
+                                                    const std::uint64_t seed) noexcept {
+    std::uint64_t a = 0u;
+    std::uint64_t b = 0u;
+    std::uint64_t c = 0u;
+    std::memcpy(&a, p, 8u);
+    std::memcpy(&b, p + (len >> 1u) - 4u, 8u);
+    std::memcpy(&c, p + len - 8u, 8u);
+    std::uint64_t h = seed ^ (static_cast<std::uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
+    h = (h ^ a) * 0xbf58476d1ce4e5b9ULL;
+    h = (rotl64(h, 27u) ^ b) * 0x94d049bb133111ebULL;
+    h = (rotl64(h, 31u) ^ c) * 0x9e3779b97f4a7c15ULL;
+    return fmix64(h);
 }
 
 struct DupProbeEntry {
@@ -2964,13 +3293,19 @@ struct DupProbeTable {
 
     bool check(yyjson_val* obj, const std::size_t len) {
         prepare(len);
+        std::uint64_t seed = g_hash_seed.load(std::memory_order_acquire);
+        if (seed == 0u) {
+            seed = hash_seed_slow();
+        }
         const std::size_t mask = slots.size() - 1u;
         yyjson_obj_iter iter = yyjson_obj_iter_with(obj);
         yyjson_val* key = nullptr;
         while ((key = yyjson_obj_iter_next(&iter)) != nullptr) {
             const char* kptr = unsafe_yyjson_get_str(key);
             const std::size_t klen = unsafe_yyjson_get_len(key);
-            const std::size_t h = hash_bytes(kptr, klen);
+            const std::size_t h = (klen >= 16u)
+                                      ? static_cast<std::size_t>(hash_str_sample(kptr, klen, seed))
+                                      : static_cast<std::size_t>(hash_bytes_seeded(kptr, klen, seed));
             std::size_t pos = h & mask;
             std::size_t probes = 0u;
             for (;;) {
@@ -2979,8 +3314,7 @@ struct DupProbeTable {
                     e = DupProbeEntry{h, kptr, klen, 0u, stamp};
                     break;
                 }
-                if (e.hash == h && e.len == klen &&
-                    (klen == 0u || std::memcmp(e.ptr, kptr, klen) == 0)) {
+                if (e.hash == h && e.len == klen && fast_memeq(e.ptr, kptr, klen)) {
                     return false;
                 }
                 if (++probes >= 64u) {
@@ -3333,9 +3667,11 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool 
     return obj;
 }
 
-inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
+inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root,
+                           const bool str_pool_padded_32 = false) {
     void* smem = tcache_alloc_fixed<sizeof(SharedYyDoc)>();
     auto* sdoc = ::new (smem) SharedYyDoc(doc_ref);
+    sdoc->str_pool_padded_32 = str_pool_padded_32;
     void* mem = nullptr;
     try {
         mem = tcache_alloc_fixed<sizeof(LazyNode)>();
@@ -3368,64 +3704,14 @@ inline bool is_yyjson_tree_unique(yyjson_val* root) {
     return true;
 }
 
-NEOJSON_ALWAYS_INLINE std::uint64_t hash_bytes_seeded(const char* data, const std::size_t len,
-                                                      const std::uint64_t seed) noexcept {
-    std::uint64_t h = seed ^ (static_cast<std::uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
-    const auto* p = reinterpret_cast<const unsigned char*>(data);
-    if (len <= 16u) {
-        if (len >= 8u) {
-            std::uint64_t a = 0u;
-            std::uint64_t b = 0u;
-            std::memcpy(&a, p, 8u);
-            std::memcpy(&b, p + len - 8u, 8u);
-            h = (h ^ a) * 0xbf58476d1ce4e5b9ULL;
-            h = (rotl64(h, 27u) ^ b) * 0x94d049bb133111ebULL;
-            return fmix64(h);
-        }
-        if (len >= 4u) {
-            std::uint32_t a = 0u;
-            std::uint32_t b = 0u;
-            std::memcpy(&a, p, 4u);
-            std::memcpy(&b, p + len - 4u, 4u);
-            h ^= (static_cast<std::uint64_t>(a) << 32u) | b;
-            return fmix64(h);
-        }
-        if (len > 0u) {
-            const std::uint64_t v = (static_cast<std::uint64_t>(p[0]) << 16u) |
-                                    (static_cast<std::uint64_t>(p[len >> 1u]) << 8u) |
-                                    static_cast<std::uint64_t>(p[len - 1u]);
-            h ^= v * 0x9e3779b97f4a7c15ULL;
-            return fmix64(h);
-        }
-        return fmix64(h);
-    }
-    return hash_bytes_long(data, len, h);
-}
-
-// Precondition: len >= 16u. O(1) three-window hash for string-value interning.
-NEOJSON_ALWAYS_INLINE std::uint64_t hash_str_sample(const char* p, const std::size_t len,
-                                                    const std::uint64_t seed) noexcept {
-    std::uint64_t a = 0u;
-    std::uint64_t b = 0u;
-    std::uint64_t c = 0u;
-    std::memcpy(&a, p, 8u);
-    std::memcpy(&b, p + (len >> 1u) - 4u, 8u);
-    std::memcpy(&c, p + len - 8u, 8u);
-    std::uint64_t h = seed ^ (static_cast<std::uint64_t>(len) * 0x9e3779b97f4a7c15ULL);
-    h = (h ^ a) * 0xbf58476d1ce4e5b9ULL;
-    h = (rotl64(h, 27u) ^ b) * 0x94d049bb133111ebULL;
-    h = (rotl64(h, 31u) ^ c) * 0x9e3779b97f4a7c15ULL;
-    return fmix64(h);
-}
-
 struct KeyInternSlot {
-    std::uint64_t hash = 0u;
-    const std::string* str = nullptr;
-    const char* data = nullptr;
-    std::size_t len = 0u;
+    const char* ptr = nullptr;
+    std::uint32_t hash32 = 0u;
     std::uint32_t doc_stamp = 0u;
+    std::uint32_t len = 0u;
     std::uint32_t key_id = 0u;
 };
+static_assert(sizeof(KeyInternSlot) == 24u, "KeyInternSlot must stay 24 bytes");
 
 struct KeySeenToken {
     std::uint64_t token = 0u;
@@ -3433,17 +3719,14 @@ struct KeySeenToken {
 };
 
 struct KeyInternTable {
+    static constexpr std::uint32_t kUnindexedKeyId = 0xFFFFFFFFu;
+
     std::vector<KeyInternSlot> slots;
     std::vector<KeySeenToken> seen;
     std::uint32_t doc_stamp = 1u;
     std::uint32_t obj_stamp = 1u;
     std::size_t used = 0u;
     std::uint32_t next_key_id = 1u;
-
-    struct Result {
-        const std::string* str;
-        std::uint32_t key_id;
-    };
 
     void begin_doc() {
         used = 0u;
@@ -3487,12 +3770,13 @@ struct KeyInternTable {
         return (static_cast<std::uint64_t>(doc_stamp) << 32u) | obj_stamp;
     }
 
-    NEOJSON_NOINLINE void rehash(const std::size_t new_cap) {
+    NEOJSON_NOINLINE void rehash(const std::size_t new_cap, const std::uint64_t seed) {
         std::vector<KeyInternSlot> fresh(new_cap, KeyInternSlot{});
         const std::size_t mask = new_cap - 1u;
         for (const KeyInternSlot& s : slots) {
             if (s.doc_stamp == doc_stamp) {
-                std::size_t pos = static_cast<std::size_t>(s.hash) & mask;
+                const std::uint64_t h = hash_bytes_seeded(s.ptr, s.len, seed);
+                std::size_t pos = static_cast<std::size_t>(h) & mask;
                 while (fresh[pos].doc_stamp == doc_stamp) {
                     pos = (pos + 1u) & mask;
                 }
@@ -3510,189 +3794,249 @@ struct KeyInternTable {
         seen.resize(new_sz, KeySeenToken{});
     }
 
-    NEOJSON_NOINLINE Result intern_miss(DocArena& arena, const char* kp, const std::size_t kl,
-                                        const std::uint64_t h) {
+    NEOJSON_NOINLINE std::uint32_t intern_miss(const char* kp, const std::size_t kl,
+                                             const std::uint64_t h, const std::uint64_t seed) {
         if ((used + 1u) * 2u >= slots.size()) {
-            rehash(slots.size() * 2u);
+            rehash(slots.size() * 2u, seed);
         }
         const std::size_t mask = slots.size() - 1u;
+        const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
         std::size_t pos = static_cast<std::size_t>(h) & mask;
         while (slots[pos].doc_stamp == doc_stamp) {
-            if (slots[pos].hash == h && slots[pos].len == kl &&
-                fast_memeq(slots[pos].data, kp, kl)) {
-                return Result{slots[pos].str, slots[pos].key_id};
+            if (slots[pos].hash32 == h32 && slots[pos].len == kl &&
+                fast_memeq(slots[pos].ptr, kp, kl)) {
+                return slots[pos].key_id;
             }
             pos = (pos + 1u) & mask;
         }
-        const std::string* inserted = arena.alloc_key_string_nonempty(kp, kl);
         const std::uint32_t id = next_key_id++;
+        if (NEOJSON_UNLIKELY(id == kUnindexedKeyId)) {
+            return kUnindexedKeyId;
+        }
         if (id >= seen.size()) {
             grow_seen(id);
         }
-        slots[pos] = KeyInternSlot{h, inserted, inserted->data(), kl, doc_stamp, id};
+        slots[pos] = KeyInternSlot{kp, h32, doc_stamp, static_cast<std::uint32_t>(kl), id};
         ++used;
-        return Result{inserted, id};
+        return id;
     }
 
-    NEOJSON_ALWAYS_INLINE Result intern(DocArena& arena, const char* kp, const std::size_t kl,
-                                        const std::string* const empty_key,
-                                        const std::uint64_t seed) {
+    NEOJSON_ALWAYS_INLINE std::uint32_t intern(const char* kp, const std::size_t kl,
+                                             const std::uint64_t seed) {
         if (kl == 0u) {
-            return Result{empty_key, 0u};
+            return 0u;
+        }
+        if (NEOJSON_UNLIKELY(kl > 0xFFFFFFFFu)) {
+            return kUnindexedKeyId;
         }
         const std::uint64_t h = hash_bytes_seeded(kp, kl, seed);
+        const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
         const std::size_t mask = slots.size() - 1u;
         std::size_t pos = static_cast<std::size_t>(h) & mask;
         for (;;) {
             const KeyInternSlot& s = slots[pos];
             if (s.doc_stamp != doc_stamp) {
-                return intern_miss(arena, kp, kl, h);
+                return intern_miss(kp, kl, h, seed);
             }
-            if (s.hash == h && s.len == kl && fast_memeq(s.data, kp, kl)) {
-                return Result{s.str, s.key_id};
+            if (s.hash32 == h32 && s.len == kl && fast_memeq(s.ptr, kp, kl)) {
+                return s.key_id;
             }
             pos = (pos + 1u) & mask;
         }
     }
 };
 
-inline SharedString* alloc_arena_string_direct(SharedYyDoc* sdoc, const char* p,
-                                               const std::size_t len) {
+NEOJSON_ALWAYS_INLINE SharedString* alloc_arena_string_direct_inline(
+    SharedYyDoc* sdoc, ThreadStrPool* pool, const char* p, const std::size_t len) {
+    assert(len >= 16u);
     void* mem = sdoc->arena.alloc(sizeof(SharedString));
-    auto* ss = ::new (mem) SharedString(p, len);
+    SharedString* ss = nullptr;
+    if (NEOJSON_LIKELY(pool != nullptr && !pool->dead && len <= 4096u)) {
+        const std::size_t b = ThreadStrPool::bucket_for_len(len);
+        auto& st = pool->buckets[b];
+        if (NEOJSON_LIKELY(st.count != 0u)) {
+            std::string& slot = st.slots[--st.count];
+            ss = ::new (mem) SharedString(std::move(slot));
+            ss->refcount.store(kArenaStringRef, std::memory_order_relaxed);
+            ss->owner_doc = sdoc;
+            try {
+                const std::size_t cur_sz = ss->value.size();
+                if (NEOJSON_LIKELY(len <= cur_sz)) {
+                    if (NEOJSON_UNLIKELY(len != cur_sz)) {
+                        ss->value.erase(len);
+                    }
+                    copy_str_ge16(ss->value.data(), p, len);
+                } else {
+                    ThreadStrPool::assign_grow_cold(ss->value, p, len);
+                }
+#if defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1
+                sdoc->arena.track_heap_string_fast(&ss->value);
+#else
+                if (!string_is_inline(ss->value)) {
+                    sdoc->arena.track_heap_string_fast(&ss->value);
+                }
+#endif
+            } catch (...) {
+                ss->~SharedString();
+                throw;
+            }
+            return ss;
+        }
+    }
+    ss = ::new (mem) SharedString();
     ss->refcount.store(kArenaStringRef, std::memory_order_relaxed);
     ss->owner_doc = sdoc;
-    if (!string_is_inline(ss->value)) {
-        sdoc->arena.track_heap_string(&ss->value);
+    try {
+        if (pool != nullptr) {
+            pool->acquire_into_cold(ss->value, p, len);
+        } else {
+            ThreadStrPool::assign_grow_cold(ss->value, p, len);
+        }
+#if defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1
+        sdoc->arena.track_heap_string_fast(&ss->value);
+#else
+        if (!string_is_inline(ss->value)) {
+            sdoc->arena.track_heap_string_fast(&ss->value);
+        }
+#endif
+    } catch (...) {
+        ss->~SharedString();
+        throw;
     }
     return ss;
 }
 
-struct StrValInternSlot {
-    std::uint32_t hash32 = 0u;
-    std::uint32_t doc_stamp = 0u;
+NEOJSON_NOINLINE SharedString* alloc_arena_string_direct(SharedYyDoc* sdoc, ThreadStrPool* pool,
+                                                       const char* p, const std::size_t len) {
+    return alloc_arena_string_direct_inline(sdoc, pool, p, len);
+}
+
+NEOJSON_ALWAYS_INLINE std::uint64_t hash_long_str_fast(
+    const std::uint64_t a, const std::uint64_t e, const std::size_t len) noexcept {
+    std::uint64_t h =
+        (a ^ (e * 0x9e3779b97f4a7c15ULL) ^ (static_cast<std::uint64_t>(len) << 48u)) *
+        0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 32u;
+    return h;
+}
+
+struct LongStrSlot {
     SharedString* ss = nullptr;
+    const char* raw_ptr = nullptr;
+    std::uint32_t hash32 = 0u;
+    std::uint32_t stamp_and_len = 0u;
 };
-static_assert(sizeof(StrValInternSlot) == 16u, "StrValInternSlot size");
+static_assert(sizeof(LongStrSlot) == 24u, "LongStrSlot must stay 24 bytes");
 
-struct StringValInternTable {
-    static constexpr std::size_t kInitCap = 8192u;
-    static constexpr std::size_t kMaxCap = 16384u;
-    static constexpr std::size_t kMaxProbes = 8u;
+struct alignas(64) LongStrSet {
+    LongStrSlot w[2]{};
+    std::uint8_t next_way = 0u;
+};
+static_assert(sizeof(LongStrSet) == 64u, "LongStrSet must stay 64 bytes");
 
-    std::vector<StrValInternSlot> slots;
-    std::uint32_t doc_stamp = 1u;
-    std::size_t used = 0u;
+struct LongStrInternCache {
+    static constexpr std::size_t kMaxSets = 4096u;
+    static constexpr std::size_t kMaxInternLen = 16384u;
+    static_assert(kMaxInternLen <= 65535u, "kMaxInternLen must fit in uint16_t");
 
-    NEOJSON_NOINLINE void begin_doc() {
-        used = 0u;
-        if (slots.empty() || slots.size() > kMaxCap) {
-            slots.assign(kInitCap, StrValInternSlot{});
-            doc_stamp = 1u;
-            return;
-        }
+    alignas(64) std::array<LongStrSet, kMaxSets> sets{};
+    std::size_t set_mask = 1023u;
+    std::uint16_t doc_stamp = 1u;
+
+    void begin_doc(const std::size_t dat_read) noexcept {
+        set_mask = (dat_read <= 1048576u) ? 1023u : 4095u;
         ++doc_stamp;
-        if (doc_stamp == 0u) {
-            std::fill(slots.begin(), slots.end(), StrValInternSlot{});
+        if (NEOJSON_UNLIKELY(doc_stamp == 0u)) {
+            sets.fill(LongStrSet{});
             doc_stamp = 1u;
         }
     }
+};
 
-    NEOJSON_NOINLINE void rehash(const std::size_t new_cap) {
-        std::vector<StrValInternSlot> fresh(new_cap, StrValInternSlot{});
-        const std::size_t mask = new_cap - 1u;
-        for (const StrValInternSlot& s : slots) {
-            if (s.doc_stamp == doc_stamp) {
-                const auto& sv = s.ss->value;
-                // Spread slots cleanly using pointer-length hash fallback to avoid storing 64-bit hash.
-                std::size_t pos = static_cast<std::size_t>(s.hash32 ^
-                                                           static_cast<std::uint32_t>(sv.size())) &
-                                  mask;
-                for (std::size_t probe = 0u; probe < kMaxProbes; ++probe) {
-                    if (fresh[pos].doc_stamp != doc_stamp) {
-                        fresh[pos] = s;
-                        break;
-                    }
-                    pos = (pos + 1u) & mask;
-                }
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+struct alignas(16) ShortMaskTable16 {
+    std::uint8_t row[16][16]{};
+    constexpr ShortMaskTable16() noexcept {
+        for (int n = 0; n < 16; ++n) {
+            for (int j = 0; j < n; ++j) {
+                row[n][j] = 0xFFu;
             }
         }
-        slots.swap(fresh);
-    }
-
-    SharedString* intern(SharedYyDoc* sdoc, const char* p, const std::size_t len,
-                         const std::uint64_t seed) {
-        const std::uint64_t h = hash_str_sample(p, len, seed);
-        const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
-        std::size_t mask = slots.size() - 1u;
-        std::size_t pos =
-            static_cast<std::size_t>(h32 ^ static_cast<std::uint32_t>(len)) & mask;
-        bool rehashed = false;
-        for (std::size_t probe = 0u; probe < kMaxProbes;) {
-            StrValInternSlot& s = slots[pos];
-            if (s.doc_stamp != doc_stamp) {
-                if ((used + 1u) * 2u >= slots.size()) {
-                    if (slots.size() < kMaxCap && !rehashed) {
-                        rehash(slots.size() * 2u);
-                        mask = slots.size() - 1u;
-                        pos = static_cast<std::size_t>(
-                                  h32 ^ static_cast<std::uint32_t>(len)) &
-                              mask;
-                        rehashed = true;
-                        probe = 0u;
-                        continue;
-                    }
-                    return alloc_arena_string_direct(sdoc, p, len);
-                }
-                SharedString* ss = alloc_arena_string_direct(sdoc, p, len);
-                s = StrValInternSlot{h32, doc_stamp, ss};
-                ++used;
-                return ss;
-            }
-            if (s.hash32 == h32 && s.ss->value.size() == len &&
-                fast_memeq(s.ss->value.data(), p, len)) {
-                return s.ss;
-            }
-            pos = (pos + 1u) & mask;
-            ++probe;
-        }
-        return alloc_arena_string_direct(sdoc, p, len);
     }
 };
+static constexpr ShortMaskTable16 kShortMask16{};
+#endif
+
+struct alignas(32) ShortStrSlot {
+    std::uint64_t w0 = 0u;
+    std::uint64_t w1 = 0u;
+    SharedString* ss = nullptr;
+    std::uint64_t stamp_and_len = 0u;
+};
+static_assert(sizeof(ShortStrSlot) == 32u, "ShortStrSlot must stay 32 bytes");
+
+struct ShortStrInternCache {
+    static constexpr std::size_t kMaxSlots = 4096u;
+
+    alignas(64) std::array<ShortStrSlot, kMaxSlots> slots{};
+    std::size_t slot_mask = 1023u;
+    std::uint32_t doc_stamp = 1u;
+
+    void begin_doc(const std::size_t dat_read) noexcept {
+        slot_mask = (dat_read <= 1048576u) ? 1023u : 4095u;
+        ++doc_stamp;
+        if (NEOJSON_UNLIKELY(doc_stamp == 0u)) {
+            slots.fill(ShortStrSlot{});
+            doc_stamp = 1u;
+        }
+    }
+};
+
+inline constexpr std::size_t kMaxDirectDfsDepth = 32u;
 
 struct ArenaWorkItem {
     yyjson_val* yy_ctn;
     json* dst_slot;
 };
 
-struct ShapeKeyRef {
-    const char* data;
-    std::size_t len;
+struct ShapeKeyDesc {
+    std::uint32_t byte_off = 0u;
+    std::uint16_t len = 0u;
+    std::uint16_t mask16 = 0u;
 };
+static_assert(sizeof(ShapeKeyDesc) == 8u, "ShapeKeyDesc must stay 8 bytes");
 
 struct ShapeEntry {
     std::uint32_t doc_stamp = 0u;
     std::uint32_t count = 0u;
-    std::uint32_t pool_off = 0u;
-    std::uint32_t key0_len = 0u;
-    const char* key0_data = nullptr;
-    const std::string* const* keys = nullptr;
+    std::uint32_t descs_off = 0u;
+    std::uint16_t key0_len = 0u;
+    std::uint16_t max_key_len = 0u;
+    std::uint64_t key0_w0 = 0u;
+    const std::string* keys = nullptr;
 };
+static_assert(sizeof(ShapeEntry) == 32u, "ShapeEntry must stay 32 bytes");
 
 struct ArenaShapeCache {
     static constexpr std::size_t kNumSets = 32u;
+    static constexpr std::size_t kWays = 4u;
     static constexpr std::size_t kMaxCachedObjKeys = 64u;
 
-    std::array<ShapeEntry, kNumSets * 2u> entries{};
+    std::array<ShapeEntry, kNumSets * kWays> entries{};
     std::array<std::uint8_t, kNumSets> next_way{};
-    std::vector<ShapeKeyRef> key_pool;
+    std::vector<char> key_bytes;
+    std::size_t key_bytes_len = 0u;
+    std::vector<ShapeKeyDesc> key_descs;
     std::uint32_t doc_stamp = 1u;
 
     void begin_doc() {
-        key_pool.clear();
+        key_bytes.clear();
+        key_bytes_len = 0u;
+        key_descs.clear();
         ++doc_stamp;
-        if (doc_stamp == 0u) {
+        if (NEOJSON_UNLIKELY(doc_stamp == 0u)) {
             entries.fill(ShapeEntry{});
+            next_way.fill(0u);
             doc_stamp = 1u;
         }
     }
@@ -3708,29 +4052,73 @@ struct ArenaShapeCache {
         return static_cast<std::size_t>((sh ^ (sh >> 8u)) & (kNumSets - 1u));
     }
 
-    NEOJSON_NOINLINE void record(const std::size_t len, const std::string* const* dst_keys) {
-        const std::size_t l0 = dst_keys[0]->size();
-        const char* p0 = dst_keys[0]->data();
-        const std::size_t set_idx = compute_set(len, p0, l0);
-        const std::size_t base = set_idx * 2u;
-        std::size_t slot_idx = base;
-        if (entries[base].doc_stamp != doc_stamp) {
-            slot_idx = base;
-        } else if (entries[base + 1u].doc_stamp != doc_stamp) {
-            slot_idx = base + 1u;
-        } else {
-            slot_idx = base + (next_way[set_idx]++ & 1u);
-        }
-        const auto off = static_cast<std::uint32_t>(key_pool.size());
+    NEOJSON_NOINLINE void record(const std::size_t len, const std::string* dst_keys) {
+        std::size_t total_bytes = 0u;
+        std::size_t max_kl = 0u;
         for (std::size_t i = 0u; i < len; ++i) {
-            key_pool.push_back(ShapeKeyRef{dst_keys[i]->data(), dst_keys[i]->size()});
+            const std::size_t kl = dst_keys[i].size();
+            if (NEOJSON_UNLIKELY(kl > 65535u)) {
+                return;
+            }
+            if (kl > max_kl) {
+                max_kl = kl;
+            }
+            total_bytes += kl;
         }
+        if (NEOJSON_UNLIKELY(key_descs.size() + len > 0xFFFFFFFFu ||
+                             key_bytes_len + total_bytes + 32u > 0xFFFFFFFFu)) {
+            return;
+        }
+        if (key_descs.capacity() < 512u) {
+            key_descs.reserve(512u);
+        }
+        if (key_bytes.capacity() < 4096u) {
+            key_bytes.reserve(4096u);
+        }
+        const std::size_t l0 = dst_keys[0].size();
+        const char* const p0 = dst_keys[0].data();
+        std::uint64_t k0_w0 = 0u;
+        const std::size_t k0_copy = (l0 >= 8u) ? 8u : l0;
+        if (k0_copy > 0u) {
+            std::memcpy(&k0_w0, p0, k0_copy);
+        }
+        const std::size_t set_idx = compute_set(len, p0, l0);
+        const std::size_t base = set_idx * kWays;
+        std::size_t slot_idx = base;
+        bool found_free = false;
+        for (std::size_t w = 0u; w < kWays; ++w) {
+            if (entries[base + w].doc_stamp != doc_stamp) {
+                slot_idx = base + w;
+                found_free = true;
+                break;
+            }
+        }
+        if (!found_free) {
+            slot_idx = base + (next_way[set_idx]++ & (kWays - 1u));
+        }
+        key_bytes.resize(key_bytes_len);
+        const auto d_off = static_cast<std::uint32_t>(key_descs.size());
+        for (std::size_t i = 0u; i < len; ++i) {
+            const std::string& kstr = dst_keys[i];
+            const std::size_t kl = kstr.size();
+            const std::uint16_t mask16 =
+                static_cast<std::uint16_t>((kl >= 16u) ? 0xFFFFu : ((1u << kl) - 1u));
+            key_descs.push_back(ShapeKeyDesc{
+                static_cast<std::uint32_t>(key_bytes.size()),
+                static_cast<std::uint16_t>(kl),
+                mask16,
+            });
+            key_bytes.insert(key_bytes.end(), kstr.data(), kstr.data() + kl);
+        }
+        key_bytes_len = key_bytes.size();
+        key_bytes.resize(key_bytes_len + 32u, '\0');
         entries[slot_idx] = ShapeEntry{
             doc_stamp,
             static_cast<std::uint32_t>(len),
-            off,
-            static_cast<std::uint32_t>(l0),
-            p0,
+            d_off,
+            static_cast<std::uint16_t>(l0),
+            static_cast<std::uint16_t>(max_kl),
+            k0_w0,
             dst_keys,
         };
     }
@@ -3738,132 +4126,258 @@ struct ArenaShapeCache {
 
 struct ArenaMaterializeScratch {
     std::vector<ArenaWorkItem> workstack;
-    std::vector<const std::string*> tmp_keys;
-    std::vector<yyjson_val*> tmp_vals;
     ArenaShapeCache shape_cache;
+    yyjson_val* dfs_vals[kMaxDirectDfsDepth + 1u][ArenaShapeCache::kMaxCachedObjKeys];
+    std::uint8_t dfs_slot_idx[kMaxDirectDfsDepth + 1u][ArenaShapeCache::kMaxCachedObjKeys];
 };
 
-inline KeyInternTable& tls_key_intern_table() {
-    thread_local KeyInternTable t;
-    return t;
+struct ArenaMatTLS {
+    KeyInternTable key_intern;
+    LongStrInternCache long_cache;
+    ShortStrInternCache short_cache;
+    ArenaMaterializeScratch scratch;
+};
+
+inline ArenaMatTLS& tls_arena_mat() {
+    thread_local std::unique_ptr<ArenaMatTLS> tls;
+    if (NEOJSON_UNLIKELY(tls == nullptr)) {
+        tls = std::make_unique<ArenaMatTLS>();
+    }
+    return *tls;
 }
 
-inline StringValInternTable& tls_str_val_intern_table() {
-    thread_local StringValInternTable t;
-    return t;
-}
+struct ArenaMatCtx {
+    SharedYyDoc* sdoc;
+    KeyInternTable& intern;
+    ArenaMaterializeScratch& scratch;
+    SharedString* empty_str;
+    LongStrInternCache& long_cache;
+    ShortStrInternCache& short_cache;
+    ThreadStrPool* str_pool;
+    std::uint64_t seed;
+    std::size_t dat_read;
+    std::size_t depth = 0u;
+    bool str_pool_padded_32 = false;
+    bool saw_dup = false;
+};
 
-inline ArenaMaterializeScratch& tls_arena_materialize_scratch() {
-    thread_local ArenaMaterializeScratch s;
-    return s;
-}
+struct MatDepthGuard {
+    std::size_t& d;
+    explicit MatDepthGuard(std::size_t& v) noexcept : d(v) {
+        ++d;
+    }
+    ~MatDepthGuard() noexcept {
+        --d;
+    }
+    MatDepthGuard(const MatDepthGuard&) = delete;
+    MatDepthGuard& operator=(const MatDepthGuard&) = delete;
+};
 
-NEOJSON_ALWAYS_INLINE SharedString* alloc_arena_string_short(SharedYyDoc* sdoc, const char* p,
-                                                           const std::size_t len) {
+NEOJSON_NOINLINE SharedString* alloc_arena_string_short_miss(
+    SharedYyDoc* sdoc, const char* p, const std::size_t len, ShortStrSlot& slot,
+    const std::uint64_t w0, const std::uint64_t w1, const std::uint64_t stamp_and_len) {
+    const std::size_t n = (len <= 15u) ? len : 0u;
     void* mem = sdoc->arena.alloc(sizeof(SharedString));
-    auto* ss = ::new (mem) SharedString(p, len);
+    auto* ss = ::new (mem) SharedString(p, n);
     ss->refcount.store(kArenaStringRef, std::memory_order_relaxed);
     ss->owner_doc = sdoc;
 #if !(defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1) && \
     !defined(_LIBCPP_VERSION) && !defined(_MSVC_STL_VERSION)
     if (!string_is_inline(ss->value)) {
-        sdoc->arena.track_heap_string(&ss->value);
+        sdoc->arena.track_heap_string_fast(&ss->value);
     }
 #endif
+    slot = ShortStrSlot{w0, w1, ss, stamp_and_len};
     return ss;
 }
 
-NEOJSON_NOINLINE SharedString* alloc_arena_string_long(SharedYyDoc* sdoc, const char* p,
-                                                       const std::size_t len,
-                                                       StringValInternTable& str_intern,
-                                                       bool& str_intern_started,
-                                                       const std::uint64_t seed) {
-    if (len <= 16384u) {
-        if (!str_intern_started) {
-            str_intern.begin_doc();
-            str_intern_started = true;
-        }
-        return str_intern.intern(sdoc, p, len, seed);
+NEOJSON_NOINLINE SharedString* alloc_arena_string_short(ArenaMatCtx& ctx, const char* p,
+                                                        const std::size_t len) {
+    assert(len >= 1u && len <= 15u);
+    std::uint64_t w0 = 0u;
+    std::uint64_t w1 = 0u;
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+    if (NEOJSON_LIKELY(ctx.str_pool_padded_32)) {
+        const __m128i v = _mm_and_si128(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)),
+            _mm_load_si128(reinterpret_cast<const __m128i*>(kShortMask16.row[len & 15u])));
+        w0 = static_cast<std::uint64_t>(_mm_cvtsi128_si64(v));
+        w1 = static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(v, 8)));
+    } else
+#endif
+    {
+        std::uint64_t buf[2] = {0u, 0u};
+        std::memcpy(buf, p, len);
+        w0 = buf[0];
+        w1 = buf[1];
     }
-    return alloc_arena_string_direct(sdoc, p, len);
+    const std::uint64_t h =
+        (w0 ^ (w1 * 0x9e3779b97f4a7c15ULL) ^ (static_cast<std::uint64_t>(len) << 48u)) *
+        0xbf58476d1ce4e5b9ULL;
+    ShortStrInternCache& sc = ctx.short_cache;
+    ShortStrSlot& slot = sc.slots[static_cast<std::size_t>(h >> 32u) & sc.slot_mask];
+    const std::uint64_t expected_sl =
+        (static_cast<std::uint64_t>(sc.doc_stamp) << 8u) | static_cast<std::uint64_t>(len);
+    if (slot.stamp_and_len == expected_sl && slot.w0 == w0 && slot.w1 == w1) {
+        return slot.ss;
+    }
+    return alloc_arena_string_short_miss(ctx.sdoc, p, len, slot, w0, w1, expected_sl);
 }
 
-NEOJSON_ALWAYS_INLINE void construct_arena_scalar(json* dst, SharedYyDoc* sdoc, yyjson_val* val,
-                                                  SharedString* const empty_str,
-                                                  StringValInternTable& str_intern,
-                                                  bool& str_intern_started,
-                                                  const std::uint64_t seed) {
-    switch (yyjson_get_tag(val)) {
-        case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
-            json_access::init_arena_null(dst);
-            return;
+NEOJSON_ALWAYS_INLINE bool long_str_eq_after_ae(const char* a_ptr, const char* b_ptr,
+                                                 const std::size_t len,
+                                                 const std::uint64_t b_first8,
+                                                 const std::uint64_t b_last8) noexcept {
+    assert(len >= 16u);
+    std::uint64_t af = 0u;
+    std::uint64_t al = 0u;
+    std::memcpy(&af, a_ptr, 8u);
+    std::memcpy(&al, a_ptr + len - 8u, 8u);
+    if (((af ^ b_first8) | (al ^ b_last8)) != 0u) {
+        return false;
+    }
+    if (len <= 16u) {
+        return true;
+    }
+    if (len <= 32u) {
+        std::uint64_t a1 = 0u, b1 = 0u, a2 = 0u, b2 = 0u;
+        std::memcpy(&a1, a_ptr + 8u, 8u);
+        std::memcpy(&b1, b_ptr + 8u, 8u);
+        std::memcpy(&a2, a_ptr + len - 16u, 8u);
+        std::memcpy(&b2, b_ptr + len - 16u, 8u);
+        return ((a1 ^ b1) | (a2 ^ b2)) == 0u;
+    }
+    if (len <= 48u) {
+        std::uint64_t a1 = 0u, b1 = 0u, a2 = 0u, b2 = 0u;
+        std::uint64_t a3 = 0u, b3 = 0u, a4 = 0u, b4 = 0u;
+        std::memcpy(&a1, a_ptr + 8u, 8u);
+        std::memcpy(&b1, b_ptr + 8u, 8u);
+        std::memcpy(&a2, a_ptr + 16u, 8u);
+        std::memcpy(&b2, b_ptr + 16u, 8u);
+        std::memcpy(&a3, a_ptr + len - 24u, 8u);
+        std::memcpy(&b3, b_ptr + len - 24u, 8u);
+        std::memcpy(&a4, a_ptr + len - 16u, 8u);
+        std::memcpy(&b4, b_ptr + len - 16u, 8u);
+        return ((a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3) | (a4 ^ b4)) == 0u;
+    }
+    return std::memcmp(a_ptr + 8u, b_ptr + 8u, len - 16u) == 0;
+}
 
-        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
-            json_access::init_arena_bool(dst, true);
-            return;
+NEOJSON_NOINLINE SharedString* alloc_arena_string_long_miss(ArenaMatCtx& ctx, const char* p,
+                                                            const std::size_t len,
+                                                            LongStrSlot& slot,
+                                                            const std::uint32_t h32,
+                                                            const std::uint32_t stamp_and_len) {
+    SharedString* ss = alloc_arena_string_direct_inline(ctx.sdoc, ctx.str_pool, p, len);
+    slot = LongStrSlot{ss, p, h32, stamp_and_len};
+    return ss;
+}
 
-        case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
-            json_access::init_arena_bool(dst, false);
-            return;
+NEOJSON_NOINLINE SharedString* alloc_arena_string_long(ArenaMatCtx& ctx, const char* p,
+                                                       const std::size_t len) {
+    if (NEOJSON_UNLIKELY(len > LongStrInternCache::kMaxInternLen)) {
+        return alloc_arena_string_direct(ctx.sdoc, ctx.str_pool, p, len);
+    }
+    std::uint64_t a = 0u;
+    std::uint64_t e = 0u;
+    std::memcpy(&a, p, 8u);
+    std::memcpy(&e, p + len - 8u, 8u);
+    const std::uint64_t h = hash_long_str_fast(a, e, len);
+    const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+    LongStrInternCache& lc = ctx.long_cache;
+    LongStrSet& set = lc.sets[static_cast<std::size_t>(h) & lc.set_mask];
+    const std::uint32_t expected_sl =
+        (static_cast<std::uint32_t>(lc.doc_stamp) << 16u) | static_cast<std::uint32_t>(len);
+    if (set.w[0].stamp_and_len == expected_sl && set.w[0].hash32 == h32 &&
+        long_str_eq_after_ae(set.w[0].raw_ptr, p, len, a, e)) {
+        return set.w[0].ss;
+    }
+    if (set.w[1].stamp_and_len == expected_sl && set.w[1].hash32 == h32 &&
+        long_str_eq_after_ae(set.w[1].raw_ptr, p, len, a, e)) {
+        return set.w[1].ss;
+    }
+    LongStrSlot* victim = nullptr;
+    if ((set.w[0].stamp_and_len >> 16u) != lc.doc_stamp) {
+        victim = &set.w[0];
+    } else if ((set.w[1].stamp_and_len >> 16u) != lc.doc_stamp) {
+        victim = &set.w[1];
+    } else {
+        victim = &set.w[set.next_way++ & 1u];
+    }
+    return alloc_arena_string_long_miss(ctx, p, len, *victim, h32, expected_sl);
+}
 
-        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+NEOJSON_ALWAYS_INLINE bool is_non_str_leaf_yyval(const yyjson_val* v) noexcept {
+    return !unsafe_yyjson_is_str(v) && (!yyjson_is_ctn(v) || unsafe_yyjson_get_len(v) == 0u);
+}
+
+NEOJSON_ALWAYS_INLINE void init_arena_non_str_leaf(json* dst, yyjson_val* val) noexcept {
+    const std::uint8_t tag = yyjson_get_tag(val);
+    if ((tag & YYJSON_TYPE_MASK) == YYJSON_TYPE_NUM) {
+        if (tag == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT)) {
             json_access::init_arena_uint(
                 dst, static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(val)));
-            return;
-
-        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
-            json_access::init_arena_sint(
-                dst, static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
-            return;
-
-        case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+        } else if (tag == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
             json_access::init_arena_real(
                 dst, static_cast<json::number_float_t>(unsafe_yyjson_get_real(val)));
-            return;
-
-        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
-        case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
-            const std::size_t kl = unsafe_yyjson_get_len(val);
-            if (kl == 0u) {
-                json_access::init_arena_string(dst, empty_str);
-                return;
-            }
-            const char* kp = unsafe_yyjson_get_str(val);
-            SharedString* ss =
-                (kl <= 15u)
-                    ? alloc_arena_string_short(sdoc, kp, kl)
-                    : alloc_arena_string_long(sdoc, kp, kl, str_intern, str_intern_started, seed);
-            json_access::init_arena_string(dst, ss);
-            return;
+        } else {
+            json_access::init_arena_sint(
+                dst, static_cast<json::number_integer_t>(unsafe_yyjson_get_sint(val)));
         }
-
-        default:
-            json_access::init_arena_null(dst);
-            return;
+        return;
     }
+    json_access::init_arena_const_leaf(dst, tag);
 }
 
-NEOJSON_ALWAYS_INLINE ArenaArray* try_build_inline_leaf_arena_array(SharedYyDoc* sdoc,
-                                                                      yyjson_val* val,
-                                                                      const std::size_t len,
-                                                                      SharedString* const empty_str,
-                                                                      StringValInternTable& str_intern,
-                                                                      bool& str_intern_started,
-                                                                      const std::uint64_t seed) {
+NEOJSON_ALWAYS_INLINE void construct_arena_leaf(ArenaMatCtx& ctx, json* dst, yyjson_val* val) {
+    if (unsafe_yyjson_is_str(val)) {
+        const std::size_t kl = unsafe_yyjson_get_len(val);
+        if (kl == 0u) {
+            json_access::init_arena_string(dst, ctx.empty_str);
+            return;
+        }
+        const char* kp = unsafe_yyjson_get_str(val);
+        SharedString* ss = (kl <= 15u) ? alloc_arena_string_short(ctx, kp, kl)
+                                       : alloc_arena_string_long(ctx, kp, kl);
+        json_access::init_arena_string(dst, ss);
+        return;
+    }
+    init_arena_non_str_leaf(dst, val);
+}
+
+NEOJSON_ALWAYS_INLINE void construct_arena_scalar(ArenaMatCtx& ctx, json* dst, yyjson_val* val) {
+    construct_arena_leaf(ctx, dst, val);
+}
+
+NEOJSON_NOINLINE ArenaArray* try_build_inline_leaf_arena_array(ArenaMatCtx& ctx, yyjson_val* val,
+                                                               const std::size_t len) {
     if (len == 2u) {
         yyjson_val* e0 = unsafe_yyjson_get_first(val);
         yyjson_val* e1 = e0 + 1u;
         if (yyjson_get_tag(e0) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL) &&
             yyjson_get_tag(e1) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
-            void* mem = sdoc->arena.alloc(sizeof(ArenaArray) + 2u * sizeof(json));
+            void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaArray) + 2u * sizeof(json));
             auto* aa = ::new (mem) ArenaArray();
             aa->count = 2u;
-            aa->doc = sdoc;
+            aa->doc = ctx.sdoc;
             json* out = aa->elems();
-            json_access::init_arena_real(&out[0],
-                                         static_cast<json::number_float_t>(unsafe_yyjson_get_real(e0)));
-            json_access::init_arena_real(&out[1],
-                                         static_cast<json::number_float_t>(unsafe_yyjson_get_real(e1)));
+            json_access::init_arena_real(
+                &out[0], static_cast<json::number_float_t>(unsafe_yyjson_get_real(e0)));
+            json_access::init_arena_real(
+                &out[1], static_cast<json::number_float_t>(unsafe_yyjson_get_real(e1)));
+            return aa;
+        }
+        if (yyjson_get_tag(e0) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT) &&
+            yyjson_get_tag(e1) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT)) {
+            void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaArray) + 2u * sizeof(json));
+            auto* aa = ::new (mem) ArenaArray();
+            aa->count = 2u;
+            aa->doc = ctx.sdoc;
+            json* out = aa->elems();
+            json_access::init_arena_uint(
+                &out[0], static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(e0)));
+            json_access::init_arena_uint(
+                &out[1], static_cast<json::number_unsigned_t>(unsafe_yyjson_get_uint(e1)));
             return aa;
         }
         if (yyjson_is_ctn(e0)) {
@@ -3873,34 +4387,164 @@ NEOJSON_ALWAYS_INLINE ArenaArray* try_build_inline_leaf_arena_array(SharedYyDoc*
         if (yyjson_is_ctn(e1)) {
             return nullptr;
         }
-        void* mem = sdoc->arena.alloc(sizeof(ArenaArray) + 2u * sizeof(json));
+        void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaArray) + 2u * sizeof(json));
         auto* aa = ::new (mem) ArenaArray();
         aa->count = 2u;
-        aa->doc = sdoc;
+        aa->doc = ctx.sdoc;
         json* out = aa->elems();
-        construct_arena_scalar(&out[0], sdoc, e0, empty_str, str_intern, str_intern_started, seed);
-        construct_arena_scalar(&out[1], sdoc, e1, empty_str, str_intern, str_intern_started, seed);
+        construct_arena_scalar(ctx, &out[0], e0);
+        construct_arena_scalar(ctx, &out[1], e1);
         return aa;
     }
     yyjson_val* e0 = unsafe_yyjson_get_first(val);
     if (yyjson_is_ctn(e0)) {
         return nullptr;
     }
-    void* mem = sdoc->arena.alloc(sizeof(ArenaArray) + sizeof(json));
+    void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaArray) + sizeof(json));
     auto* aa = ::new (mem) ArenaArray();
     aa->count = 1u;
-    aa->doc = sdoc;
-    construct_arena_scalar(aa->elems(), sdoc, e0, empty_str, str_intern, str_intern_started, seed);
+    aa->doc = ctx.sdoc;
+    construct_arena_scalar(ctx, aa->elems(), e0);
     return aa;
 }
 
-NEOJSON_ALWAYS_INLINE void init_arena_slot(json* dst, SharedYyDoc* sdoc, yyjson_val* cv,
-                                           std::vector<ArenaWorkItem>& workstack,
-                                           SharedString* const empty_str,
-                                           StringValInternTable& str_intern,
-                                           bool& str_intern_started, const std::uint64_t seed) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+alignas(64) static constexpr std::uint64_t kU64LenMask[9] = {
+    0x0000000000000000ULL, 0x00000000000000FFULL, 0x000000000000FFFFULL,
+    0x0000000000FFFFFFULL, 0x00000000FFFFFFFFULL, 0x000000FFFFFFFFFFULL,
+    0x0000FFFFFFFFFFFFULL, 0x00FFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+};
+#endif
+
+NEOJSON_ALWAYS_INLINE std::uint64_t load_key0_w0(const bool padded32, const char* p,
+                                                 const std::size_t n) noexcept {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (NEOJSON_LIKELY(padded32)) {
+        std::uint64_t w = 0u;
+        std::memcpy(&w, p, 8u);
+        return w & kU64LenMask[(n >= 8u) ? 8u : n];
+    }
+#else
+    (void)padded32;
+#endif
+    std::uint64_t w = 0u;
+    const std::size_t k = (n >= 8u) ? 8u : n;
+    if (k > 0u) {
+        std::memcpy(&w, p, k);
+    }
+    return w;
+}
+
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+alignas(64) static constexpr std::uint32_t kKeyLenMask32[33] = {
+    0x00000000u, 0x00000001u, 0x00000003u, 0x00000007u, 0x0000000Fu, 0x0000001Fu, 0x0000003Fu,
+    0x0000007Fu, 0x000000FFu, 0x000001FFu, 0x000003FFu, 0x000007FFu, 0x00000FFFu, 0x00001FFFu,
+    0x00003FFFu, 0x00007FFFu, 0x0000FFFFu, 0x0001FFFFu, 0x0003FFFFu, 0x0007FFFFu, 0x000FFFFFu,
+    0x001FFFFFu, 0x003FFFFFu, 0x007FFFFFu, 0x00FFFFFFu, 0x01FFFFFFu, 0x03FFFFFFu, 0x07FFFFFFu,
+    0x0FFFFFFFu, 0x1FFFFFFFu, 0x3FFFFFFFu, 0x7FFFFFFFu, 0xFFFFFFFFu,
+};
+
+NEOJSON_ALWAYS_INLINE bool shape_key_eq_padded32(const char* a, const char* b,
+                                                 const std::size_t n) noexcept {
+    assert(n <= 32u);
+    const __m128i va0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a));
+    const __m128i vb0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b));
+    const __m128i va1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 16u));
+    const __m128i vb1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 16u));
+    const std::uint32_t eq0 =
+        static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(va0, vb0)));
+    const std::uint32_t eq1 =
+        static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(va1, vb1)));
+    const std::uint32_t eq = eq0 | (eq1 << 16u);
+    return ((~eq) & kKeyLenMask32[n]) == 0u;
+}
+#endif
+
+NEOJSON_NOINLINE bool shape_key_eq_slow(const char* a, const char* b,
+                                        const std::size_t n) noexcept {
+    return fast_memeq(a, b, n);
+}
+
+NEOJSON_ALWAYS_INLINE bool shape_key_eq_ctx(const bool padded32, const char* yy_s,
+                                            const char* shape_s, const std::size_t n) noexcept {
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+    if (NEOJSON_LIKELY(padded32 && n <= 32u)) {
+        return shape_key_eq_padded32(yy_s, shape_s, n);
+    }
+#else
+    (void)padded32;
+#endif
+    return shape_key_eq_slow(yy_s, shape_s, n);
+}
+
+NEOJSON_ALWAYS_INLINE bool shape_key_eq_desc(const bool padded32, const char* yy_s,
+                                             const std::size_t yy_len, const char* key_bytes,
+                                             const ShapeKeyDesc d) noexcept {
+    if (NEOJSON_UNLIKELY(yy_len != d.len)) {
+        return false;
+    }
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+    if (NEOJSON_LIKELY(padded32)) {
+        const char* const shape_s = key_bytes + d.byte_off;
+        const __m128i va0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yy_s));
+        const __m128i vb0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shape_s));
+        const std::uint32_t eq0 =
+            static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(va0, vb0)));
+        if (NEOJSON_UNLIKELY(((~eq0) & d.mask16) != 0u)) {
+            return false;
+        }
+        if (NEOJSON_LIKELY(d.len <= 16u)) {
+            return true;
+        }
+        if (NEOJSON_LIKELY(d.len <= 32u)) {
+            const __m128i va1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yy_s + 16u));
+            const __m128i vb1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shape_s + 16u));
+            const std::uint32_t eq1 =
+                static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(va1, vb1)));
+            return ((~eq1) & kKeyLenMask32[d.len - 16u]) == 0u;
+        }
+        return shape_key_eq_slow(yy_s + 16u, shape_s + 16u, d.len - 16u);
+    }
+#else
+    (void)padded32;
+#endif
+    return shape_key_eq_slow(yy_s, key_bytes + d.byte_off, d.len);
+}
+
+struct ShapeBuildRes {
+    ArenaObject* ao = nullptr;
+    ShapeEntry se{};
+};
+
+NEOJSON_NOINLINE ArenaArray* build_arena_array_node(ArenaMatCtx& ctx, yyjson_val* val);
+NEOJSON_NOINLINE ArenaObject* build_arena_object_node(ArenaMatCtx& ctx, yyjson_val* val,
+                                                      bool* own_unique_out, bool known_unique);
+
+NEOJSON_NOINLINE void init_arena_nonempty_ctn(ArenaMatCtx& ctx, json* dst, yyjson_val* cv,
+                                              const std::size_t clen) {
+    if (clen <= 2u && yyjson_is_arr(cv)) {
+        if (ArenaArray* leaf = try_build_inline_leaf_arena_array(ctx, cv, clen)) {
+            json_access::init_arena_array_ptr(dst, leaf);
+            return;
+        }
+    }
+    if (NEOJSON_LIKELY(ctx.depth < kMaxDirectDfsDepth)) {
+        MatDepthGuard dguard(ctx.depth);
+        if (yyjson_is_arr(cv)) {
+            json_access::init_arena_array_ptr(dst, build_arena_array_node(ctx, cv));
+        } else {
+            json_access::init_arena_object_ptr(
+                dst, build_arena_object_node(ctx, cv, nullptr, false));
+        }
+        return;
+    }
+    json_access::init_arena_null(dst);
+    ctx.scratch.workstack.push_back(ArenaWorkItem{cv, dst});
+}
+
+inline void init_arena_slot(ArenaMatCtx& ctx, json* dst, yyjson_val* cv) {
     if (!yyjson_is_ctn(cv)) {
-        construct_arena_scalar(dst, sdoc, cv, empty_str, str_intern, str_intern_started, seed);
+        construct_arena_scalar(ctx, dst, cv);
         return;
     }
     const std::size_t clen = unsafe_yyjson_get_len(cv);
@@ -3910,103 +4554,406 @@ NEOJSON_ALWAYS_INLINE void init_arena_slot(json* dst, SharedYyDoc* sdoc, yyjson_
         } else {
             json_access::init_arena_empty_object(dst);
         }
-    } else if (clen <= 2u && yyjson_is_arr(cv)) {
-        if (ArenaArray* leaf = try_build_inline_leaf_arena_array(
-                sdoc, cv, clen, empty_str, str_intern, str_intern_started, seed)) {
-            json_access::init_arena_array_ptr(dst, leaf);
-        } else {
-            json_access::init_arena_null(dst);
-            workstack.push_back(ArenaWorkItem{cv, dst});
-        }
-    } else {
-        json_access::init_arena_null(dst);
-        workstack.push_back(ArenaWorkItem{cv, dst});
+        return;
     }
+    init_arena_nonempty_ctn(ctx, dst, cv, clen);
 }
 
-inline const ShapeEntry* lookup_arena_shape_entry(const ArenaMaterializeScratch& scratch,
-                                                  const std::size_t len, const char* p0,
-                                                  const std::size_t l0) noexcept {
-    const std::size_t set_idx = ArenaShapeCache::compute_set(len, p0, l0);
-    const std::uint32_t stamp = scratch.shape_cache.doc_stamp;
-    for (std::size_t way = 0u; way < 2u; ++way) {
-        const ShapeEntry& se = scratch.shape_cache.entries[set_idx * 2u + way];
-        if (se.doc_stamp == stamp && se.count == len && se.key0_len == l0 &&
-            fast_memeq(se.key0_data, p0, l0)) {
-            return &se;
-        }
-    }
-    return nullptr;
-}
-
-inline ArenaObject* try_build_arena_object_with_entry(
-    SharedYyDoc* sdoc, yyjson_val* val, const ShapeEntry& se, ArenaMaterializeScratch& scratch,
-    SharedString* const empty_str, StringValInternTable& str_intern, bool& str_intern_started,
-    const std::uint64_t seed, const bool check_key0) {
+NEOJSON_NOINLINE ArenaObject* try_build_arena_object_with_entry(ArenaMatCtx& ctx, yyjson_val* val,
+                                                                const ShapeEntry& se,
+                                                                const bool check_key0) {
     const std::size_t len = se.count;
-    yyjson_val* k0 = unsafe_yyjson_get_first(val);
-    if (check_key0) {
-        const std::size_t l0 = unsafe_yyjson_get_len(k0);
-        const char* p0 = unsafe_yyjson_get_str(k0);
-        if (l0 != se.key0_len || !fast_memeq(p0, se.key0_data, l0)) {
+    if (NEOJSON_UNLIKELY(len == 0u || len > ArenaShapeCache::kMaxCachedObjKeys)) {
+        return nullptr;
+    }
+    const char* const kb = ctx.scratch.shape_cache.key_bytes.data();
+    const ShapeKeyDesc* const descs = ctx.scratch.shape_cache.key_descs.data() + se.descs_off;
+    const bool padded = ctx.str_pool_padded_32;
+    yyjson_val* const k0 = unsafe_yyjson_get_first(val);
+    if (check_key0 &&
+        NEOJSON_UNLIKELY(!shape_key_eq_desc(
+            padded, unsafe_yyjson_get_str(k0), unsafe_yyjson_get_len(k0), kb, descs[0]))) {
+        return nullptr;
+    }
+    const std::string* const se_keys = se.keys;
+
+    if (val->uni.ofs == (2u * len + 1u) * sizeof(yyjson_val)) {
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+        if (NEOJSON_LIKELY(padded && se.max_key_len <= 16u)) {
+            for (std::size_t i = 1u; i < len; ++i) {
+                yyjson_val* const ck = val + 1u + 2u * i;
+                const ShapeKeyDesc d = descs[i];
+                if (NEOJSON_UNLIKELY(unsafe_yyjson_get_len(ck) != d.len)) {
+                    return nullptr;
+                }
+                const __m128i va = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(unsafe_yyjson_get_str(ck)));
+                const __m128i vb =
+                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(kb + d.byte_off));
+                const std::uint32_t eq =
+                    static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(va, vb)));
+                if (NEOJSON_UNLIKELY(((~eq) & d.mask16) != 0u)) {
+                    return nullptr;
+                }
+            }
+        } else
+#endif
+        {
+            for (std::size_t i = 1u; i < len; ++i) {
+                yyjson_val* const ck = val + 1u + 2u * i;
+                if (NEOJSON_UNLIKELY(!shape_key_eq_desc(
+                        padded, unsafe_yyjson_get_str(ck), unsafe_yyjson_get_len(ck), kb,
+                        descs[i]))) {
+                    return nullptr;
+                }
+            }
+        }
+        void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaObject) + len * sizeof(json));
+        auto* ao = ::new (mem) ArenaObject();
+        ao->count = static_cast<std::uint32_t>(len);
+        ao->doc = ctx.sdoc;
+        ao->keys_ptr = se_keys;
+        json* out = ao->vals();
+        for (std::size_t i = 0u; i < len; ++i) {
+            construct_arena_leaf(ctx, &out[i], val + 2u + 2u * i);
+        }
+        return ao;
+    }
+
+    if (len >= 2u && !yyjson_is_ctn(k0 + 1u)) {
+        yyjson_val* const k1 = k0 + 2u;
+        if (NEOJSON_UNLIKELY(!shape_key_eq_desc(
+                padded, unsafe_yyjson_get_str(k1), unsafe_yyjson_get_len(k1), kb, descs[1]))) {
             return nullptr;
         }
     }
-    yyjson_val* small_vals[ArenaShapeCache::kMaxCachedObjKeys];
-    yyjson_val* cv = k0 + 1u;
-    small_vals[0] = cv;
-    const ShapeKeyRef* expected = scratch.shape_cache.key_pool.data() + se.pool_off;
-    for (std::size_t i = 1u; i < len; ++i) {
-        yyjson_val* ck = unsafe_yyjson_get_next(cv);
-        cv = ck + 1u;
-        const std::size_t kl = unsafe_yyjson_get_len(ck);
-        const char* kp = unsafe_yyjson_get_str(ck);
-        if (kl != expected[i].len || !fast_memeq(kp, expected[i].data, kl)) {
-            return nullptr;
-        }
-        small_vals[i] = cv;
-    }
-    void* mem = sdoc->arena.alloc(sizeof(ArenaObject) + len * sizeof(json));
+
+    char* const ao_start = ctx.sdoc->arena.bump_ptr;
+    void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaObject) + len * sizeof(json));
+    char* const ao_end = ctx.sdoc->arena.bump_ptr;
     auto* ao = ::new (mem) ArenaObject();
     ao->count = static_cast<std::uint32_t>(len);
-    ao->doc = sdoc;
-    ao->keys_ptr = se.keys;
-    json* out = ao->vals();
-    for (std::size_t i = 0u; i < len; ++i) {
-        init_arena_slot(&out[i], sdoc, small_vals[i], scratch.workstack, empty_str, str_intern,
-                        str_intern_started, seed);
+    ao->doc = ctx.sdoc;
+    ao->keys_ptr = se_keys;
+    json* const out = ao->vals();
+
+    assert(ctx.depth <= kMaxDirectDfsDepth);
+    yyjson_val** const p_cv = ctx.scratch.dfs_vals[ctx.depth];
+    std::uint8_t* const p_idx = ctx.scratch.dfs_slot_idx[ctx.depth];
+    std::size_t pending_cnt = 0u;
+
+    yyjson_val* ck = nullptr;
+    yyjson_val* const cv0 = k0 + 1u;
+    if (NEOJSON_LIKELY(!yyjson_is_ctn(cv0))) {
+        construct_arena_leaf(ctx, &out[0], cv0);
+        ck = cv0 + 1u;
+    } else if (unsafe_yyjson_get_len(cv0) == 0u) {
+        if (yyjson_is_arr(cv0)) {
+            json_access::init_arena_empty_array(&out[0]);
+        } else {
+            json_access::init_arena_empty_object(&out[0]);
+        }
+        ck = cv0 + 1u;
+    } else {
+        p_idx[0] = 0u;
+        p_cv[0] = cv0;
+        pending_cnt = 1u;
+        ck = unsafe_yyjson_get_next(cv0);
+    }
+
+    for (std::size_t i = 1u; i < len; ++i) {
+        if (NEOJSON_UNLIKELY(!shape_key_eq_desc(
+                padded, unsafe_yyjson_get_str(ck), unsafe_yyjson_get_len(ck), kb, descs[i]))) {
+            if (mem == static_cast<void*>(ao_start) && ctx.sdoc->arena.bump_ptr == ao_end) {
+                ctx.sdoc->arena.bump_ptr = ao_start;
+            }
+            return nullptr;
+        }
+        yyjson_val* const cv = ck + 1u;
+        if (NEOJSON_LIKELY(!yyjson_is_ctn(cv))) {
+            construct_arena_leaf(ctx, &out[i], cv);
+            if (i + 1u < len) {
+                ck = cv + 1u;
+            }
+        } else if (unsafe_yyjson_get_len(cv) == 0u) {
+            if (yyjson_is_arr(cv)) {
+                json_access::init_arena_empty_array(&out[i]);
+            } else {
+                json_access::init_arena_empty_object(&out[i]);
+            }
+            if (i + 1u < len) {
+                ck = cv + 1u;
+            }
+        } else {
+            p_idx[pending_cnt] = static_cast<std::uint8_t>(i);
+            p_cv[pending_cnt] = cv;
+            ++pending_cnt;
+            if (i + 1u < len) {
+                ck = unsafe_yyjson_get_next(cv);
+            }
+        }
+    }
+
+    for (std::size_t p = 0u; p < pending_cnt; ++p) {
+        yyjson_val* const cval = p_cv[p];
+        init_arena_nonempty_ctn(ctx, &out[p_idx[p]], cval, unsafe_yyjson_get_len(cval));
     }
     return ao;
 }
 
-inline ArenaObject* build_arena_object_node(SharedYyDoc* sdoc, yyjson_val* val,
-                                            KeyInternTable& intern,
-                                            ArenaMaterializeScratch& scratch,
-                                            const std::string* const empty_key,
-                                            SharedString* const empty_str,
-                                            StringValInternTable& str_intern,
-                                            bool& str_intern_started, const std::uint64_t seed,
-                                            bool& own_unique, bool& saw_dup);
+NEOJSON_NOINLINE ShapeBuildRes try_build_from_shape_cache_rest(
+    ArenaMatCtx& ctx, yyjson_val* val, const ShapeEntry* ways, const std::size_t start_w,
+    const std::uint32_t stamp, const std::size_t len, const char* p0, const std::size_t l0,
+    const std::uint64_t k0_w0) {
+    const char* const kb = ctx.scratch.shape_cache.key_bytes.data();
+    const ShapeKeyDesc* const kdescs = ctx.scratch.shape_cache.key_descs.data();
+    const bool padded = ctx.str_pool_padded_32;
+    for (std::size_t w = start_w; w < ArenaShapeCache::kWays; ++w) {
+        const ShapeEntry& se = ways[w];
+        if (se.doc_stamp == stamp && se.count == len && se.key0_len == l0 &&
+            se.key0_w0 == k0_w0 &&
+            (l0 <= 8u || shape_key_eq_ctx(padded, p0, kb + kdescs[se.descs_off].byte_off, l0))) {
+            if (ArenaObject* ao = try_build_arena_object_with_entry(ctx, val, se, false)) {
+                return ShapeBuildRes{ao, se};
+            }
+        }
+    }
+    return ShapeBuildRes{};
+}
 
-inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
-                                          KeyInternTable& intern,
-                                          ArenaMaterializeScratch& scratch,
-                                          const std::string* const empty_key,
-                                          SharedString* const empty_str,
-                                          StringValInternTable& str_intern,
-                                          bool& str_intern_started, const std::uint64_t seed,
-                                          bool& saw_dup) {
+NEOJSON_ALWAYS_INLINE ShapeBuildRes find_and_build_shape(ArenaMatCtx& ctx, yyjson_val* val,
+                                                         const std::size_t len, const char* p0,
+                                                         const std::size_t l0) {
+    const std::size_t set_idx = ArenaShapeCache::compute_set(len, p0, l0);
+    const std::uint32_t stamp = ctx.scratch.shape_cache.doc_stamp;
+    const ShapeEntry* ways = &ctx.scratch.shape_cache.entries[set_idx * ArenaShapeCache::kWays];
+    const char* const kb = ctx.scratch.shape_cache.key_bytes.data();
+    const ShapeKeyDesc* const kdescs = ctx.scratch.shape_cache.key_descs.data();
+    const bool padded = ctx.str_pool_padded_32;
+    const std::uint64_t k0_w0 = load_key0_w0(padded, p0, l0);
+    const ShapeEntry* cand = nullptr;
+    std::size_t cand_w = 0u;
+    for (std::size_t w = 0u; w < ArenaShapeCache::kWays; ++w) {
+        const ShapeEntry& se = ways[w];
+        if (se.doc_stamp == stamp && se.count == len && se.key0_len == l0 &&
+            se.key0_w0 == k0_w0 &&
+            (l0 <= 8u || shape_key_eq_ctx(padded, p0, kb + kdescs[se.descs_off].byte_off, l0))) {
+            cand = &se;
+            cand_w = w;
+            break;
+        }
+    }
+    if (cand != nullptr) {
+        if (ArenaObject* ao = try_build_arena_object_with_entry(ctx, val, *cand, false)) {
+            return ShapeBuildRes{ao, *cand};
+        }
+        if (NEOJSON_UNLIKELY(cand_w + 1u < ArenaShapeCache::kWays)) {
+            return try_build_from_shape_cache_rest(ctx, val, ways, cand_w + 1u, stamp, len, p0, l0,
+                                                   k0_w0);
+        }
+    }
+    return ShapeBuildRes{};
+}
+
+NEOJSON_NOINLINE ShapeBuildRes try_build_from_shape_cache(ArenaMatCtx& ctx, yyjson_val* val,
+                                                        const std::size_t len, const char* p0,
+                                                        const std::size_t l0) {
+    return find_and_build_shape(ctx, val, len, p0, l0);
+}
+
+NEOJSON_NOINLINE void build_arena_array_obj2_run(ArenaMatCtx& ctx, json* out, const std::size_t len,
+                                                 std::size_t& i_io, yyjson_val*& cur_io,
+                                                 const ShapeEntry& cached_se) {
+    const ShapeKeyDesc* const descs = ctx.scratch.shape_cache.key_descs.data() + cached_se.descs_off;
+    const ShapeKeyDesc d0 = descs[0];
+    const ShapeKeyDesc d1 = descs[1];
+    const char* const kb = ctx.scratch.shape_cache.key_bytes.data();
+    const bool padded = ctx.str_pool_padded_32;
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+    const bool fast_sse = padded && (cached_se.max_key_len <= 16u);
+    const __m128i k0v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kb + d0.byte_off));
+    const __m128i k1v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kb + d1.byte_off));
+    auto key_eq = [&](yyjson_val* ck, const ShapeKeyDesc d, const __m128i kv) noexcept -> bool {
+        if (NEOJSON_LIKELY(fast_sse)) {
+            if (NEOJSON_UNLIKELY(unsafe_yyjson_get_len(ck) != d.len)) {
+                return false;
+            }
+            const __m128i av = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(unsafe_yyjson_get_str(ck)));
+            const std::uint32_t eq =
+                static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(av, kv)));
+            return ((~eq) & d.mask16) == 0u;
+        }
+        return shape_key_eq_desc(padded, unsafe_yyjson_get_str(ck), unsafe_yyjson_get_len(ck), kb,
+                                 d);
+    };
+#else
+    const int k0v = 0;
+    const int k1v = 0;
+    auto key_eq = [&](yyjson_val* ck, const ShapeKeyDesc d, const int) noexcept -> bool {
+        return shape_key_eq_desc(padded, unsafe_yyjson_get_str(ck), unsafe_yyjson_get_len(ck), kb,
+                                 d);
+    };
+#endif
+    static_assert(sizeof(ArenaObject) + 2u * sizeof(json) == 64u,
+                  "2-entry ArenaObject leaf must be 64 bytes");
+    std::size_t i = i_io;
+    yyjson_val* cur = cur_io;
+    char* bp = ctx.sdoc->arena.bump_ptr;
+    char* bend = ctx.sdoc->arena.bump_end;
+
+    auto emit_ao2 = [&](yyjson_val* cv0, yyjson_val* cv1) {
+        ++i;
+        void* omem = nullptr;
+        if (NEOJSON_LIKELY(static_cast<std::size_t>(bend - bp) >= 64u)) {
+            omem = bp;
+            bp += 64u;
+        } else {
+            ctx.sdoc->arena.bump_ptr = bp;
+            omem = ctx.sdoc->arena.alloc_slow(64u);
+            bp = ctx.sdoc->arena.bump_ptr;
+            bend = ctx.sdoc->arena.bump_end;
+        }
+        auto* next_ao = ::new (omem) ArenaObject();
+        next_ao->count = 2u;
+        next_ao->doc = ctx.sdoc;
+        next_ao->keys_ptr = cached_se.keys;
+        json* lout = next_ao->vals();
+        init_arena_non_str_leaf(&lout[0], cv0);
+        init_arena_non_str_leaf(&lout[1], cv1);
+        json_access::init_arena_object_ptr(&out[i], next_ao);
+        cur = cv1 + 1u;
+    };
+
+    while (i + 1u < len &&
+           yyjson_get_tag(cur) == (YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE) &&
+           unsafe_yyjson_get_len(cur) == 2u &&
+           cur->uni.ofs == 5u * sizeof(yyjson_val)) {
+        yyjson_val* ck0 = cur + 1u;
+        yyjson_val* cv0 = cur + 2u;
+        yyjson_val* ck1 = cur + 3u;
+        yyjson_val* cv1 = cur + 4u;
+        if (unsafe_yyjson_is_str(cv0) || unsafe_yyjson_is_str(cv1)) {
+            break;
+        }
+        if (NEOJSON_UNLIKELY(!key_eq(ck0, d0, k0v) || !key_eq(ck1, d1, k1v))) {
+            break;
+        }
+        emit_ao2(cv0, cv1);
+    }
+    ctx.sdoc->arena.bump_ptr = bp;
+    i_io = i;
+    cur_io = cur;
+}
+
+NEOJSON_NOINLINE void build_arena_array_obj3_run(ArenaMatCtx& ctx, json* out, const std::size_t len,
+                                                 std::size_t& i_io, yyjson_val*& cur_io,
+                                                 const ShapeEntry& cached_se) {
+    const ShapeKeyDesc* const descs = ctx.scratch.shape_cache.key_descs.data() + cached_se.descs_off;
+    const ShapeKeyDesc d0 = descs[0];
+    const ShapeKeyDesc d1 = descs[1];
+    const ShapeKeyDesc d2 = descs[2];
+    const char* const kb = ctx.scratch.shape_cache.key_bytes.data();
+    const bool padded = ctx.str_pool_padded_32;
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
+    const bool fast_sse = padded && (cached_se.max_key_len <= 16u);
+    const __m128i k0v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kb + d0.byte_off));
+    const __m128i k1v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kb + d1.byte_off));
+    const __m128i k2v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kb + d2.byte_off));
+    auto key_eq = [&](yyjson_val* ck, const ShapeKeyDesc d, const __m128i kv) noexcept -> bool {
+        if (NEOJSON_LIKELY(fast_sse)) {
+            if (NEOJSON_UNLIKELY(unsafe_yyjson_get_len(ck) != d.len)) {
+                return false;
+            }
+            const __m128i av = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(unsafe_yyjson_get_str(ck)));
+            const std::uint32_t eq =
+                static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(av, kv)));
+            return ((~eq) & d.mask16) == 0u;
+        }
+        return shape_key_eq_desc(padded, unsafe_yyjson_get_str(ck), unsafe_yyjson_get_len(ck), kb,
+                                 d);
+    };
+#else
+    const int k0v = 0;
+    const int k1v = 0;
+    const int k2v = 0;
+    auto key_eq = [&](yyjson_val* ck, const ShapeKeyDesc d, const int) noexcept -> bool {
+        return shape_key_eq_desc(padded, unsafe_yyjson_get_str(ck), unsafe_yyjson_get_len(ck), kb,
+                                 d);
+    };
+#endif
+    static_assert(sizeof(ArenaObject) + 3u * sizeof(json) == 80u,
+                  "3-entry ArenaObject leaf must be 80 bytes");
+    std::size_t i = i_io;
+    yyjson_val* cur = cur_io;
+    char* bp = ctx.sdoc->arena.bump_ptr;
+    char* bend = ctx.sdoc->arena.bump_end;
+
+    auto emit_ao3 = [&](yyjson_val* cv0, yyjson_val* cv1, yyjson_val* cv2) {
+        ++i;
+        void* omem = nullptr;
+        if (NEOJSON_LIKELY(static_cast<std::size_t>(bend - bp) >= 80u)) {
+            omem = bp;
+            bp += 80u;
+        } else {
+            ctx.sdoc->arena.bump_ptr = bp;
+            omem = ctx.sdoc->arena.alloc_slow(80u);
+            bp = ctx.sdoc->arena.bump_ptr;
+            bend = ctx.sdoc->arena.bump_end;
+        }
+        auto* next_ao = ::new (omem) ArenaObject();
+        next_ao->count = 3u;
+        next_ao->doc = ctx.sdoc;
+        next_ao->keys_ptr = cached_se.keys;
+        json* lout = next_ao->vals();
+        init_arena_non_str_leaf(&lout[0], cv0);
+        init_arena_non_str_leaf(&lout[1], cv1);
+        init_arena_non_str_leaf(&lout[2], cv2);
+        json_access::init_arena_object_ptr(&out[i], next_ao);
+        cur = cv2 + 1u;
+    };
+
+    while (i + 1u < len &&
+           yyjson_get_tag(cur) == (YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE) &&
+           unsafe_yyjson_get_len(cur) == 3u &&
+           cur->uni.ofs == 7u * sizeof(yyjson_val)) {
+        yyjson_val* ck0 = cur + 1u;
+        yyjson_val* cv0 = cur + 2u;
+        yyjson_val* ck1 = cur + 3u;
+        yyjson_val* cv1 = cur + 4u;
+        yyjson_val* ck2 = cur + 5u;
+        yyjson_val* cv2 = cur + 6u;
+        if (unsafe_yyjson_is_str(cv0) || unsafe_yyjson_is_str(cv1) ||
+            unsafe_yyjson_is_str(cv2)) {
+            break;
+        }
+        if (NEOJSON_UNLIKELY(!key_eq(ck0, d0, k0v) || !key_eq(ck1, d1, k1v) ||
+                             !key_eq(ck2, d2, k2v))) {
+            break;
+        }
+        emit_ao3(cv0, cv1, cv2);
+    }
+    ctx.sdoc->arena.bump_ptr = bp;
+    i_io = i;
+    cur_io = cur;
+}
+
+NEOJSON_NOINLINE ArenaArray* build_arena_array_node(ArenaMatCtx& ctx, yyjson_val* val) {
     const std::size_t len = unsafe_yyjson_get_len(val);
-    void* mem = sdoc->arena.alloc(sizeof(ArenaArray) + len * sizeof(json));
+    void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaArray) + len * sizeof(json));
     auto* aa = ::new (mem) ArenaArray();
     aa->count = static_cast<std::uint32_t>(len);
-    aa->doc = sdoc;
+    aa->doc = ctx.sdoc;
     json* out = aa->elems();
     yyjson_val* cur = unsafe_yyjson_get_first(val);
     for (std::size_t i = 0u; i < len; ++i) {
         if (!yyjson_is_ctn(cur)) {
-            construct_arena_scalar(&out[i], sdoc, cur, empty_str, str_intern, str_intern_started,
-                                   seed);
+            if (NEOJSON_LIKELY(!unsafe_yyjson_is_str(cur))) {
+                init_arena_non_str_leaf(&out[i], cur);
+            } else {
+                construct_arena_leaf(ctx, &out[i], cur);
+            }
             if (i + 1u < len) {
                 cur = cur + 1u;
             }
@@ -4029,22 +4976,22 @@ inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
                         yyjson_get_tag(e1) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
                         static_assert(sizeof(ArenaArray) + 2u * sizeof(json) == 48u,
                                       "2-element ArenaArray must fit in 48 bytes");
-                        char* bp = sdoc->arena.bump_ptr;
-                        char* bend = sdoc->arena.bump_end;
+                        char* bp = ctx.sdoc->arena.bump_ptr;
+                        char* bend = ctx.sdoc->arena.bump_end;
                         for (;;) {
                             void* lmem = nullptr;
                             if (static_cast<std::size_t>(bend - bp) >= 48u) {
                                 lmem = bp;
                                 bp += 48u;
                             } else {
-                                sdoc->arena.bump_ptr = bp;
-                                lmem = sdoc->arena.alloc_slow(48u);
-                                bp = sdoc->arena.bump_ptr;
-                                bend = sdoc->arena.bump_end;
+                                ctx.sdoc->arena.bump_ptr = bp;
+                                lmem = ctx.sdoc->arena.alloc_slow(48u);
+                                bp = ctx.sdoc->arena.bump_ptr;
+                                bend = ctx.sdoc->arena.bump_end;
                             }
                             auto* leaf = ::new (lmem) ArenaArray();
                             leaf->count = 2u;
-                            leaf->doc = sdoc;
+                            leaf->doc = ctx.sdoc;
                             json* lout = leaf->elems();
                             json_access::init_arena_real(
                                 &lout[0],
@@ -4055,12 +5002,12 @@ inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
                             json_access::init_arena_array_ptr(&out[i], leaf);
                             ++i;
                             if (i >= len) {
-                                sdoc->arena.bump_ptr = bp;
+                                ctx.sdoc->arena.bump_ptr = bp;
                                 return aa;
                             }
                             cur = e1 + 1u;
                             if (!yyjson_is_arr(cur) || unsafe_yyjson_get_len(cur) != 2u) {
-                                sdoc->arena.bump_ptr = bp;
+                                ctx.sdoc->arena.bump_ptr = bp;
                                 --i;
                                 break;
                             }
@@ -4068,7 +5015,7 @@ inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
                             e1 = e0 + 1u;
                             if (yyjson_get_tag(e0) != (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL) ||
                                 yyjson_get_tag(e1) != (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
-                                sdoc->arena.bump_ptr = bp;
+                                ctx.sdoc->arena.bump_ptr = bp;
                                 --i;
                                 break;
                             }
@@ -4076,66 +5023,93 @@ inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
                         continue;
                     }
                 }
-                if (ArenaArray* leaf = try_build_inline_leaf_arena_array(
-                        sdoc, cur, clen, empty_str, str_intern, str_intern_started, seed)) {
+                if (ArenaArray* leaf = try_build_inline_leaf_arena_array(ctx, cur, clen)) {
                     json_access::init_arena_array_ptr(&out[i], leaf);
                     if (i + 1u < len) {
                         cur = cur + clen + 1u;
                     }
+                } else if (NEOJSON_LIKELY(ctx.depth < kMaxDirectDfsDepth)) {
+                    MatDepthGuard dguard(ctx.depth);
+                    ArenaArray* child_aa = build_arena_array_node(ctx, cur);
+                    json_access::init_arena_array_ptr(&out[i], child_aa);
+                    if (i + 1u < len) {
+                        cur = unsafe_yyjson_get_next(cur);
+                    }
                 } else {
                     json_access::init_arena_null(&out[i]);
-                    scratch.workstack.push_back(ArenaWorkItem{cur, &out[i]});
+                    ctx.scratch.workstack.push_back(ArenaWorkItem{cur, &out[i]});
                     if (i + 1u < len) {
                         cur = unsafe_yyjson_get_next(cur);
                     }
                 }
-            } else if (yyjson_is_obj(cur) && clen <= ArenaShapeCache::kMaxCachedObjKeys) {
+            } else if (NEOJSON_LIKELY(ctx.depth < kMaxDirectDfsDepth) && yyjson_is_obj(cur) &&
+                       clen <= ArenaShapeCache::kMaxCachedObjKeys) {
                 yyjson_val* k0 = unsafe_yyjson_get_first(cur);
-                const ShapeEntry* se = lookup_arena_shape_entry(
-                    scratch, clen, unsafe_yyjson_get_str(k0), unsafe_yyjson_get_len(k0));
-                if (se == nullptr) {
-                    bool ignored_own_unique = true;
-                    ArenaObject* first_ao = build_arena_object_node(
-                        sdoc, cur, intern, scratch, empty_key, empty_str, str_intern,
-                        str_intern_started, seed, ignored_own_unique, saw_dup);
-                    json_access::init_arena_object_ptr(&out[i], first_ao);
-                    if (i + 1u < len) {
-                        cur = unsafe_yyjson_get_next(cur);
+                ShapeBuildRes res{};
+                {
+                    MatDepthGuard dguard(ctx.depth);
+                    res = try_build_from_shape_cache(ctx, cur, clen, unsafe_yyjson_get_str(k0),
+                                                     unsafe_yyjson_get_len(k0));
+                    if (res.ao == nullptr) {
+                        res.ao = build_arena_object_node(ctx, cur, nullptr, false);
+                        json_access::init_arena_object_ptr(&out[i], res.ao);
+                        if (i + 1u < len) {
+                            cur = unsafe_yyjson_get_next(cur);
+                        }
+                        continue;
                     }
-                } else {
-                    const ShapeEntry cached_se = *se;
-                    bool check_k0 = false;
-                    for (;;) {
-                        ArenaObject* ao = try_build_arena_object_with_entry(
-                            sdoc, cur, cached_se, scratch, empty_str, str_intern,
-                            str_intern_started, seed, check_k0);
-                        if (ao == nullptr) {
-                            bool ignored_own_unique = true;
-                            ao = build_arena_object_node(
-                                sdoc, cur, intern, scratch, empty_key, empty_str, str_intern,
-                                str_intern_started, seed, ignored_own_unique, saw_dup);
-                            json_access::init_arena_object_ptr(&out[i], ao);
-                            if (i + 1u < len) {
-                                cur = unsafe_yyjson_get_next(cur);
-                            }
+                }
+                const ShapeEntry cached_se = res.se;
+                json_access::init_arena_object_ptr(&out[i], res.ao);
+                if (i + 1u >= len) {
+                    return aa;
+                }
+                cur = unsafe_yyjson_get_next(cur);
+                if (cached_se.count == 2u) {
+                    build_arena_array_obj2_run(ctx, out, len, i, cur, cached_se);
+                    if (i + 1u >= len) {
+                        return aa;
+                    }
+                } else if (cached_se.count == 3u) {
+                    build_arena_array_obj3_run(ctx, out, len, i, cur, cached_se);
+                    if (i + 1u >= len) {
+                        return aa;
+                    }
+                }
+                {
+                    MatDepthGuard dguard(ctx.depth);
+                    while (i + 1u < len &&
+                           yyjson_get_tag(cur) == (YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE) &&
+                           unsafe_yyjson_get_len(cur) == cached_se.count) {
+                        ArenaObject* next_ao =
+                            try_build_arena_object_with_entry(ctx, cur, cached_se, true);
+                        if (next_ao == nullptr) {
                             break;
                         }
-                        json_access::init_arena_object_ptr(&out[i], ao);
+                        ++i;
+                        json_access::init_arena_object_ptr(&out[i], next_ao);
                         if (i + 1u >= len) {
                             return aa;
                         }
                         cur = unsafe_yyjson_get_next(cur);
-                        if (yyjson_get_tag(cur) != (YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE) ||
-                            unsafe_yyjson_get_len(cur) != cached_se.count) {
-                            break;
-                        }
-                        ++i;
-                        check_k0 = true;
                     }
+                }
+                continue;
+            } else if (NEOJSON_LIKELY(ctx.depth < kMaxDirectDfsDepth)) {
+                MatDepthGuard dguard(ctx.depth);
+                if (yyjson_is_arr(cur)) {
+                    ArenaArray* child_aa = build_arena_array_node(ctx, cur);
+                    json_access::init_arena_array_ptr(&out[i], child_aa);
+                } else {
+                    ArenaObject* child_ao = build_arena_object_node(ctx, cur, nullptr, false);
+                    json_access::init_arena_object_ptr(&out[i], child_ao);
+                }
+                if (i + 1u < len) {
+                    cur = unsafe_yyjson_get_next(cur);
                 }
             } else {
                 json_access::init_arena_null(&out[i]);
-                scratch.workstack.push_back(ArenaWorkItem{cur, &out[i]});
+                ctx.scratch.workstack.push_back(ArenaWorkItem{cur, &out[i]});
                 if (i + 1u < len) {
                     cur = unsafe_yyjson_get_next(cur);
                 }
@@ -4145,114 +5119,213 @@ inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
     return aa;
 }
 
-inline ArenaObject* build_arena_object_node(SharedYyDoc* sdoc, yyjson_val* val,
-                                            KeyInternTable& intern,
-                                            ArenaMaterializeScratch& scratch,
-                                            const std::string* const empty_key,
-                                            SharedString* const empty_str,
-                                            StringValInternTable& str_intern,
-                                            bool& str_intern_started, const std::uint64_t seed,
-                                            bool& own_unique, bool& saw_dup) {
-    const std::size_t len = unsafe_yyjson_get_len(val);
-    own_unique = true;
+NEOJSON_NOINLINE ArenaObject* build_arena_medium_object_slow(ArenaMatCtx& ctx, yyjson_val* val,
+                                                             const std::size_t len,
+                                                             bool* own_unique_out) {
+    yyjson_val* small_keys[ArenaShapeCache::kMaxCachedObjKeys];
     yyjson_val* small_vals[ArenaShapeCache::kMaxCachedObjKeys];
-
-    if (len >= 1u && len <= ArenaShapeCache::kMaxCachedObjKeys) {
-        yyjson_val* k0 = unsafe_yyjson_get_first(val);
-        const char* p0 = unsafe_yyjson_get_str(k0);
-        const std::size_t l0 = unsafe_yyjson_get_len(k0);
-        if (const ShapeEntry* se = lookup_arena_shape_entry(scratch, len, p0, l0)) {
-            if (ArenaObject* ao = try_build_arena_object_with_entry(
-                    sdoc, val, *se, scratch, empty_str, str_intern, str_intern_started, seed,
-                    false)) {
-                return ao;
-            }
-        }
-    }
-
-    const std::string* small_keys[ArenaShapeCache::kMaxCachedObjKeys];
-    const std::string** kbuf = small_keys;
+    std::vector<yyjson_val*> large_keys;
+    std::vector<yyjson_val*> large_vals;
+    yyjson_val** kbuf = small_keys;
     yyjson_val** vbuf = small_vals;
     if (len > ArenaShapeCache::kMaxCachedObjKeys) {
-        scratch.tmp_keys.resize(len);
-        scratch.tmp_vals.resize(len);
-        kbuf = scratch.tmp_keys.data();
-        vbuf = scratch.tmp_vals.data();
+        large_keys.resize(len);
+        large_vals.resize(len);
+        kbuf = large_keys.data();
+        vbuf = large_vals.data();
     }
 
+    bool local_unique = true;
     std::size_t out_n = 0u;
     yyjson_obj_iter iter = yyjson_obj_iter_with(val);
     yyjson_val* k = nullptr;
-    if (len <= 16u) {
-        while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
-            const auto res = intern.intern(sdoc->arena, unsafe_yyjson_get_str(k),
-                                           unsafe_yyjson_get_len(k), empty_key, seed);
-            yyjson_val* cv = yyjson_obj_iter_get_val(k);
+    const std::uint64_t obj_tok = ctx.intern.next_obj_token();
+    while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+        const char* kp = unsafe_yyjson_get_str(k);
+        const std::size_t kl = unsafe_yyjson_get_len(k);
+        const std::uint32_t key_id = ctx.intern.intern(kp, kl, ctx.seed);
+        yyjson_val* cv = yyjson_obj_iter_get_val(k);
+        if (NEOJSON_UNLIKELY(key_id == KeyInternTable::kUnindexedKeyId)) {
             bool found = false;
             for (std::size_t j = 0u; j < out_n; ++j) {
-                if (kbuf[j] == res.str) {
+                if (unsafe_yyjson_get_len(kbuf[j]) == kl &&
+                    fast_memeq(unsafe_yyjson_get_str(kbuf[j]), kp, kl)) {
                     vbuf[j] = cv;
-                    own_unique = false;
-                    saw_dup = true;
+                    local_unique = false;
+                    ctx.saw_dup = true;
                     found = true;
                     break;
                 }
             }
             if (!found) {
-                kbuf[out_n] = res.str;
+                kbuf[out_n] = k;
                 vbuf[out_n] = cv;
                 ++out_n;
             }
+            continue;
         }
-    } else {
-        const std::uint64_t obj_tok = intern.next_obj_token();
-        while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
-            const auto res = intern.intern(sdoc->arena, unsafe_yyjson_get_str(k),
-                                           unsafe_yyjson_get_len(k), empty_key, seed);
-            yyjson_val* cv = yyjson_obj_iter_get_val(k);
-            KeySeenToken& st = intern.seen[res.key_id];
-            if (st.token == obj_tok) {
-                vbuf[st.out_idx] = cv;
-                own_unique = false;
-                saw_dup = true;
-            } else {
-                st.token = obj_tok;
-                st.out_idx = static_cast<std::uint32_t>(out_n);
-                kbuf[out_n] = res.str;
-                vbuf[out_n] = cv;
-                ++out_n;
-            }
+        KeySeenToken& st = ctx.intern.seen[key_id];
+        if (st.token == obj_tok) {
+            vbuf[st.out_idx] = cv;
+            local_unique = false;
+            ctx.saw_dup = true;
+        } else {
+            st.token = obj_tok;
+            st.out_idx = static_cast<std::uint32_t>(out_n);
+            kbuf[out_n] = k;
+            vbuf[out_n] = cv;
+            ++out_n;
         }
+    }
+    if (own_unique_out != nullptr) {
+        *own_unique_out = local_unique;
     }
 
-    void* mem = sdoc->arena.alloc(sizeof(ArenaObject) + out_n * sizeof(json) +
-                                  out_n * sizeof(const std::string*));
+    static_assert(alignof(std::string) <= alignof(json) && alignof(json) >= alignof(ArenaObject),
+                  "ArenaObject contiguous keys must stay aligned");
+    void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaObject) + out_n * sizeof(json) +
+                                      out_n * sizeof(std::string));
     auto* ao = ::new (mem) ArenaObject();
     ao->count = static_cast<std::uint32_t>(out_n);
-    ao->doc = sdoc;
+    ao->doc = ctx.sdoc;
     json* out = ao->vals();
-    const std::string** dst_keys = reinterpret_cast<const std::string**>(
+    std::string* dst_keys = reinterpret_cast<std::string*>(
         reinterpret_cast<unsigned char*>(ao) + sizeof(ArenaObject) + out_n * sizeof(json));
-    if (out_n > 0u) {
-        std::memcpy(dst_keys, kbuf, out_n * sizeof(const std::string*));
-    }
     ao->keys_ptr = dst_keys;
     for (std::size_t i = 0u; i < out_n; ++i) {
-        init_arena_slot(&out[i], sdoc, vbuf[i], scratch.workstack, empty_str, str_intern,
-                        str_intern_started, seed);
+        yyjson_val* ky = kbuf[i];
+        ctx.sdoc->arena.construct_key_in_place(&dst_keys[i], unsafe_yyjson_get_str(ky),
+                                               unsafe_yyjson_get_len(ky), ctx.str_pool);
     }
-    if (own_unique && out_n >= 1u && out_n <= ArenaShapeCache::kMaxCachedObjKeys) {
-        scratch.shape_cache.record(out_n, dst_keys);
+    for (std::size_t i = 0u; i < out_n; ++i) {
+        init_arena_slot(ctx, &out[i], vbuf[i]);
+    }
+    if (local_unique && out_n >= 1u && out_n <= ArenaShapeCache::kMaxCachedObjKeys) {
+        ctx.scratch.shape_cache.record(out_n, dst_keys);
     }
     return ao;
 }
 
+NEOJSON_NOINLINE ArenaObject* build_arena_large_unique_object(ArenaMatCtx& ctx, yyjson_val* val,
+                                                              const std::size_t len) {
+    void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaObject) + len * sizeof(json) +
+                                      len * sizeof(std::string));
+    auto* ao = ::new (mem) ArenaObject();
+    ao->count = static_cast<std::uint32_t>(len);
+    ao->doc = ctx.sdoc;
+    json* out = ao->vals();
+    std::string* dst_keys = reinterpret_cast<std::string*>(
+        reinterpret_cast<unsigned char*>(ao) + sizeof(ArenaObject) + len * sizeof(json));
+    ao->keys_ptr = dst_keys;
+    yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+    yyjson_val* k = nullptr;
+    std::size_t idx = 0u;
+    while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+        ctx.sdoc->arena.construct_key_in_place(&dst_keys[idx], unsafe_yyjson_get_str(k),
+                                               unsafe_yyjson_get_len(k), ctx.str_pool);
+        init_arena_slot(ctx, &out[idx], yyjson_obj_iter_get_val(k));
+        ++idx;
+    }
+    return ao;
+}
+
+NEOJSON_NOINLINE ArenaObject* build_arena_object_miss(ArenaMatCtx& ctx, yyjson_val* val,
+                                                      const std::size_t len,
+                                                      bool* own_unique_out,
+                                                      const bool known_unique) {
+    if (known_unique && len > ArenaShapeCache::kMaxCachedObjKeys) {
+        if (own_unique_out != nullptr) {
+            *own_unique_out = true;
+        }
+        return build_arena_large_unique_object(ctx, val, len);
+    }
+
+    if (len > 16u) {
+        return build_arena_medium_object_slow(ctx, val, len, own_unique_out);
+    }
+
+    bool local_unique = true;
+    yyjson_val* small_keys[16];
+    yyjson_val* small_vals[16];
+    std::size_t out_n = 0u;
+    yyjson_obj_iter iter = yyjson_obj_iter_with(val);
+    yyjson_val* k = nullptr;
+    while ((k = yyjson_obj_iter_next(&iter)) != nullptr) {
+        const char* kp = unsafe_yyjson_get_str(k);
+        const std::size_t kl = unsafe_yyjson_get_len(k);
+        yyjson_val* cv = yyjson_obj_iter_get_val(k);
+        bool found = false;
+        for (std::size_t j = 0u; j < out_n; ++j) {
+            yyjson_val* prev_k = small_keys[j];
+            if (unsafe_yyjson_get_len(prev_k) == kl &&
+                fast_memeq(unsafe_yyjson_get_str(prev_k), kp, kl)) {
+                small_vals[j] = cv;
+                local_unique = false;
+                ctx.saw_dup = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            small_keys[out_n] = k;
+            small_vals[out_n] = cv;
+            ++out_n;
+        }
+    }
+    if (own_unique_out != nullptr) {
+        *own_unique_out = local_unique;
+    }
+
+    void* mem = ctx.sdoc->arena.alloc(sizeof(ArenaObject) + out_n * sizeof(json) +
+                                      out_n * sizeof(std::string));
+    auto* ao = ::new (mem) ArenaObject();
+    ao->count = static_cast<std::uint32_t>(out_n);
+    ao->doc = ctx.sdoc;
+    json* out = ao->vals();
+    std::string* dst_keys = reinterpret_cast<std::string*>(
+        reinterpret_cast<unsigned char*>(ao) + sizeof(ArenaObject) + out_n * sizeof(json));
+    ao->keys_ptr = dst_keys;
+    for (std::size_t i = 0u; i < out_n; ++i) {
+        yyjson_val* ky = small_keys[i];
+        ctx.sdoc->arena.construct_key_in_place(&dst_keys[i], unsafe_yyjson_get_str(ky),
+                                               unsafe_yyjson_get_len(ky), ctx.str_pool);
+    }
+    for (std::size_t i = 0u; i < out_n; ++i) {
+        init_arena_slot(ctx, &out[i], small_vals[i]);
+    }
+    if (local_unique && out_n >= 1u) {
+        ctx.scratch.shape_cache.record(out_n, dst_keys);
+    }
+    return ao;
+}
+
+NEOJSON_NOINLINE ArenaObject* build_arena_object_node(ArenaMatCtx& ctx, yyjson_val* val,
+                                                      bool* own_unique_out,
+                                                      const bool known_unique) {
+    const std::size_t len = unsafe_yyjson_get_len(val);
+    if (own_unique_out != nullptr) {
+        *own_unique_out = true;
+    }
+
+    if (NEOJSON_LIKELY(len >= 1u && len <= ArenaShapeCache::kMaxCachedObjKeys)) {
+        yyjson_val* k0 = unsafe_yyjson_get_first(val);
+        const char* p0 = unsafe_yyjson_get_str(k0);
+        const std::size_t l0 = unsafe_yyjson_get_len(k0);
+        if (ArenaObject* ao = find_and_build_shape(ctx, val, len, p0, l0).ao) {
+            return ao;
+        }
+    }
+
+    return build_arena_object_miss(ctx, val, len, own_unique_out, known_unique);
+}
+
 inline const void* materialize_doc_arena(SharedYyDoc* sdoc, yyjson_val* root,
-                                         const value_t root_type, bool& root_own_unique,
-                                         bool& saw_dup) {
+                                         const value_t root_type, const bool root_already_unique,
+                                         bool& root_own_unique, bool& saw_dup) {
+    const std::size_t dat_read = (sdoc->doc != nullptr) ? sdoc->doc->dat_read : 0u;
     if (sdoc->arena.head == nullptr && sdoc->doc != nullptr) {
         const std::size_t vc = yyjson_doc_get_val_count(sdoc->doc);
-        std::size_t est = vc * 24u + 4096u;
+        std::size_t est = vc * 28u + 4096u;
         if (est < 65536u) {
             est = 65536u;
         } else if (est > kLargeCacheMaxEntryBytes) {
@@ -4265,52 +5338,58 @@ inline const void* materialize_doc_arena(SharedYyDoc* sdoc, yyjson_val* root,
     if (seed == 0u) {
         seed = hash_seed_slow();
     }
-    const std::string* const empty_key = &empty_key_string_singleton();
-    SharedString* const empty_str = &empty_arena_string_singleton();
-    StringValInternTable& str_intern = tls_str_val_intern_table();
-    bool str_intern_started = false;
-
-    KeyInternTable& intern = tls_key_intern_table();
-    intern.begin_doc();
-    ArenaMaterializeScratch& scratch = tls_arena_materialize_scratch();
-    scratch.shape_cache.begin_doc();
-    scratch.workstack.clear();
+    ArenaMatTLS& tls = tls_arena_mat();
+    tls.key_intern.begin_doc();
+    tls.long_cache.begin_doc(dat_read);
+    tls.short_cache.begin_doc(dat_read);
+    tls.scratch.shape_cache.begin_doc();
+    tls.scratch.workstack.clear();
     struct ScratchGuard {
         ArenaMaterializeScratch& s;
         ~ScratchGuard() {
             s.workstack.clear();
         }
-    } scratch_guard{scratch};
+    } scratch_guard{tls.scratch};
+    ArenaMaterializeScratch& scratch = tls.scratch;
+
+    ArenaMatCtx ctx{
+        sdoc,
+        tls.key_intern,
+        scratch,
+        &empty_arena_string_singleton(),
+        tls.long_cache,
+        tls.short_cache,
+        try_tls_str_pool(),
+        seed,
+        dat_read,
+        0u,
+        sdoc->str_pool_padded_32,
+        false,
+    };
 
     root_own_unique = true;
-    saw_dup = false;
 
     const void* root_ptr = nullptr;
     if (root_type == value_t::array) {
-        root_ptr = build_arena_array_node(sdoc, root, intern, scratch, empty_key, empty_str,
-                                          str_intern, str_intern_started, seed, saw_dup);
+        root_ptr = build_arena_array_node(ctx, root);
     } else {
-        root_ptr = build_arena_object_node(sdoc, root, intern, scratch, empty_key, empty_str,
-                                           str_intern, str_intern_started, seed, root_own_unique,
-                                           saw_dup);
+        root_ptr = build_arena_object_node(ctx, root, &root_own_unique, root_already_unique);
     }
 
     while (!scratch.workstack.empty()) {
         const ArenaWorkItem item = scratch.workstack.back();
         scratch.workstack.pop_back();
+        ctx.depth = 0u;
         if (yyjson_is_arr(item.yy_ctn)) {
-            ArenaArray* child_aa = build_arena_array_node(sdoc, item.yy_ctn, intern, scratch,
-                                                          empty_key, empty_str, str_intern,
-                                                          str_intern_started, seed, saw_dup);
+            ArenaArray* child_aa = build_arena_array_node(ctx, item.yy_ctn);
             json_access::set_arena_array_ptr(item.dst_slot, child_aa);
         } else {
-            bool ignored_own_unique = true;
-            ArenaObject* child_ao = build_arena_object_node(
-                sdoc, item.yy_ctn, intern, scratch, empty_key, empty_str, str_intern,
-                str_intern_started, seed, ignored_own_unique, saw_dup);
+            ArenaObject* child_ao =
+                build_arena_object_node(ctx, item.yy_ctn, nullptr, false);
             json_access::set_arena_object_ptr(item.dst_slot, child_ao);
         }
     }
+    saw_dup = ctx.saw_dup;
     return root_ptr;
 }
 
@@ -4326,13 +5405,16 @@ const void* lazy_materialize_arena(LazyHeader* hdr, const value_t type) {
     if (existing != nullptr) {
         return existing;
     }
-    SpinGuard guard(node->doc->arena_lock);
+    U8SpinGuard guard(node->doc->arena_lock);
     existing = node->arena_view.load(std::memory_order_relaxed);
     if (existing == nullptr) {
+        const bool root_already_unique =
+            (type == value_t::object) &&
+            ((node->dedup_state.load(std::memory_order_acquire) & 1u) != 0u);
         bool root_own_unique = true;
         bool saw_dup = false;
-        const void* built =
-            materialize_doc_arena(node->doc, node->val, type, root_own_unique, saw_dup);
+        const void* built = materialize_doc_arena(node->doc, node->val, type, root_already_unique,
+                                                  root_own_unique, saw_dup);
         if (type == value_t::object) {
             if (root_own_unique) {
                 mark_own_unique(node);
@@ -4380,9 +5462,9 @@ ArenaHashIndex* arena_obj_build_index_slow(const ArenaObject* ao) noexcept {
         }
         std::fill_n(slots, cap, ArenaHashSlot{0u, 0u});
         const std::size_t mask = cap - 1u;
-        const std::string* const* ks = ao->keys();
+        const std::string* ks = ao->keys();
         for (std::size_t i = 0u; i < n; ++i) {
-            const std::uint64_t h = hash_bytes(ks[i]->data(), ks[i]->size());
+            const std::uint64_t h = hash_bytes(ks[i].data(), ks[i].size());
             const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
             std::size_t pos = static_cast<std::size_t>(h) & mask;
             while (slots[pos].idx_plus_one != 0u) {
@@ -4490,7 +5572,7 @@ void arena_clone_to_owned(json& dst, const json& src) {
         } else {
             const ArenaObject* ao = json_access::arena_object_ptr(*cur_src);
             const std::size_t n = ao->count;
-            const std::string* const* ks = ao->keys();
+            const std::string* ks = ao->keys();
             const json* vs = ao->vals();
             if (n == 0u) {
                 *cur_dst = json_access::make_object();
@@ -4499,7 +5581,7 @@ void arena_clone_to_owned(json& dst, const json& src) {
                 if (n <= kSmallObjMaxCap) {
                     std::size_t total_key_bytes = 0u;
                     for (std::size_t i = 0u; i < n; ++i) {
-                        total_key_bytes += ks[i]->size();
+                        total_key_bytes += ks[i].size();
                     }
                     so = json_access::create_small_object_raw_for(n, total_key_bytes);
                 }
@@ -4515,7 +5597,7 @@ void arena_clone_to_owned(json& dst, const json& src) {
                     for (std::size_t i = 0u; i < n; ++i) {
                         bool nested = false;
                         json val = clone_arena_leaf_or_placeholder(vs[i], nested);
-                        json_access::small_object_append_unique(so, *ks[i], std::move(val));
+                        json_access::small_object_append_unique(so, ks[i], std::move(val));
                         if (nested) {
                             workstack.emplace_back(&vs[i], &so->val(i));
                         }
@@ -4535,7 +5617,7 @@ void arena_clone_to_owned(json& dst, const json& src) {
                     for (std::size_t i = 0u; i < n; ++i) {
                         bool nested = false;
                         json val = clone_arena_leaf_or_placeholder(vs[i], nested);
-                        obj->emplace_back_unindexed(*ks[i], std::move(val));
+                        obj->emplace_back_unindexed(ks[i], std::move(val));
                         if (nested) {
                             workstack.emplace_back(&vs[i], &(*obj)[i].second);
                         }
@@ -4603,7 +5685,7 @@ const void* arena_compat_object(const ArenaObject* ao) {
         }
     }
     const std::size_t n = ao->count;
-    const std::string* const* ks = ao->keys();
+    const std::string* ks = ao->keys();
     const json* vs = ao->vals();
     json::object_t* obj = json_access::create_object_vec_cap(n);
     struct ObjGuard {
@@ -4619,9 +5701,9 @@ const void* arena_compat_object(const ArenaObject* ao) {
         if (v.is_string()) {
             // Detach strings to m_storage == 0u so compat_cache never holds a refcount cycle to sdoc.
             const auto& s = json_access::string_of(v);
-            obj->emplace_back_unindexed(*ks[i], json_access::make_string(s.data(), s.size()));
+            obj->emplace_back_unindexed(ks[i], json_access::make_string(s.data(), s.size()));
         } else {
-            obj->emplace_back_unindexed(*ks[i], json_access::copy_arena_slot_raw(v));
+            obj->emplace_back_unindexed(ks[i], json_access::copy_arena_slot_raw(v));
         }
     }
     SpinGuard lock_guard(ex->extra_lock);
@@ -4863,7 +5945,7 @@ struct ObjView {
             case Kind::Small:
                 return static_cast<const SmallObject4*>(ptr)->key_view(i);
             case Kind::Arena:
-                return std::string_view(*static_cast<const ArenaObject*>(ptr)->keys()[i]);
+                return std::string_view(static_cast<const ArenaObject*>(ptr)->keys()[i]);
             case Kind::Eager:
             case Kind::Empty:
             default:
@@ -5739,13 +6821,13 @@ inline void dump_arena_object_compact_strict(DumpBuffer& out, const ArenaObject*
         return;
     }
     out.push('{');
-    const std::string* const* ks = ao->keys();
+    const std::string* ks = ao->keys();
     const json* vs = ao->vals();
     for (std::size_t i = 0u; i < n; ++i) {
         if (i > 0u) {
             out.push(',');
         }
-        utf8_impl::dump_key_colon_fast_strict(out, *ks[i]);
+        utf8_impl::dump_key_colon_fast_strict(out, ks[i]);
         dump_compact_strict(out, vs[i]);
     }
     out.push('}');
@@ -6111,7 +7193,7 @@ inline void dump_arena_object_value(DumpBuffer& out, const ArenaObject* ao,
         out.append("{}", 2);
         return;
     }
-    const std::string* const* ks = ao->keys();
+    const std::string* ks = ao->keys();
     const json* vs = ao->vals();
     if (pretty_print) {
         out.append("{\n", 2);
@@ -6123,7 +7205,7 @@ inline void dump_arena_object_value(DumpBuffer& out, const ArenaObject* ao,
         for (std::size_t i = 0u; i < n; ++i) {
             out.append(indent_string.data(), new_indent);
             out.push('"');
-            utf8_impl::dump_escaped(out, *ks[i], ensure_ascii, error_handler);
+            utf8_impl::dump_escaped(out, ks[i], ensure_ascii, error_handler);
             out.append("\": ", 3);
             dump_value(out, vs[i], true, ensure_ascii, error_handler, indent_step, indent_string,
                        new_indent);
@@ -6142,7 +7224,7 @@ inline void dump_arena_object_value(DumpBuffer& out, const ArenaObject* ao,
                 out.push(',');
             }
             out.push('"');
-            utf8_impl::dump_escaped(out, *ks[i], ensure_ascii, error_handler);
+            utf8_impl::dump_escaped(out, ks[i], ensure_ascii, error_handler);
             out.append("\":", 2);
             dump_value(out, vs[i], false, ensure_ascii, error_handler, indent_step, indent_string,
                        current_indent);
@@ -8602,7 +9684,16 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_i
             sig = sig * 100000000ULL + parse_8_digits_swar(w);
             p += 8;
             digits += 8;
-            if (end - p >= 4) {
+            if (end - p >= 8) {
+                std::uint64_t w2 = 0u;
+                std::memcpy(&w2, p, 8u);
+                if (is_made_of_8_digits_swar(w2)) {
+                    sig = sig * 100000000ULL + parse_8_digits_swar(w2);
+                    p += 8;
+                    digits += 8;
+                }
+            }
+            if (digits <= 14 && end - p >= 4) {
                 std::uint32_t w4 = 0u;
                 std::memcpy(&w4, p, 4u);
                 if (is_made_of_4_digits_swar(w4)) {
@@ -8664,30 +9755,46 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* skip_ws_avx2_slow(
     return p;
 }
 
-alignas(32) static constexpr std::uint8_t kSimdQuote32[32] = {
+} // namespace
+
+alignas(32) extern std::uint8_t kSimdQuote32[32];
+alignas(32) extern std::uint8_t kSimdBslash32[32];
+alignas(32) extern std::uint8_t kSimd1F_32[32];
+alignas(32) extern std::uint8_t kSimd20_32[32];
+alignas(32) extern std::uint8_t kSimdE0_32[32];
+
+alignas(32) std::uint8_t kSimdQuote32[32] = {
     0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u,
     0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u,
     0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u,
     0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u, 0x22u,
 };
-alignas(32) static constexpr std::uint8_t kSimdBslash32[32] = {
+alignas(32) std::uint8_t kSimdBslash32[32] = {
     0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu,
     0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu,
     0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu,
     0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu, 0x5Cu,
 };
-alignas(32) static constexpr std::uint8_t kSimd20_32[32] = {
+alignas(32) std::uint8_t kSimd1F_32[32] = {
+    0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu,
+    0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu,
+    0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu,
+    0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu, 0x1Fu,
+};
+alignas(32) std::uint8_t kSimd20_32[32] = {
     0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u,
     0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u,
     0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u,
     0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u, 0x20u,
 };
-alignas(32) static constexpr std::uint8_t kSimdE0_32[32] = {
+alignas(32) std::uint8_t kSimdE0_32[32] = {
     0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u,
     0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u,
     0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u,
     0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u, 0xE0u,
 };
+
+namespace {
 alignas(32) static constexpr std::uint8_t kSimd0F_32[32] = {
     0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu,
     0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu, 0x0Fu,
@@ -8713,28 +9820,29 @@ alignas(32) static constexpr std::uint8_t kSimd80_32[32] = {
     0x80u, 0x80u, 0x80u, 0x80u, 0x80u, 0x80u, 0x80u, 0x80u,
 };
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_ws_fast_avx2(
+NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_ws_inline_avx2(
     const char* p, const char* const end) noexcept {
     if (NEOJSON_LIKELY(p < end && static_cast<unsigned char>(*p) > 0x20u)) {
         return p;
     }
-    if (NEOJSON_LIKELY(p < end && (*p == ' ' || *p == '\n'))) {
-        ++p;
-        if (p < end && static_cast<unsigned char>(*p) > 0x20u) {
-            return p;
-        }
-        if (NEOJSON_LIKELY(end - p >= 32)) {
-            const __m256i v_sp = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            const std::uint32_t non_sp =
-                ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_sp)));
-            if (NEOJSON_LIKELY(non_sp != 0u)) {
-                p += static_cast<unsigned>(__builtin_ctz(non_sp));
-                if (NEOJSON_LIKELY(static_cast<unsigned char>(*p) > 0x20u)) {
-                    return p;
-                }
+    return skip_ws_avx2_slow(p, end);
+}
+
+NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_spaces_once_avx2(
+    const char* p, const char* const end) noexcept {
+    if (NEOJSON_LIKELY(end - p >= 32)) {
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        const __m256i v_sp = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
+        const std::uint32_t non_sp =
+            ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_sp)));
+        if (NEOJSON_LIKELY(non_sp != 0u)) {
+            p += static_cast<unsigned>(__builtin_ctz(non_sp));
+            if (NEOJSON_LIKELY(static_cast<unsigned char>(*p) > 0x20u)) {
+                return p;
             }
+            return skip_ws_avx2_slow(p, end);
         }
+        return skip_ws_avx2_slow(p + 32, end);
     }
     return skip_ws_avx2_slow(p, end);
 }
@@ -8843,10 +9951,150 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool utf8_chunk_valid_avx2
     return _mm256_testz_si256(err, err) != 0;
 }
 
+NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) void validate_utf8_step_avx2(
+    const __m256i p, const __m256i c, const __m256i zero, const __m256i v_0f, const __m256i v_df,
+    const __m256i v_ef, const __m256i v_80, const __m256i lut_hi1, const __m256i lut_lo1,
+    const __m256i lut_hi2, __m256i& err) noexcept {
+    const __m256i v_shift = _mm256_permute2x128_si256(p, c, 0x21);
+    const __m256i prev1 = _mm256_alignr_epi8(c, v_shift, 15);
+    const __m256i prev2 = _mm256_alignr_epi8(c, v_shift, 14);
+    const __m256i prev3 = _mm256_alignr_epi8(c, v_shift, 13);
+    const __m256i hi1 = _mm256_and_si256(_mm256_srli_epi16(prev1, 4), v_0f);
+    const __m256i lo1 = _mm256_and_si256(prev1, v_0f);
+    const __m256i hi2 = _mm256_and_si256(_mm256_srli_epi16(c, 4), v_0f);
+    const __m256i sc = _mm256_and_si256(
+        _mm256_and_si256(_mm256_shuffle_epi8(lut_hi1, hi1), _mm256_shuffle_epi8(lut_lo1, lo1)),
+        _mm256_shuffle_epi8(lut_hi2, hi2));
+    const __m256i must23 =
+        _mm256_or_si256(_mm256_subs_epu8(prev2, v_df), _mm256_subs_epu8(prev3, v_ef));
+    const __m256i must23_80 = _mm256_and_si256(_mm256_cmpgt_epi8(must23, zero), v_80);
+    err = _mm256_or_si256(err, _mm256_xor_si256(sc, must23_80));
+}
+
+NEOJSON_NOINLINE __attribute__((target("avx2"))) bool validate_utf8_avx2(
+    const char* const s, const std::size_t len) noexcept {
+    if (len == 0u) {
+        return true;
+    }
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i v_0f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd0F_32));
+    const __m256i v_df = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdDF_32));
+    const __m256i v_ef = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdEF_32));
+    const __m256i v_80 = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd80_32));
+    const __m256i lut_hi1 = _mm256_setr_epi8(
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+        0x11, 0x01, 0x0D, 0x61,
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80), static_cast<char>(0x80),
+        0x11, 0x01, 0x0D, 0x61);
+    const __m256i lut_lo1 = _mm256_setr_epi8(
+        static_cast<char>(0xB7), static_cast<char>(0x93), static_cast<char>(0x83), static_cast<char>(0x83),
+        static_cast<char>(0xC3), static_cast<char>(0xE3), static_cast<char>(0xE3), static_cast<char>(0xE3),
+        static_cast<char>(0xE3), static_cast<char>(0xE3), static_cast<char>(0xE3), static_cast<char>(0xE3),
+        static_cast<char>(0xE3), static_cast<char>(0xEB), static_cast<char>(0xE3), static_cast<char>(0xE3),
+        static_cast<char>(0xB7), static_cast<char>(0x93), static_cast<char>(0x83), static_cast<char>(0x83),
+        static_cast<char>(0xC3), static_cast<char>(0xE3), static_cast<char>(0xE3), static_cast<char>(0xE3),
+        static_cast<char>(0xE3), static_cast<char>(0xE3), static_cast<char>(0xE3), static_cast<char>(0xE3),
+        static_cast<char>(0xE3), static_cast<char>(0xEB), static_cast<char>(0xE3), static_cast<char>(0xE3));
+    const __m256i lut_hi2 = _mm256_setr_epi8(
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        static_cast<char>(0xB6), static_cast<char>(0xD6), static_cast<char>(0xDA), static_cast<char>(0xDA),
+        0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        static_cast<char>(0xB6), static_cast<char>(0xD6), static_cast<char>(0xDA), static_cast<char>(0xDA),
+        0x01, 0x01, 0x01, 0x01);
+
+    __m256i prev = zero;
+    __m256i err = zero;
+
+    std::size_t i = 0u;
+    for (; i + 32u <= len; i += 32u) {
+        const __m256i curr = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+        if (_mm256_movemask_epi8(_mm256_or_si256(prev, curr)) != 0) {
+            validate_utf8_step_avx2(prev, curr, zero, v_0f, v_df, v_ef, v_80, lut_hi1, lut_lo1,
+                                    lut_hi2, err);
+        }
+        prev = curr;
+    }
+    const std::size_t rem = len & 31u;
+    if (rem > 0u) {
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+        const __m256i pmask =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kUtf8PrefixMask + 32u - rem));
+        const __m256i curr = _mm256_and_si256(v, pmask);
+        validate_utf8_step_avx2(prev, curr, zero, v_0f, v_df, v_ef, v_80, lut_hi1, lut_lo1,
+                                lut_hi2, err);
+    } else if (_mm256_movemask_epi8(prev) != 0) {
+        validate_utf8_step_avx2(prev, zero, zero, v_0f, v_df, v_ef, v_80, lut_hi1, lut_lo1,
+                                lut_hi2, err);
+    }
+    return _mm256_testz_si256(err, err) != 0;
+}
+
+NEOJSON_NOINLINE __attribute__((target("avx2"))) bool decode_unicode_escape_avx2(
+    const char*& p, const char* const end, char*& dst) noexcept {
+    if (NEOJSON_UNLIKELY(end - p < 4)) {
+        return false;
+    }
+    std::uint32_t cp = 0u;
+    if (NEOJSON_UNLIKELY(!decode_hex4_fast(p, cp))) {
+        return false;
+    }
+    p += 4;
+    if (cp <= 0x7Fu) {
+        *dst++ = static_cast<char>(cp);
+    } else if (cp <= 0x7FFu) {
+        dst[0] = static_cast<char>(0xC0u | (cp >> 6u));
+        dst[1] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        dst += 2;
+    } else if (cp >= 0xD800u && cp <= 0xDBFFu) {
+        if (NEOJSON_UNLIKELY(end - p < 6 || p[0] != '\\' || p[1] != 'u')) {
+            return false;
+        }
+        std::uint32_t cp2 = 0u;
+        if (NEOJSON_UNLIKELY(!decode_hex4_fast(p + 2, cp2) || cp2 < 0xDC00u ||
+                             cp2 > 0xDFFFu)) {
+            return false;
+        }
+        p += 6;
+        const std::uint32_t full =
+            0x10000u + (((cp - 0xD800u) << 10u) | (cp2 - 0xDC00u));
+        dst[0] = static_cast<char>(0xF0u | (full >> 18u));
+        dst[1] = static_cast<char>(0x80u | ((full >> 12u) & 0x3Fu));
+        dst[2] = static_cast<char>(0x80u | ((full >> 6u) & 0x3Fu));
+        dst[3] = static_cast<char>(0x80u | (full & 0x3Fu));
+        dst += 4;
+    } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+        return false;
+    } else {
+        dst[0] = static_cast<char>(0xE0u | (cp >> 12u));
+        dst[1] = static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu));
+        dst[2] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        dst += 3;
+    }
+    return true;
+}
+
+struct alignas(64) SimpleEscTable {
+    char ch[256]{};
+    constexpr SimpleEscTable() noexcept {
+        ch[static_cast<unsigned char>('"')] = '"';
+        ch[static_cast<unsigned char>('\\')] = '\\';
+        ch[static_cast<unsigned char>('/')] = '/';
+        ch[static_cast<unsigned char>('b')] = '\b';
+        ch[static_cast<unsigned char>('f')] = '\f';
+        ch[static_cast<unsigned char>('n')] = '\n';
+        ch[static_cast<unsigned char>('r')] = '\r';
+        ch[static_cast<unsigned char>('t')] = '\t';
+    }
+};
+static constexpr SimpleEscTable kSimpleEsc{};
+
 NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_slow_avx2(
     const char* p, const char* const end, char* const dst_start, char* dst,
-    yyjson_val* const out) noexcept {
-    bool has_esc = false;
+    yyjson_val* const out, const bool has_esc_init = false) noexcept {
+    bool has_esc = has_esc_init;
     if (p < end) {
         const unsigned char b0 = static_cast<unsigned char>(*p);
         if (NEOJSON_UNLIKELY(b0 < 0x20u)) {
@@ -8878,14 +10126,13 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_slow_a
                         if (NEOJSON_UNLIKELY(!utf8_chunk_valid_avx2(v))) {
                             return {nullptr, dst_start};
                         }
+                        const unsigned char c29 = static_cast<unsigned char>(p[29]);
+                        const unsigned char c30 = static_cast<unsigned char>(p[30]);
+                        const unsigned char c31 = static_cast<unsigned char>(p[31]);
                         std::size_t adv = 32u;
-                        if (static_cast<unsigned char>(p[31]) >= 0xC0u) {
-                            adv = 31u;
-                        } else if (static_cast<unsigned char>(p[30]) >= 0xE0u) {
-                            adv = 30u;
-                        } else if (static_cast<unsigned char>(p[29]) >= 0xF0u) {
-                            adv = 29u;
-                        }
+                        adv = (c29 >= 0xF0u) ? 29u : adv;
+                        adv = (c30 >= 0xE0u) ? 30u : adv;
+                        adv = (c31 >= 0xC0u) ? 31u : adv;
                         p += adv;
                         dst += adv;
                     } else {
@@ -9042,112 +10289,192 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_slow_a
         if (NEOJSON_UNLIKELY(p >= end)) {
             return {nullptr, dst_start};
         }
-        const char esc = *p++;
-        switch (esc) {
-            case '"':
-            case '\\':
-            case '/':
-                *dst++ = esc;
-                break;
-            case 'b':
-                *dst++ = '\b';
-                break;
-            case 'f':
-                *dst++ = '\f';
-                break;
-            case 'n':
-                *dst++ = '\n';
-                break;
-            case 'r':
-                *dst++ = '\r';
-                break;
-            case 't':
-                *dst++ = '\t';
-                break;
-            case 'u': {
-                if (NEOJSON_UNLIKELY(end - p < 4)) {
-                    return {nullptr, dst_start};
-                }
-                std::uint32_t cp = 0u;
-                if (NEOJSON_UNLIKELY(!decode_hex4_fast(p, cp))) {
-                    return {nullptr, dst_start};
-                }
-                p += 4;
-                if (cp <= 0x7Fu) {
-                    *dst++ = static_cast<char>(cp);
-                } else if (cp <= 0x7FFu) {
-                    dst[0] = static_cast<char>(0xC0u | (cp >> 6u));
-                    dst[1] = static_cast<char>(0x80u | (cp & 0x3Fu));
-                    dst += 2;
-                } else if (cp >= 0xD800u && cp <= 0xDBFFu) {
-                    if (NEOJSON_UNLIKELY(end - p < 6 || p[0] != '\\' || p[1] != 'u')) {
-                        return {nullptr, dst_start};
-                    }
-                    std::uint32_t cp2 = 0u;
-                    if (NEOJSON_UNLIKELY(!decode_hex4_fast(p + 2, cp2) || cp2 < 0xDC00u ||
-                                         cp2 > 0xDFFFu)) {
-                        return {nullptr, dst_start};
-                    }
-                    p += 6;
-                    const std::uint32_t full =
-                        0x10000u + (((cp - 0xD800u) << 10u) | (cp2 - 0xDC00u));
-                    dst[0] = static_cast<char>(0xF0u | (full >> 18u));
-                    dst[1] = static_cast<char>(0x80u | ((full >> 12u) & 0x3Fu));
-                    dst[2] = static_cast<char>(0x80u | ((full >> 6u) & 0x3Fu));
-                    dst[3] = static_cast<char>(0x80u | (full & 0x3Fu));
-                    dst += 4;
-                } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
-                    return {nullptr, dst_start};
-                } else {
-                    dst[0] = static_cast<char>(0xE0u | (cp >> 12u));
-                    dst[1] = static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu));
-                    dst[2] = static_cast<char>(0x80u | (cp & 0x3Fu));
-                    dst += 3;
-                }
-                break;
-            }
-            default:
+        const unsigned char esc = static_cast<unsigned char>(*p++);
+        const char dec = kSimpleEsc.ch[esc];
+        if (NEOJSON_LIKELY(dec != 0)) {
+            *dst++ = dec;
+        } else if (esc == 'u') {
+            if (NEOJSON_UNLIKELY(!decode_unicode_escape_avx2(p, end, dst))) {
                 return {nullptr, dst_start};
+            }
+        } else {
+            return {nullptr, dst_start};
         }
     }
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) StrParseRes parse_string_fast_avx2(
-    const char* p, const char* const end, char* const str_cur, yyjson_val* const out) noexcept {
-    char* const dst_start = str_cur;
-    char* dst = dst_start;
+NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool parse_string_key_fast_avx2(
+    const char*& p_io, const char* const end, char*& str_cur_io, yyjson_val* const out) noexcept {
+    const char* p = p_io;
+    char* const dst_start = str_cur_io;
     if (NEOJSON_LIKELY(end - p >= 32)) {
-        do {
-            const __m256i v_quote =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-            const __m256i v_bslash =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-            const __m256i v_20 = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
-            const __m256i q_or_b =
-                _mm256_or_si256(_mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
-            const __m256i special = _mm256_or_si256(q_or_b, _mm256_cmpgt_epi8(v_20, v));
-            const std::uint32_t mask = static_cast<std::uint32_t>(_mm256_movemask_epi8(special));
-            if (mask != 0u) {
-                const unsigned n = static_cast<unsigned>(__builtin_ctz(mask));
-                p += n;
-                dst += n;
-                if (NEOJSON_LIKELY(*p == '"')) {
-                    *dst = '\0';
-                    const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_start), v);
+        const std::uint32_t q_mask = static_cast<std::uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32)))));
+        const __m256i ok_vec = _mm256_andnot_si256(
+            _mm256_cmpeq_epi8(v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32))),
+            _mm256_cmpgt_epi8(v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32))));
+        const std::uint32_t bad_mask = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(ok_vec));
+        if (NEOJSON_LIKELY(q_mask != 0u)) {
+            const std::uint32_t pre_mask = (q_mask ^ (q_mask - 1u)) >> 1u;
+            if (NEOJSON_LIKELY((bad_mask & pre_mask) == 0u)) {
+                const unsigned n = static_cast<unsigned>(__builtin_ctz(q_mask));
+                dst_start[n] = '\0';
+                out->tag = (static_cast<std::uint64_t>(n) << 8u) | YYJSON_TYPE_STR |
+                           YYJSON_SUBTYPE_NOESC;
+                out->uni.str = dst_start;
+                p_io = p + n + 1u;
+                str_cur_io = dst_start + n + 1u;
+                return true;
+            }
+        }
+        if (bad_mask != 0u) {
+            const unsigned b = static_cast<unsigned>(__builtin_ctz(bad_mask));
+            const StrParseRes sr =
+                parse_string_slow_avx2(p + b, end, dst_start, dst_start + b, out, false);
+            p_io = sr.p;
+            str_cur_io = sr.str_cur;
+            return sr.p != nullptr;
+        }
+        p += 32;
+        char* dst = dst_start + 32;
+        while (end - p >= 32) {
+            const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), vc);
+            const std::uint32_t qm = static_cast<std::uint32_t>(_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(
+                    vc, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32)))));
+            const __m256i okc = _mm256_andnot_si256(
+                _mm256_cmpeq_epi8(
+                    vc, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32))),
+                _mm256_cmpgt_epi8(
+                    vc, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32))));
+            const std::uint32_t bm = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(okc));
+            if (NEOJSON_LIKELY(qm != 0u)) {
+                const std::uint32_t prem = (qm ^ (qm - 1u)) >> 1u;
+                if (NEOJSON_LIKELY((bm & prem) == 0u)) {
+                    const unsigned m = static_cast<unsigned>(__builtin_ctz(qm));
+                    dst[m] = '\0';
+                    const std::size_t slen = static_cast<std::size_t>((dst + m) - dst_start);
                     out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
                                YYJSON_SUBTYPE_NOESC;
                     out->uni.str = dst_start;
-                    return {p + 1, dst + 1};
+                    p_io = p + m + 1u;
+                    str_cur_io = dst + m + 1u;
+                    return true;
                 }
-                return parse_string_slow_avx2(p, end, dst_start, dst, out);
+            }
+            if (bm != 0u) {
+                const unsigned b = static_cast<unsigned>(__builtin_ctz(bm));
+                const StrParseRes sr =
+                    parse_string_slow_avx2(p + b, end, dst_start, dst + b, out, false);
+                p_io = sr.p;
+                str_cur_io = sr.str_cur;
+                return sr.p != nullptr;
             }
             p += 32;
             dst += 32;
-        } while (end - p >= 32);
+        }
+        const StrParseRes sr = parse_string_slow_avx2(p, end, dst_start, dst, out, false);
+        p_io = sr.p;
+        str_cur_io = sr.str_cur;
+        return sr.p != nullptr;
     }
-    return parse_string_slow_avx2(p, end, dst_start, dst, out);
+    const StrParseRes sr = parse_string_slow_avx2(p, end, dst_start, dst_start, out, false);
+    p_io = sr.p;
+    str_cur_io = sr.str_cur;
+    return sr.p != nullptr;
+}
+
+NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool parse_string_val_fast_avx2(
+    const char*& p_io, const char* const end, char*& str_cur_io, yyjson_val* const out) noexcept {
+    const char* p = p_io;
+    char* const dst_start = str_cur_io;
+    char* dst = dst_start;
+    if (NEOJSON_LIKELY(end - p >= 32)) {
+        std::uint32_t hi_accum = 0u;
+        std::uint8_t subtype = YYJSON_SUBTYPE_NOESC;
+        do {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
+            const std::uint32_t q_mask = static_cast<std::uint32_t>(_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(
+                    v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32)))));
+            const __m256i bad_vec = _mm256_or_si256(
+                _mm256_cmpeq_epi8(
+                    v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32))),
+                _mm256_cmpeq_epi8(
+                    _mm256_and_si256(
+                        v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdE0_32))),
+                    _mm256_setzero_si256()));
+            const std::uint32_t bad_mask =
+                static_cast<std::uint32_t>(_mm256_movemask_epi8(bad_vec));
+            if (NEOJSON_LIKELY(q_mask != 0u)) {
+                const std::uint32_t pre_mask = (q_mask ^ (q_mask - 1u)) >> 1u;
+                if (NEOJSON_LIKELY((bad_mask & pre_mask) == 0u)) {
+                    const unsigned n = static_cast<unsigned>(__builtin_ctz(q_mask));
+                    const std::uint32_t cur_hi =
+                        static_cast<std::uint32_t>(_mm256_movemask_epi8(v)) & pre_mask;
+                    dst[n] = '\0';
+                    const std::size_t slen = static_cast<std::size_t>((dst + n) - dst_start);
+                    if (NEOJSON_UNLIKELY((hi_accum | cur_hi) != 0u) &&
+                        NEOJSON_UNLIKELY(!validate_utf8_avx2(dst_start, slen))) {
+                        return false;
+                    }
+                    out->tag =
+                        (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
+                    out->uni.str = dst_start;
+                    p_io = p + n + 1u;
+                    str_cur_io = dst + n + 1u;
+                    return true;
+                }
+            }
+            if (bad_mask != 0u) {
+                const unsigned b = static_cast<unsigned>(__builtin_ctz(bad_mask));
+                const std::uint32_t pre_b = (bad_mask ^ (bad_mask - 1u)) >> 1u;
+                hi_accum |= static_cast<std::uint32_t>(_mm256_movemask_epi8(v)) & pre_b;
+                p += b;
+                dst += b;
+                if (*p == '\\' && p + 1 < end) {
+                    const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                    if (NEOJSON_LIKELY(ec != 0)) {
+                        *dst++ = ec;
+                        p += 2;
+                        subtype = YYJSON_SUBTYPE_NONE;
+                        continue;
+                    }
+                }
+                if (NEOJSON_UNLIKELY(hi_accum != 0u) &&
+                    NEOJSON_UNLIKELY(!validate_utf8_avx2(
+                        dst_start, static_cast<std::size_t>(dst - dst_start)))) {
+                    return false;
+                }
+                const StrParseRes sr = parse_string_slow_avx2(
+                    p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+                p_io = sr.p;
+                str_cur_io = sr.str_cur;
+                return sr.p != nullptr;
+            }
+            hi_accum |= static_cast<std::uint32_t>(_mm256_movemask_epi8(v));
+            p += 32;
+            dst += 32;
+        } while (end - p >= 32);
+        if (NEOJSON_UNLIKELY(hi_accum != 0u)) {
+            p = p_io;
+            dst = dst_start;
+            subtype = YYJSON_SUBTYPE_NOESC;
+        }
+        const StrParseRes sr = parse_string_slow_avx2(
+            p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+        p_io = sr.p;
+        str_cur_io = sr.str_cur;
+        return sr.p != nullptr;
+    }
+    const StrParseRes sr = parse_string_slow_avx2(p, end, dst_start, dst, out, false);
+    p_io = sr.p;
+    str_cur_io = sr.str_cur;
+    return sr.p != nullptr;
 }
 
 NEOJSON_NOINLINE __attribute__((target("avx2"))) int parse_num_pair_run_avx2(
@@ -9244,7 +10571,7 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
     const char* p = data;
     const char* const end = data + len;
 
-    p = skip_ws_fast_avx2(p, end);
+    p = skip_ws_inline_avx2(p, end);
     if (p >= end || (*p != '{' && *p != '[')) {
         return nullptr;
     }
@@ -9276,7 +10603,7 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
     ctn->uni.ofs = 0u;
     if (*p == '{') {
         ctn->tag = YYJSON_TYPE_OBJ;
-        p = skip_ws_fast_avx2(p + 1, end);
+        p = skip_ws_inline_avx2(p + 1, end);
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
         }
@@ -9287,7 +10614,7 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
         goto obj_key_begin_no_ws;
     } else {
         ctn->tag = YYJSON_TYPE_ARR;
-        p = skip_ws_fast_avx2(p + 1, end);
+        p = skip_ws_inline_avx2(p + 1, end);
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
         }
@@ -9300,19 +10627,31 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
 
 obj_key_begin_spaces:
     if (NEOJSON_LIKELY(end - p >= 32)) {
-        const __m256i v_sp = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
         const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        const std::uint32_t non_sp =
-            ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_sp)));
+        const std::uint32_t non_sp = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(
+                v, _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32)))));
         if (NEOJSON_LIKELY(non_sp != 0u)) {
             p += static_cast<unsigned>(__builtin_ctz(non_sp));
             if (NEOJSON_LIKELY(*p == '"')) {
-                goto obj_key_begin_quote;
+                goto obj_key_got_quote;
             }
+            p = skip_ws_inline_avx2(p, end);
+            if (NEOJSON_UNLIKELY(p >= end)) {
+                goto fail;
+            }
+            goto obj_key_begin_no_ws;
         }
+        p = skip_ws_avx2_slow(p + 32, end);
+    } else {
+        p = skip_ws_avx2_slow(p, end);
     }
+    if (NEOJSON_UNLIKELY(p >= end)) {
+        goto fail;
+    }
+    goto obj_key_begin_no_ws;
 obj_key_begin:
-    p = skip_ws_fast_avx2(p, end);
+    p = skip_ws_inline_avx2(p, end);
     if (NEOJSON_UNLIKELY(p >= end)) {
         goto fail;
     }
@@ -9320,7 +10659,7 @@ obj_key_begin_no_ws:
     if (NEOJSON_UNLIKELY(*p != '"')) {
         goto fail;
     }
-obj_key_begin_quote:
+obj_key_got_quote:
     if (NEOJSON_UNLIKELY(val >= val_end)) {
         ctx->val = val;
         ctx->ctn = ctn;
@@ -9331,18 +10670,14 @@ obj_key_begin_quote:
         val_end = ctx->val_end;
         ctn = ctx->ctn;
     }
-    {
-        const StrParseRes sr = parse_string_fast_avx2(p + 1, end, str_cur, val++);
-        p = sr.p;
-        str_cur = sr.str_cur;
-        if (NEOJSON_UNLIKELY(p == nullptr)) {
-            goto fail;
-        }
+    ++p;
+    if (NEOJSON_UNLIKELY(!parse_string_key_fast_avx2(p, end, str_cur, val++))) {
+        goto fail;
     }
-    if (NEOJSON_LIKELY(end - p >= 2 && p[0] == ':' && p[1] == ' ')) {
+    if (NEOJSON_LIKELY(end - p >= 3 && p[0] == ':' && p[1] == ' ')) {
         p += 2;
         if (NEOJSON_UNLIKELY(static_cast<unsigned char>(*p) <= 0x20u)) {
-            p = skip_ws_fast_avx2(p, end);
+            p = skip_ws_avx2_slow(p, end);
             if (NEOJSON_UNLIKELY(p >= end)) {
                 goto fail;
             }
@@ -9356,7 +10691,7 @@ obj_key_begin_quote:
         }
         ++p;
         if (p < end && static_cast<unsigned char>(*p) <= 0x20u) {
-            p = skip_ws_fast_avx2(p, end);
+            p = skip_ws_avx2_slow(p, end);
         }
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
@@ -9366,13 +10701,88 @@ obj_key_begin_quote:
     {
         const unsigned char c = static_cast<unsigned char>(*p);
         if (c == '"') {
-            const StrParseRes sr = parse_string_fast_avx2(p + 1, end, str_cur, val++);
-            p = sr.p;
-            str_cur = sr.str_cur;
-            if (NEOJSON_UNLIKELY(p == nullptr)) {
+            ++p;
+            if (NEOJSON_UNLIKELY(!parse_string_val_fast_avx2(p, end, str_cur, val++))) {
                 goto fail;
             }
             ++ctn_len;
+        } else if ((c | 0x20u) == 0x7bu) {
+            if (NEOJSON_UNLIKELY(ctx->depth_rem == 0u)) {
+                goto fail;
+            }
+            if ((c & 0x20u) == 0u) {
+                if (p + 1 < end && p[1] == ']') {
+                    val->tag = YYJSON_TYPE_ARR;
+                    val->uni.ofs = sizeof(yyjson_val);
+                    ++val;
+                    ++ctn_len;
+                    p += 2;
+                } else {
+                    if (p + 1 < end && p[1] == '\n') {
+                        p = skip_spaces_once_avx2(p + 2, end);
+                    } else {
+                        p = skip_ws_inline_avx2(p + 1, end);
+                    }
+                    if (NEOJSON_UNLIKELY(p >= end)) {
+                        goto fail;
+                    }
+                    if (*p == ']') {
+                        val->tag = YYJSON_TYPE_ARR;
+                        val->uni.ofs = sizeof(yyjson_val);
+                        ++val;
+                        ++ctn_len;
+                        ++p;
+                    } else {
+                        ctn->tag =
+                            (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_OBJ;
+                        yyjson_val* const child = val++;
+                        child->uni.ofs = static_cast<std::size_t>(
+                            reinterpret_cast<const char*>(child) -
+                            reinterpret_cast<const char*>(ctn));
+                        child->tag = YYJSON_TYPE_ARR;
+                        ctn = child;
+                        ctn_len = 0u;
+                        --ctx->depth_rem;
+                        goto arr_val_begin_no_ws;
+                    }
+                }
+            } else {
+                if (p + 1 < end && p[1] == '}') {
+                    val->tag = YYJSON_TYPE_OBJ;
+                    val->uni.ofs = sizeof(yyjson_val);
+                    ++val;
+                    ++ctn_len;
+                    p += 2;
+                } else {
+                    if (p + 1 < end && p[1] == '\n') {
+                        p = skip_spaces_once_avx2(p + 2, end);
+                    } else {
+                        p = skip_ws_inline_avx2(p + 1, end);
+                    }
+                    if (NEOJSON_UNLIKELY(p >= end)) {
+                        goto fail;
+                    }
+                    if (*p == '}') {
+                        val->tag = YYJSON_TYPE_OBJ;
+                        val->uni.ofs = sizeof(yyjson_val);
+                        ++val;
+                        ++ctn_len;
+                        ++p;
+                    } else {
+                        ctn->tag =
+                            (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_OBJ;
+                        yyjson_val* const child = val++;
+                        child->uni.ofs = static_cast<std::size_t>(
+                            reinterpret_cast<const char*>(child) -
+                            reinterpret_cast<const char*>(ctn));
+                        child->tag = YYJSON_TYPE_OBJ;
+                        ctn = child;
+                        ctn_len = 0u;
+                        --ctx->depth_rem;
+                        goto obj_key_begin_no_ws;
+                    }
+                }
+            }
         } else if (static_cast<unsigned>(static_cast<unsigned>(c) - static_cast<unsigned>('0')) <=
                        9u ||
                    c == '-') {
@@ -9381,95 +10791,31 @@ obj_key_begin_quote:
                 goto fail;
             }
             ++ctn_len;
-        } else if (c == '{') {
-            if (NEOJSON_UNLIKELY(ctx->depth_rem == 0u)) {
-                goto fail;
-            }
-            if (p + 1 < end && p[1] == '}') {
-                val->tag = YYJSON_TYPE_OBJ;
-                val->uni.ofs = sizeof(yyjson_val);
-                ++val;
-                ++ctn_len;
-                p += 2;
-            } else {
-                p = skip_ws_fast_avx2(p + 1, end);
-                if (NEOJSON_UNLIKELY(p >= end)) {
-                    goto fail;
-                }
-                if (*p == '}') {
-                    val->tag = YYJSON_TYPE_OBJ;
-                    val->uni.ofs = sizeof(yyjson_val);
-                    ++val;
-                    ++ctn_len;
-                    ++p;
-                } else {
-                    ctn->tag = (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_OBJ;
-                    yyjson_val* const child = val++;
-                    child->uni.ofs = static_cast<std::size_t>(
-                        reinterpret_cast<const char*>(child) - reinterpret_cast<const char*>(ctn));
-                    child->tag = YYJSON_TYPE_OBJ;
-                    ctn = child;
-                    ctn_len = 0u;
-                    --ctx->depth_rem;
-                    goto obj_key_begin_no_ws;
-                }
-            }
-        } else if (c == '[') {
-            if (NEOJSON_UNLIKELY(ctx->depth_rem == 0u)) {
-                goto fail;
-            }
-            if (p + 1 < end && p[1] == ']') {
-                val->tag = YYJSON_TYPE_ARR;
-                val->uni.ofs = sizeof(yyjson_val);
-                ++val;
-                ++ctn_len;
-                p += 2;
-            } else {
-                p = skip_ws_fast_avx2(p + 1, end);
-                if (NEOJSON_UNLIKELY(p >= end)) {
-                    goto fail;
-                }
-                if (*p == ']') {
-                    val->tag = YYJSON_TYPE_ARR;
-                    val->uni.ofs = sizeof(yyjson_val);
-                    ++val;
-                    ++ctn_len;
-                    ++p;
-                } else {
-                    ctn->tag = (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_OBJ;
-                    yyjson_val* const child = val++;
-                    child->uni.ofs = static_cast<std::size_t>(
-                        reinterpret_cast<const char*>(child) - reinterpret_cast<const char*>(ctn));
-                    child->tag = YYJSON_TYPE_ARR;
-                    ctn = child;
-                    ctn_len = 0u;
-                    --ctx->depth_rem;
-                    goto arr_val_begin_no_ws;
-                }
-            }
-        } else if (c == 'n') {
-            if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "null", 4u) != 0)) {
-                goto fail;
-            }
-            val++->tag = YYJSON_TYPE_NULL;
-            p += 4;
-            ++ctn_len;
-        } else if (c == 'f') {
-            if (NEOJSON_UNLIKELY(end - p < 5 || std::memcmp(p + 1, "alse", 4u) != 0)) {
-                goto fail;
-            }
-            val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE;
-            p += 5;
-            ++ctn_len;
-        } else if (c == 't') {
-            if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "true", 4u) != 0)) {
-                goto fail;
-            }
-            val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE;
-            p += 4;
-            ++ctn_len;
         } else {
-            goto fail;
+            if (c == 'f') {
+                if (NEOJSON_UNLIKELY(end - p < 5 || std::memcmp(p + 1, "alse", 4u) != 0)) {
+                    goto fail;
+                }
+                val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE;
+                p += 5;
+                ++ctn_len;
+            } else if (c == 'n') {
+                if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "null", 4u) != 0)) {
+                    goto fail;
+                }
+                val++->tag = YYJSON_TYPE_NULL;
+                p += 4;
+                ++ctn_len;
+            } else if (c == 't') {
+                if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "true", 4u) != 0)) {
+                    goto fail;
+                }
+                val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE;
+                p += 4;
+                ++ctn_len;
+            } else {
+                goto fail;
+            }
         }
     }
 
@@ -9487,15 +10833,19 @@ obj_val_end:
             ++p;
             goto obj_end;
         }
-        p = skip_ws_fast_avx2(p, end);
+        if (*p == '\n') {
+            p = skip_spaces_once_avx2(p + 1, end);
+        } else {
+            p = skip_ws_inline_avx2(p, end);
+        }
         if (NEOJSON_LIKELY(p < end)) {
-            if (*p == ',') {
-                ++p;
-                goto obj_key_begin;
-            }
             if (*p == '}') {
                 ++p;
                 goto obj_end;
+            }
+            if (*p == ',') {
+                ++p;
+                goto obj_key_begin;
             }
         }
     }
@@ -9520,20 +10870,13 @@ obj_end: {
 }
 
 arr_val_begin_spaces:
-    if (NEOJSON_LIKELY(end - p >= 32)) {
-        const __m256i v_sp = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
-        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        const std::uint32_t non_sp =
-            ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_sp)));
-        if (NEOJSON_LIKELY(non_sp != 0u)) {
-            p += static_cast<unsigned>(__builtin_ctz(non_sp));
-            if (NEOJSON_LIKELY(static_cast<unsigned char>(*p) > 0x20u)) {
-                goto arr_val_begin_no_ws;
-            }
-        }
+    p = skip_spaces_once_avx2(p, end);
+    if (NEOJSON_UNLIKELY(p >= end)) {
+        goto fail;
     }
+    goto arr_val_begin_no_ws;
 arr_val_begin:
-    p = skip_ws_fast_avx2(p, end);
+    p = skip_ws_inline_avx2(p, end);
     if (NEOJSON_UNLIKELY(p >= end)) {
         goto fail;
     }
@@ -9551,37 +10894,115 @@ arr_val_begin_no_ws:
 
     {
         const unsigned char c = static_cast<unsigned char>(*p);
-        if (c == '{') {
+        if ((c | 0x20u) == 0x7bu) {
             if (NEOJSON_UNLIKELY(ctx->depth_rem == 0u)) {
                 goto fail;
             }
-            if (p + 1 < end && p[1] == '}') {
-                val->tag = YYJSON_TYPE_OBJ;
-                val->uni.ofs = sizeof(yyjson_val);
-                ++val;
-                ++ctn_len;
-                p += 2;
-            } else {
-                p = skip_ws_fast_avx2(p + 1, end);
-                if (NEOJSON_UNLIKELY(p >= end)) {
-                    goto fail;
-                }
-                if (*p == '}') {
+            if ((c & 0x20u) != 0u) {
+                if (p + 1 < end && p[1] == '}') {
                     val->tag = YYJSON_TYPE_OBJ;
                     val->uni.ofs = sizeof(yyjson_val);
                     ++val;
                     ++ctn_len;
-                    ++p;
+                    p += 2;
                 } else {
-                    ctn->tag = (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_ARR;
-                    yyjson_val* const child = val++;
+                    if (p + 1 < end && p[1] == '\n') {
+                        p = skip_spaces_once_avx2(p + 2, end);
+                    } else {
+                        p = skip_ws_inline_avx2(p + 1, end);
+                    }
+                    if (NEOJSON_UNLIKELY(p >= end)) {
+                        goto fail;
+                    }
+                    if (*p == '}') {
+                        val->tag = YYJSON_TYPE_OBJ;
+                        val->uni.ofs = sizeof(yyjson_val);
+                        ++val;
+                        ++ctn_len;
+                        ++p;
+                    } else {
+                        ctn->tag =
+                            (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_ARR;
+                        yyjson_val* const child = val++;
+                        child->uni.ofs = static_cast<std::size_t>(
+                            reinterpret_cast<const char*>(child) -
+                            reinterpret_cast<const char*>(ctn));
+                        child->tag = YYJSON_TYPE_OBJ;
+                        ctn = child;
+                        ctn_len = 0u;
+                        --ctx->depth_rem;
+                        goto obj_key_begin_no_ws;
+                    }
+                }
+            } else {
+                if (p + 1 < end && p[1] == ']') {
+                    val->tag = YYJSON_TYPE_ARR;
+                    val->uni.ofs = sizeof(yyjson_val);
+                    ++val;
+                    ++ctn_len;
+                    p += 2;
+                } else if (p + 4 < end &&
+                           (p[1] == '-' ||
+                            static_cast<unsigned>(static_cast<unsigned char>(p[1]) - '0') <= 9u)) {
+                    ctx->p = p;
+                    ctx->val = val;
+                    ctx->val_end = val_end;
+                    ctx->ctn = ctn;
+                    ctx->ctn_len = ctn_len;
+                    const int pair_rc = parse_num_pair_run_avx2(ctx, end, kHdrVals);
+                    val = ctx->val;
+                    val_end = ctx->val_end;
+                    ctn = ctx->ctn;
+                    ctn_len = ctx->ctn_len;
+                    p = ctx->p;
+                    if (NEOJSON_UNLIKELY(pair_rc == 0)) {
+                        goto fail;
+                    }
+                    if (pair_rc == 1) {
+                        goto arr_val_begin;
+                    }
+                    if (pair_rc == 2) {
+                        goto arr_val_end;
+                    }
+                    ctn->tag =
+                        (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_ARR;
+                    yyjson_val* const child = val;
                     child->uni.ofs = static_cast<std::size_t>(
                         reinterpret_cast<const char*>(child) - reinterpret_cast<const char*>(ctn));
-                    child->tag = YYJSON_TYPE_OBJ;
+                    child->tag = YYJSON_TYPE_ARR;
                     ctn = child;
-                    ctn_len = 0u;
+                    ctn_len = 1u;
+                    val += 2;
                     --ctx->depth_rem;
-                    goto obj_key_begin_no_ws;
+                    goto arr_val_end;
+                } else {
+                    if (p + 1 < end && p[1] == '\n') {
+                        p = skip_spaces_once_avx2(p + 2, end);
+                    } else {
+                        p = skip_ws_inline_avx2(p + 1, end);
+                    }
+                    if (NEOJSON_UNLIKELY(p >= end)) {
+                        goto fail;
+                    }
+                    if (*p == ']') {
+                        val->tag = YYJSON_TYPE_ARR;
+                        val->uni.ofs = sizeof(yyjson_val);
+                        ++val;
+                        ++ctn_len;
+                        ++p;
+                    } else {
+                        ctn->tag =
+                            (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_ARR;
+                        yyjson_val* const child = val++;
+                        child->uni.ofs = static_cast<std::size_t>(
+                            reinterpret_cast<const char*>(child) -
+                            reinterpret_cast<const char*>(ctn));
+                        child->tag = YYJSON_TYPE_ARR;
+                        ctn = child;
+                        ctn_len = 0u;
+                        --ctx->depth_rem;
+                        goto arr_val_begin_no_ws;
+                    }
                 }
             }
         } else if (static_cast<unsigned>(static_cast<unsigned>(c) - static_cast<unsigned>('0')) <=
@@ -9593,102 +11014,36 @@ arr_val_begin_no_ws:
             }
             ++ctn_len;
         } else if (c == '"') {
-            const StrParseRes sr = parse_string_fast_avx2(p + 1, end, str_cur, val++);
-            p = sr.p;
-            str_cur = sr.str_cur;
-            if (NEOJSON_UNLIKELY(p == nullptr)) {
+            ++p;
+            if (NEOJSON_UNLIKELY(!parse_string_val_fast_avx2(p, end, str_cur, val++))) {
                 goto fail;
             }
-            ++ctn_len;
-        } else if (c == '[') {
-            if (NEOJSON_UNLIKELY(ctx->depth_rem == 0u)) {
-                goto fail;
-            }
-            if (p + 1 < end && p[1] == ']') {
-                val->tag = YYJSON_TYPE_ARR;
-                val->uni.ofs = sizeof(yyjson_val);
-                ++val;
-                ++ctn_len;
-                p += 2;
-            } else if (p + 4 < end &&
-                       (p[1] == '-' ||
-                        static_cast<unsigned>(static_cast<unsigned char>(p[1]) - '0') <= 9u)) {
-                ctx->p = p;
-                ctx->val = val;
-                ctx->val_end = val_end;
-                ctx->ctn = ctn;
-                ctx->ctn_len = ctn_len;
-                const int pair_rc = parse_num_pair_run_avx2(ctx, end, kHdrVals);
-                val = ctx->val;
-                val_end = ctx->val_end;
-                ctn = ctx->ctn;
-                ctn_len = ctx->ctn_len;
-                p = ctx->p;
-                if (NEOJSON_UNLIKELY(pair_rc == 0)) {
-                    goto fail;
-                }
-                if (pair_rc == 1) {
-                    goto arr_val_begin;
-                }
-                if (pair_rc == 2) {
-                    goto arr_val_end;
-                }
-                ctn->tag = (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_ARR;
-                yyjson_val* const child = val;
-                child->uni.ofs = static_cast<std::size_t>(
-                    reinterpret_cast<const char*>(child) - reinterpret_cast<const char*>(ctn));
-                child->tag = YYJSON_TYPE_ARR;
-                ctn = child;
-                ctn_len = 1u;
-                val += 2;
-                --ctx->depth_rem;
-                goto arr_val_end;
-            } else {
-                p = skip_ws_fast_avx2(p + 1, end);
-                if (NEOJSON_UNLIKELY(p >= end)) {
-                    goto fail;
-                }
-                if (*p == ']') {
-                    val->tag = YYJSON_TYPE_ARR;
-                    val->uni.ofs = sizeof(yyjson_val);
-                    ++val;
-                    ++ctn_len;
-                    ++p;
-                } else {
-                    ctn->tag = (static_cast<std::uint64_t>(ctn_len + 1u) << 8u) | YYJSON_TYPE_ARR;
-                    yyjson_val* const child = val++;
-                    child->uni.ofs = static_cast<std::size_t>(
-                        reinterpret_cast<const char*>(child) - reinterpret_cast<const char*>(ctn));
-                    child->tag = YYJSON_TYPE_ARR;
-                    ctn = child;
-                    ctn_len = 0u;
-                    --ctx->depth_rem;
-                    goto arr_val_begin_no_ws;
-                }
-            }
-        } else if (c == 'n') {
-            if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "null", 4u) != 0)) {
-                goto fail;
-            }
-            val++->tag = YYJSON_TYPE_NULL;
-            p += 4;
-            ++ctn_len;
-        } else if (c == 'f') {
-            if (NEOJSON_UNLIKELY(end - p < 5 || std::memcmp(p + 1, "alse", 4u) != 0)) {
-                goto fail;
-            }
-            val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE;
-            p += 5;
-            ++ctn_len;
-        } else if (c == 't') {
-            if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "true", 4u) != 0)) {
-                goto fail;
-            }
-            val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE;
-            p += 4;
             ++ctn_len;
         } else {
-            goto fail;
+            if (c == 'n') {
+                if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "null", 4u) != 0)) {
+                    goto fail;
+                }
+                val++->tag = YYJSON_TYPE_NULL;
+                p += 4;
+                ++ctn_len;
+            } else if (c == 'f') {
+                if (NEOJSON_UNLIKELY(end - p < 5 || std::memcmp(p + 1, "alse", 4u) != 0)) {
+                    goto fail;
+                }
+                val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE;
+                p += 5;
+                ++ctn_len;
+            } else if (c == 't') {
+                if (NEOJSON_UNLIKELY(end - p < 4 || std::memcmp(p, "true", 4u) != 0)) {
+                    goto fail;
+                }
+                val++->tag = YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE;
+                p += 4;
+                ++ctn_len;
+            } else {
+                goto fail;
+            }
         }
     }
 
@@ -9706,15 +11061,19 @@ arr_val_end:
             ++p;
             goto arr_end;
         }
-        p = skip_ws_fast_avx2(p, end);
+        if (*p == '\n') {
+            p = skip_spaces_once_avx2(p + 1, end);
+        } else {
+            p = skip_ws_inline_avx2(p, end);
+        }
         if (NEOJSON_LIKELY(p < end)) {
-            if (*p == ',') {
-                ++p;
-                goto arr_val_begin;
-            }
             if (*p == ']') {
                 ++p;
                 goto arr_end;
+            }
+            if (*p == ',') {
+                ++p;
+                goto arr_val_begin;
             }
         }
     }
@@ -9739,10 +11098,11 @@ arr_end: {
 }
 
 doc_end: {
-    p = skip_ws_fast_avx2(p, end);
+    p = skip_ws_inline_avx2(p, end);
     if (NEOJSON_UNLIKELY(p != end)) {
         goto fail;
     }
+    std::memset(str_cur, 0, 32u);
     yyjson_val* const val_hdr = ctx->val_hdr;
     auto* const doc = reinterpret_cast<yyjson_doc*>(val_hdr);
     yyjson_val* const root = val_hdr + kHdrVals;
@@ -9765,7 +11125,7 @@ fail:
 inline yyjson_doc* try_parse_native_simd_doc(const std::string_view s,
                                              const std::size_t max_depth) {
 #if NEOJSON_X86_SIMD && defined(__SIZEOF_INT128__)
-    if (NEOJSON_LIKELY(g_has_avx2 && s.size() >= 32u && max_depth > 0u &&
+    if (NEOJSON_LIKELY(has_avx2() && s.size() >= 32u && max_depth > 0u &&
                        static_cast<unsigned char>(s[0]) != 0xEFu)) {
         ParseRunCtx ctx{};
         return parse_native_simd_avx2(s.data(), s.size(), max_depth, &ctx);
@@ -9828,7 +11188,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
                                   detail::nesting_limit_message(options.max_depth));
     };
 
-    auto finish_doc = [&](yyjson_doc*& doc) -> json {
+    auto finish_doc = [&](yyjson_doc*& doc, const bool padded_32) -> json {
         yyjson_val* root = yyjson_doc_get_root(doc);
         if (cb) {
             if (!detail::within_depth(doc, root, options.max_depth)) {
@@ -9845,7 +11205,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         if (!yyjson_is_ctn(root) || unsafe_yyjson_get_len(root) == 0u) {
             return detail::make_node(root);
         }
-        return detail::lazy_make_root(doc, root);
+        return detail::lazy_make_root(doc, root, padded_32);
     };
 
     auto parse_with_nul_scan = [&]() -> json {
@@ -9888,7 +11248,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
                 }
             }
         } guard{doc};
-        return finish_doc(guard.d);
+        return finish_doc(guard.d, false);
     };
 
     // Only pre-scan for NUL when comments are enabled (raw NUL inside comments would not fail yyjson).
@@ -9900,6 +11260,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
     yyjson_doc* doc = (!ignore_comments)
                           ? detail::try_parse_native_simd_doc(s, options.max_depth)
                           : nullptr;
+    const bool native_simd_padded = (doc != nullptr);
     if (doc == nullptr) {
         // yyjson_read_opts_max_depth does not mutate the input buffer when YYJSON_READ_INSITU is not set.
         doc = yyjson_read_opts_max_depth(
@@ -9931,7 +11292,7 @@ json json::parse(std::string_view s, parser_callback_t cb, const bool allow_exce
         }
     } guard{doc};
 
-    return finish_doc(guard.d);
+    return finish_doc(guard.d, native_simd_padded);
 }
 
 json json::parse(std::istream& i, parser_callback_t cb, const bool allow_exceptions,
