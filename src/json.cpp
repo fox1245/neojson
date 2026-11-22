@@ -104,20 +104,14 @@ std::uint64_t hash_bytes_long(const char* data, const std::size_t len,
 
 namespace {
 
-inline constexpr std::size_t kSlabSize = 65536;
-inline constexpr std::uintptr_t kSlabMask = ~std::uintptr_t{kSlabSize - 1};
-inline constexpr std::uint32_t kNumSizeClasses = 16;
-inline constexpr std::size_t kMaxPooledSize = 4096u;
-inline constexpr std::uint32_t kMaxCachedEmptySlabs = 64;
-inline constexpr std::uint32_t kReclaimScanLimit = 8;
-inline constexpr std::array<std::uint32_t, kNumSizeClasses> kSizeClasses = {{
-    16u,   32u,   48u,   64u,   96u,   128u,  192u,  256u,
-    384u,  512u,  768u,  1024u, 1536u, 2048u, 3072u, 4096u
-}};
+inline void flush_doc_credit_for_teardown() noexcept;
 
-struct FreeNode {
-    FreeNode* next;
-};
+inline constexpr std::uint32_t kNumSizeClasses = static_cast<std::uint32_t>(kTCacheClasses);
+inline constexpr std::size_t kMaxPooledSize = kTCacheMaxBytes;
+inline constexpr std::uint32_t kMaxCachedEmptySlabs = 64u;
+inline constexpr std::uint32_t kReclaimScanLimit = 8u;
+
+inline std::atomic<std::uint64_t> g_next_pool_id{0u};
 
 struct ThreadPool;
 
@@ -140,40 +134,28 @@ inline void cpu_relax() noexcept {
 }
 
 struct SlabHeader {
+    SlabHeaderBase hdr;
     SlabHeader* prev;
     SlabHeader* next;
-    FreeNode* local_free;
-    std::uint32_t class_idx;
-    std::uint32_t slot_size;
     std::uint32_t slot_count;
     std::uint32_t bump_off;
-    std::uint32_t local_used;
-    bool in_full;
-    char cache_pad[16];
 
-    std::atomic<ThreadPool*> owner;
-    std::atomic<std::uint32_t> remote_lock;
-    FreeNode* remote_free;
+    alignas(64) std::atomic<std::uint32_t> remote_lock;
+    SlabFreeNode* remote_free;
     std::atomic<std::uint32_t> remote_count;
     std::uint32_t orphan_live;
 
     SlabHeader(const std::uint32_t cls, const std::uint32_t ssz, const std::uint32_t scnt,
-               ThreadPool* own, const std::uint32_t bump, const std::uint32_t used,
+               const std::uint64_t oid, const std::uint32_t bump, const std::uint32_t used,
                const std::uint32_t orphan) noexcept
-        : prev(nullptr),
+        : hdr{nullptr, used, cls, ssz, 0u, 0u, {0u, 0u}, oid},
+          prev(nullptr),
           next(nullptr),
-          local_free(nullptr),
-          class_idx(cls),
-          slot_size(ssz),
           slot_count(scnt),
           bump_off(bump),
-          local_used(used),
-          in_full(false),
-          cache_pad{},
-          owner(own),
-          remote_lock(0),
+          remote_lock(0u),
           remote_free(nullptr),
-          remote_count(0),
+          remote_count(0u),
           orphan_live(orphan) {}
 
     void lock_remote() noexcept {
@@ -189,32 +171,19 @@ struct SlabHeader {
     }
 };
 
+static_assert(std::is_standard_layout<SlabHeader>::value,
+              "SlabHeader must remain standard-layout for base pointer interconvertibility");
+static_assert(offsetof(SlabHeader, hdr) == 0u,
+              "SlabHeaderBase must be at offset 0 of SlabHeader");
+
 inline constexpr std::size_t kSlabHeaderBytes = (sizeof(SlabHeader) + 63u) & ~std::size_t{63};
 static_assert(kSlabHeaderBytes % 64u == 0u, "slab header must preserve slot alignment");
 static_assert((kSlabSize - kSlabHeaderBytes) / kMaxPooledSize >= 15u,
               "largest pooled class must fit at least 15 slots per 64 KiB slab");
 
-constexpr std::array<std::uint8_t, 256> make_class_lut() noexcept {
-    std::array<std::uint8_t, 256> lut{};
-    for (std::size_t q = 0; q < 256u; ++q) {
-        const std::uint32_t req = static_cast<std::uint32_t>((q + 1u) * 16u);
-        std::uint8_t cls = 0;
-        while (cls + 1u < kNumSizeClasses && kSizeClasses[cls] < req) {
-            ++cls;
-        }
-        lut[q] = cls;
-    }
-    return lut;
-}
-
-inline constexpr std::array<std::uint8_t, 256> kClassLut = make_class_lut();
-
 inline std::uint32_t class_for_size(const std::size_t n) noexcept {
-    if (n == 0u) {
-        return 0u;
-    }
     assert(n <= kMaxPooledSize);
-    return static_cast<std::uint32_t>(kClassLut[(n - 1u) >> 4u]);
+    return tcache_class_for_size(n);
 }
 
 inline void* alloc_aligned_64k() {
@@ -259,9 +228,9 @@ inline void poison_region(void* p, const std::size_t bytes) noexcept {
 
 inline void poison_slot_tail(void* p, const std::size_t slot_size) noexcept {
 #if defined(NEOJSON_HAS_ASAN)
-    if (slot_size > sizeof(FreeNode)) {
-        ASAN_POISON_MEMORY_REGION(static_cast<char*>(p) + sizeof(FreeNode),
-                                  slot_size - sizeof(FreeNode));
+    if (slot_size > sizeof(SlabFreeNode)) {
+        ASAN_POISON_MEMORY_REGION(static_cast<char*>(p) + sizeof(SlabFreeNode),
+                                  slot_size - sizeof(SlabFreeNode));
     }
 #else
     (void)p;
@@ -335,21 +304,21 @@ inline void drain_remote(SlabHeader* s) noexcept {
         return;
     }
     s->lock_remote();
-    FreeNode* drained = s->remote_free;
+    SlabFreeNode* drained = s->remote_free;
     s->remote_free = nullptr;
     const std::uint32_t count = s->remote_count.load(std::memory_order_relaxed);
     s->remote_count.store(0u, std::memory_order_relaxed);
     s->unlock_remote();
 
     if (drained != nullptr) {
-        FreeNode* tail = drained;
+        SlabFreeNode* tail = drained;
         while (tail->next != nullptr) {
             tail = tail->next;
         }
-        tail->next = s->local_free;
-        s->local_free = drained;
-        assert(s->local_used >= count);
-        s->local_used -= count;
+        tail->next = s->hdr.local_free;
+        s->hdr.local_free = drained;
+        assert(s->hdr.local_used >= count);
+        s->hdr.local_used -= count;
     }
 }
 
@@ -360,9 +329,13 @@ struct SlabBin {
 };
 
 struct ThreadPool {
+    std::uint64_t owner_id = 0u;
     std::array<SlabBin, kNumSizeClasses> bins{};
     SlabHeader* empty_slabs = nullptr;
-    std::uint32_t empty_count = 0;
+    std::uint32_t empty_count = 0u;
+
+    ThreadPool() noexcept
+        : owner_id(g_next_pool_id.fetch_add(1u, std::memory_order_relaxed) + 1u) {}
 
     void recycle_empty_slab(SlabHeader* s) noexcept {
         if (empty_count < kMaxCachedEmptySlabs) {
@@ -382,19 +355,19 @@ struct ThreadPool {
             s->~SlabHeader();
             free_aligned_64k(s);
         }
-        empty_count = 0;
+        empty_count = 0u;
 
         auto release_list = [](SlabHeader* cur) noexcept {
             while (cur != nullptr) {
                 SlabHeader* next = cur->next;
                 cur->lock_remote();
                 const std::uint32_t rc = cur->remote_count.load(std::memory_order_relaxed);
-                assert(cur->local_used >= rc);
-                const std::uint32_t live = cur->local_used - rc;
+                assert(cur->hdr.local_used >= rc);
+                const std::uint32_t live = cur->hdr.local_used - rc;
                 cur->remote_free = nullptr;
                 cur->remote_count.store(0u, std::memory_order_relaxed);
                 cur->orphan_live = live;
-                cur->owner.store(nullptr, std::memory_order_release);
+                cur->hdr.owner_id.store(0u, std::memory_order_release);
                 cur->unlock_remote();
                 if (live == 0u) {
                     cur->~SlabHeader();
@@ -413,58 +386,8 @@ struct ThreadPool {
         }
     }
 
-    void* alloc(const std::uint32_t cls) {
-        SlabBin& bin = bins[cls];
-        while (bin.head != nullptr) {
-            SlabHeader* s = bin.head;
-            if (FreeNode* node = s->local_free) {
-                s->local_free = node->next;
-                ++s->local_used;
-                unpoison_slot(node, s->slot_size);
-                return node;
-            }
-            if (s->bump_off + s->slot_size <= static_cast<std::uint32_t>(kSlabSize)) {
-                void* p = reinterpret_cast<char*>(s) + s->bump_off;
-                s->bump_off += s->slot_size;
-                ++s->local_used;
-                unpoison_slot(p, s->slot_size);
-                return p;
-            }
-            drain_remote(s);
-            if (FreeNode* node = s->local_free) {
-                s->local_free = node->next;
-                ++s->local_used;
-                unpoison_slot(node, s->slot_size);
-                return node;
-            }
-            list_erase(bin.head, s);
-            s->in_full = true;
-            queue_push_back(bin.full_head, bin.full_tail, s);
-        }
-
-        for (std::uint32_t scan = 0; scan < kReclaimScanLimit && bin.full_head != nullptr; ++scan) {
-            SlabHeader* s = bin.full_head;
-            if (s->remote_count.load(std::memory_order_acquire) != 0u) {
-                drain_remote(s);
-                if (FreeNode* node = s->local_free) {
-                    s->local_free = node->next;
-                    ++s->local_used;
-                    queue_erase(bin.full_head, bin.full_tail, s);
-                    s->in_full = false;
-                    list_push(bin.head, s);
-                    unpoison_slot(node, s->slot_size);
-                    return node;
-                }
-            }
-            if (bin.full_head != bin.full_tail) {
-                queue_erase(bin.full_head, bin.full_tail, s);
-                queue_push_back(bin.full_head, bin.full_tail, s);
-            } else {
-                break;
-            }
-        }
-
-        const std::uint32_t ssz = kSizeClasses[cls];
+    SlabHeader* alloc_new_slab(const std::uint32_t cls) {
+        const std::uint32_t ssz = kTCacheSizes[cls];
         const std::uint32_t scnt =
             static_cast<std::uint32_t>((kSlabSize - kSlabHeaderBytes) / ssz);
         void* slab_mem = nullptr;
@@ -480,12 +403,70 @@ struct ThreadPool {
         } else {
             slab_mem = alloc_aligned_64k();
         }
-        auto* s = ::new (slab_mem) SlabHeader(
-            cls, ssz, scnt, this, static_cast<std::uint32_t>(kSlabHeaderBytes) + ssz, 1u, 0u);
-        poison_region(static_cast<char*>(slab_mem) + kSlabHeaderBytes + ssz,
+        return ::new (slab_mem) SlabHeader(
+            cls, ssz, scnt, owner_id, static_cast<std::uint32_t>(kSlabHeaderBytes), 0u, 0u);
+    }
+
+    void* alloc(const std::uint32_t cls) {
+        SlabBin& bin = bins[cls];
+        while (bin.head != nullptr) {
+            SlabHeader* s = bin.head;
+            if (SlabFreeNode* node = s->hdr.local_free) {
+                s->hdr.local_free = node->next;
+                ++s->hdr.local_used;
+                unpoison_slot(node, s->hdr.slot_size);
+                return node;
+            }
+            if (s->bump_off + s->hdr.slot_size <= static_cast<std::uint32_t>(kSlabSize)) {
+                void* p = reinterpret_cast<char*>(s) + s->bump_off;
+                s->bump_off += s->hdr.slot_size;
+                ++s->hdr.local_used;
+                unpoison_slot(p, s->hdr.slot_size);
+                return p;
+            }
+            drain_remote(s);
+            if (SlabFreeNode* node = s->hdr.local_free) {
+                s->hdr.local_free = node->next;
+                ++s->hdr.local_used;
+                unpoison_slot(node, s->hdr.slot_size);
+                return node;
+            }
+            list_erase(bin.head, s);
+            s->hdr.in_full = 1u;
+            queue_push_back(bin.full_head, bin.full_tail, s);
+        }
+
+        for (std::uint32_t scan = 0u; scan < kReclaimScanLimit && bin.full_head != nullptr;
+             ++scan) {
+            SlabHeader* s = bin.full_head;
+            if (s->remote_count.load(std::memory_order_acquire) != 0u) {
+                drain_remote(s);
+                if (SlabFreeNode* node = s->hdr.local_free) {
+                    s->hdr.local_free = node->next;
+                    ++s->hdr.local_used;
+                    queue_erase(bin.full_head, bin.full_tail, s);
+                    s->hdr.in_full = 0u;
+                    list_push(bin.head, s);
+                    unpoison_slot(node, s->hdr.slot_size);
+                    return node;
+                }
+            }
+            if (bin.full_head != bin.full_tail) {
+                queue_erase(bin.full_head, bin.full_tail, s);
+                queue_push_back(bin.full_head, bin.full_tail, s);
+            } else {
+                break;
+            }
+        }
+
+        SlabHeader* s = alloc_new_slab(cls);
+        const std::uint32_t ssz = s->hdr.slot_size;
+        s->bump_off = static_cast<std::uint32_t>(kSlabHeaderBytes) + ssz;
+        s->hdr.local_used = 1u;
+        poison_region(reinterpret_cast<char*>(s) + kSlabHeaderBytes + ssz,
                       kSlabSize - kSlabHeaderBytes - ssz);
         list_push(bin.head, s);
-        return static_cast<char*>(slab_mem) + kSlabHeaderBytes;
+        return reinterpret_cast<char*>(s) + kSlabHeaderBytes;
     }
 };
 
@@ -500,6 +481,34 @@ inline thread_local ThreadPoolGuard t_pool_guard{};
 
 ThreadPoolGuard::~ThreadPoolGuard() {
     armed = false;
+    flush_doc_credit_for_teardown();
+    t_slab_cache.owner_id = 0u;
+    for (std::size_t cls = 0u; cls < kTCacheClasses; ++cls) {
+        SlabFastBin& fbin = t_slab_cache.bins[cls];
+        if (fbin.active != nullptr) {
+            auto* s = reinterpret_cast<SlabHeader*>(fbin.active);
+            const std::uint32_t ssz = s->hdr.slot_size;
+            if (fbin.bump < fbin.bump_end) {
+                const auto unused = static_cast<std::uint32_t>(
+                    static_cast<std::size_t>(fbin.bump_end - fbin.bump) / ssz);
+                s->bump_off -= unused * ssz;
+                assert(s->hdr.local_used >= unused);
+                s->hdr.local_used -= unused;
+            }
+            while (SlabFreeNode* node = fbin.free_head) {
+                fbin.free_head = node->next;
+                node->next = s->hdr.local_free;
+                s->hdr.local_free = node;
+                assert(s->hdr.local_used > 0u);
+                --s->hdr.local_used;
+            }
+            s->hdr.is_active_bump = 0u;
+        }
+        fbin.bump = nullptr;
+        fbin.bump_end = nullptr;
+        fbin.free_head = nullptr;
+        fbin.active = nullptr;
+    }
     t_pool_dead = true;
     ThreadPool* tp = t_pool;
     t_pool = nullptr;
@@ -511,10 +520,10 @@ ThreadPoolGuard::~ThreadPoolGuard() {
 }
 
 inline void* alloc_standalone_slab(const std::uint32_t cls) {
-    const std::uint32_t ssz = kSizeClasses[cls];
+    const std::uint32_t ssz = kTCacheSizes[cls];
     const std::uint32_t scnt = static_cast<std::uint32_t>((kSlabSize - kSlabHeaderBytes) / ssz);
     void* mem = alloc_aligned_64k();
-    ::new (mem) SlabHeader(cls, ssz, scnt, nullptr, static_cast<std::uint32_t>(kSlabSize), 0u, 1u);
+    ::new (mem) SlabHeader(cls, ssz, scnt, 0u, static_cast<std::uint32_t>(kSlabSize), 0u, 1u);
     poison_region(static_cast<char*>(mem) + kSlabHeaderBytes + ssz,
                   kSlabSize - kSlabHeaderBytes - ssz);
     return static_cast<char*>(mem) + kSlabHeaderBytes;
@@ -522,9 +531,9 @@ inline void* alloc_standalone_slab(const std::uint32_t cls) {
 
 inline void remote_or_orphan_free(SlabHeader* s, void* p) noexcept {
     s->lock_remote();
-    if (s->owner.load(std::memory_order_acquire) != nullptr) {
-        auto* node = ::new (p) FreeNode{s->remote_free};
-        poison_slot_tail(p, s->slot_size);
+    if (s->hdr.owner_id.load(std::memory_order_acquire) != 0u) {
+        auto* node = ::new (p) SlabFreeNode{s->remote_free};
+        poison_slot_tail(p, s->hdr.slot_size);
         s->remote_free = node;
         const std::uint32_t rc = s->remote_count.load(std::memory_order_relaxed);
         s->remote_count.store(rc + 1u, std::memory_order_release);
@@ -534,7 +543,7 @@ inline void remote_or_orphan_free(SlabHeader* s, void* p) noexcept {
     assert(s->orphan_live > 0u);
     const std::uint32_t rem = --s->orphan_live;
     if (rem > 0u) {
-        poison_region(p, s->slot_size);
+        poison_region(p, s->hdr.slot_size);
     }
     s->unlock_remote();
     if (rem == 0u) {
@@ -550,6 +559,11 @@ void* pool_alloc(const std::size_t n) {
         return ::operator new(n);
     }
     const std::uint32_t cls = class_for_size(n);
+#if !defined(NEOJSON_HAS_ASAN)
+    if (!t_pool_dead) {
+        return tcache_alloc_class(cls);
+    }
+#endif
     ThreadPool* tp = t_pool;
     if (tp == nullptr) {
         if (t_pool_dead) {
@@ -574,25 +588,239 @@ void pool_free(void* p, const std::size_t n) noexcept {
         ::operator delete(p);
         return;
     }
+    const std::uint32_t cls = class_for_size(n);
+#if !defined(NEOJSON_HAS_ASAN)
+    tcache_free_class(cls, p);
+#else
+    pool_free_slow(p, cls);
+#endif
+}
+
+void* pool_alloc_refill(const std::uint32_t cls, ThreadSlabCache& tc) {
+    if (t_pool_dead) {
+        return alloc_standalone_slab(cls);
+    }
+    ThreadPool* tp = t_pool;
+    if (tp == nullptr) {
+        t_pool_guard.armed = true;
+        void* raw = std::malloc(sizeof(ThreadPool));
+        if (raw == nullptr) {
+            throw std::bad_alloc();
+        }
+        tp = ::new (raw) ThreadPool();
+        t_pool = tp;
+    }
+    if (tc.owner_id == 0u) {
+        tc.owner_id = tp->owner_id;
+    }
+    SlabFastBin& bin = tc.bins[cls];
+    assert(bin.bump == bin.bump_end && bin.free_head == nullptr);
+    SlabBin& sbin = tp->bins[cls];
+
+    auto activate_slab = [&](SlabHeader* s) noexcept -> void* {
+        s->hdr.is_active_bump = 1u;
+        bin.active = &s->hdr;
+        const std::uint32_t ssz = s->hdr.slot_size;
+        if (s->hdr.local_used == 0u) {
+            s->hdr.local_free = nullptr;
+            s->bump_off = static_cast<std::uint32_t>(kSlabHeaderBytes) + s->slot_count * ssz;
+            s->hdr.local_used = s->slot_count;
+            char* base = reinterpret_cast<char*>(s) + kSlabHeaderBytes;
+            bin.bump = base + ssz;
+            bin.bump_end = base + s->slot_count * ssz;
+            return base;
+        }
+        if (s->bump_off + ssz <= static_cast<std::uint32_t>(kSlabSize)) {
+            const std::uint32_t avail =
+                (static_cast<std::uint32_t>(kSlabSize) - s->bump_off) / ssz;
+            char* start = reinterpret_cast<char*>(s) + s->bump_off;
+            s->bump_off += avail * ssz;
+            s->hdr.local_used += avail;
+            bin.bump = start + ssz;
+            bin.bump_end = start + avail * ssz;
+            return start;
+        }
+        const std::uint32_t ever_bumped =
+            (s->bump_off - static_cast<std::uint32_t>(kSlabHeaderBytes)) / ssz;
+        SlabFreeNode* first = s->hdr.local_free;
+        assert(first != nullptr);
+        s->hdr.local_free = nullptr;
+        s->hdr.local_used = ever_bumped;
+        bin.free_head = first->next;
+        return first;
+    };
+
+    if (bin.active != nullptr) {
+        auto* s = reinterpret_cast<SlabHeader*>(bin.active);
+        if (s->hdr.local_used == 0u || s->hdr.local_free != nullptr ||
+            s->bump_off + s->hdr.slot_size <= static_cast<std::uint32_t>(kSlabSize)) {
+            return activate_slab(s);
+        }
+        drain_remote(s);
+        if (s->hdr.local_free != nullptr) {
+            return activate_slab(s);
+        }
+        s->hdr.is_active_bump = 0u;
+        bin.active = nullptr;
+        list_erase(sbin.head, s);
+        s->hdr.in_full = 1u;
+        queue_push_back(sbin.full_head, sbin.full_tail, s);
+    }
+
+    for (SlabHeader* s = sbin.head; s != nullptr;) {
+        SlabHeader* next_s = s->next;
+        if (s->hdr.local_used == 0u || s->hdr.local_free != nullptr ||
+            s->bump_off + s->hdr.slot_size <= static_cast<std::uint32_t>(kSlabSize)) {
+            return activate_slab(s);
+        }
+        drain_remote(s);
+        if (s->hdr.local_free != nullptr) {
+            return activate_slab(s);
+        }
+        list_erase(sbin.head, s);
+        s->hdr.in_full = 1u;
+        queue_push_back(sbin.full_head, sbin.full_tail, s);
+        s = next_s;
+    }
+
+    for (std::uint32_t scan = 0u; scan < kReclaimScanLimit && sbin.full_head != nullptr; ++scan) {
+        SlabHeader* s = sbin.full_head;
+        if (s->remote_count.load(std::memory_order_acquire) != 0u) {
+            drain_remote(s);
+            if (s->hdr.local_free != nullptr) {
+                queue_erase(sbin.full_head, sbin.full_tail, s);
+                s->hdr.in_full = 0u;
+                list_push(sbin.head, s);
+                return activate_slab(s);
+            }
+        }
+        if (sbin.full_head != sbin.full_tail) {
+            queue_erase(sbin.full_head, sbin.full_tail, s);
+            queue_push_back(sbin.full_head, sbin.full_tail, s);
+        } else {
+            break;
+        }
+    }
+
+    SlabHeader* s = tp->alloc_new_slab(cls);
+    list_push(sbin.head, s);
+    return activate_slab(s);
+}
+
+void pool_free_slow(void* p, const std::uint32_t /*cls*/) noexcept {
+    if (p == nullptr) {
+        return;
+    }
     SlabHeader* s = slab_from_ptr(p);
     ThreadPool* const cur = t_pool;
-    if (cur != nullptr && s->owner.load(std::memory_order_relaxed) == cur) {
-        auto* node = ::new (p) FreeNode{s->local_free};
-        poison_slot_tail(p, s->slot_size);
-        s->local_free = node;
-        --s->local_used;
-        SlabBin& bin = cur->bins[s->class_idx];
-        if (s->in_full) {
+    if (cur != nullptr && s->hdr.owner_id.load(std::memory_order_relaxed) == cur->owner_id) {
+        auto* node = ::new (p) SlabFreeNode{s->hdr.local_free};
+        poison_slot_tail(p, s->hdr.slot_size);
+        s->hdr.local_free = node;
+        --s->hdr.local_used;
+        SlabBin& bin = cur->bins[s->hdr.class_idx];
+        if (s->hdr.in_full != 0u) {
             queue_erase(bin.full_head, bin.full_tail, s);
-            s->in_full = false;
-            list_push(bin.head, s);
-        } else if (s->local_used == 0u && (bin.head != s || s->next != nullptr)) {
+            s->hdr.in_full = 0u;
+            if (s->hdr.local_used == 0u && s->hdr.is_active_bump == 0u && bin.head != nullptr) {
+                cur->recycle_empty_slab(s);
+            } else {
+                list_push(bin.head, s);
+            }
+        } else if (s->hdr.local_used == 0u && s->hdr.is_active_bump == 0u &&
+                   (bin.head != s || s->next != nullptr)) {
             list_erase(bin.head, s);
             cur->recycle_empty_slab(s);
         }
         return;
     }
     remote_or_orphan_free(s, p);
+}
+
+namespace {
+
+inline void flush_doc_credit_for_teardown() noexcept {
+    ThreadDocCredit& tc = t_doc_credit;
+    tc.dead = true;
+    SharedDocHeader* doc = tc.doc;
+    const std::uint32_t credit = tc.credit;
+    tc.doc = nullptr;
+    tc.credit = 0u;
+    if (doc != nullptr && credit > 0u) {
+        if (doc->refcount.load(std::memory_order_acquire) == credit ||
+            doc->refcount.fetch_sub(credit, std::memory_order_acq_rel) == credit) {
+            destroy_shared_doc_slow(doc);
+        }
+    }
+}
+
+struct DocCreditGuard {
+    bool armed = false;
+    ~DocCreditGuard() noexcept {
+        armed = false;
+        flush_doc_credit_for_teardown();
+    }
+};
+
+inline thread_local DocCreditGuard t_doc_credit_guard{};
+
+} // namespace
+
+void shared_doc_addref_slow(SharedDocHeader* hdr, ThreadDocCredit& tc) noexcept {
+    if (hdr == nullptr) {
+        return;
+    }
+    if (tc.dead) {
+        hdr->refcount.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    t_doc_credit_guard.armed = true;
+    if (tc.doc != hdr) {
+        SharedDocHeader* prev = tc.doc;
+        const std::uint32_t prev_credit = tc.credit;
+        tc.doc = hdr;
+        tc.credit = 0u;
+        if (prev != nullptr && prev_credit > 0u) {
+            if (prev->refcount.load(std::memory_order_acquire) == prev_credit ||
+                prev->refcount.fetch_sub(prev_credit, std::memory_order_acq_rel) == prev_credit) {
+                destroy_shared_doc_slow(prev);
+            }
+        }
+    }
+    constexpr std::uint32_t kBatch = 256u;
+    hdr->refcount.fetch_add(kBatch, std::memory_order_relaxed);
+    tc.credit += (kBatch - 1u);
+}
+
+void shared_doc_release_slow(SharedDocHeader* hdr, const std::uint32_t n,
+                             ThreadDocCredit& tc) noexcept {
+    if (hdr == nullptr || n == 0u) {
+        return;
+    }
+    if (tc.doc == hdr) {
+        if (!tc.dead && n <= 256u && tc.credit + n > 512u &&
+            hdr->refcount.load(std::memory_order_acquire) > tc.credit + n) {
+            const std::uint32_t drain = (tc.credit + n) - 256u;
+            tc.credit = 256u;
+            const std::uint32_t prev =
+                hdr->refcount.fetch_sub(drain, std::memory_order_acq_rel);
+            assert(prev > drain);
+            (void)prev;
+            return;
+        }
+        const std::uint32_t total = tc.credit + n;
+        tc.doc = nullptr;
+        tc.credit = 0u;
+        if (hdr->refcount.load(std::memory_order_acquire) == total ||
+            hdr->refcount.fetch_sub(total, std::memory_order_acq_rel) == total) {
+            destroy_shared_doc_slow(hdr);
+        }
+        return;
+    }
+    if (hdr->refcount.load(std::memory_order_acquire) == n ||
+        hdr->refcount.fetch_sub(n, std::memory_order_acq_rel) == n) {
+        destroy_shared_doc_slow(hdr);
+    }
 }
 
 namespace {
@@ -1681,8 +1909,17 @@ struct json_access {
         return j.m_value.small_obj;
     }
 
-    static SmallObject4* create_small_object_raw() {
-        return json::create_small_object_empty();
+    static SmallObject4* create_small_object_raw(const std::size_t cap = kSmallObjCap) {
+        return json::create_small_object_empty(cap);
+    }
+
+    static SmallObject4* create_small_object_raw_cap(const std::size_t exact_cap) {
+        return json::create_small_object_empty_cap(exact_cap);
+    }
+
+    static SmallObject4* create_small_object_raw_for(const std::size_t n,
+                                                     const std::size_t key_bytes) {
+        return json::create_small_object_empty_for(n, key_bytes);
     }
 
     static void destroy_small_object_raw(SmallObject4*& so) noexcept {
@@ -1703,34 +1940,19 @@ struct json_access {
 
     static void small_object_append_unique(SmallObject4* so, const std::string_view key,
                                            json&& val) {
-        const std::size_t n = so->count;
-        assert(n < kSmallObjCap);
-        const std::uint8_t tag = small_obj_key_tag(key);
-        ::new (so->slot_ptr(n)) SmallObject4::entry_t(
-            std::piecewise_construct,
-            std::forward_as_tuple(key.data(), key.size()),
-            std::forward_as_tuple(std::move(val)));
-        so->tags[n] = tag;
-        so->count = static_cast<std::uint8_t>(n + 1u);
+        json::small_obj_append_unique_entry(so, key, std::move(val));
     }
 
     static void small_object_emplace_or_assign(SmallObject4* so, const std::string_view key,
                                                json&& val) {
         const std::size_t n = so->count;
         const std::uint8_t tag = small_obj_key_tag(key);
-        for (std::size_t i = 0u; i < n; ++i) {
-            if (so->tags[i] == tag && so->entry(i).first == key) {
-                so->entry(i).second = std::move(val);
-                return;
-            }
+        const std::size_t idx = json::small_obj_find_with_tag(so, key, tag);
+        if (idx < n) {
+            so->val(idx) = std::move(val);
+            return;
         }
-        assert(n < kSmallObjCap);
-        ::new (so->slot_ptr(n)) SmallObject4::entry_t(
-            std::piecewise_construct,
-            std::forward_as_tuple(key.data(), key.size()),
-            std::forward_as_tuple(std::move(val)));
-        so->tags[n] = tag;
-        so->count = static_cast<std::uint8_t>(n + 1u);
+        json::small_obj_append_unique_entry(so, key, std::move(val));
     }
 
     static json make_lazy(const json::value_t type, LazyHeader* node) noexcept {
@@ -1890,19 +2112,28 @@ struct json_access {
     }
 
     static void init_arena_bool(json* dst, const bool b) noexcept {
-        ::new (dst) json(b);
+        ::new (dst) json();
+        dst->m_type = json::value_t::boolean;
+        dst->m_value.number_unsigned = 0u;
+        dst->m_value.boolean = b;
     }
 
     static void init_arena_uint(json* dst, const json::number_unsigned_t u) noexcept {
-        ::new (dst) json(u);
+        ::new (dst) json();
+        dst->m_type = json::value_t::number_unsigned;
+        dst->m_value.number_unsigned = u;
     }
 
     static void init_arena_sint(json* dst, const json::number_integer_t i) noexcept {
-        ::new (dst) json(i);
+        ::new (dst) json();
+        dst->m_type = json::value_t::number_integer;
+        dst->m_value.number_integer = i;
     }
 
     static void init_arena_real(json* dst, const json::number_float_t d) noexcept {
-        ::new (dst) json(d);
+        ::new (dst) json();
+        dst->m_type = json::value_t::number_float;
+        dst->m_value.number_float = d;
     }
 
     static void init_arena_string(json* dst, SharedString* ss) noexcept {
@@ -1980,15 +2211,13 @@ struct json_access {
 
     static json& small_object_append_placeholder(SmallObject4* so, const std::string_view key) {
         const std::size_t n = so->count;
-        assert(n < kSmallObjCap);
-        const std::uint8_t tag = small_obj_key_tag(key);
-        ::new (so->slot_ptr(n)) SmallObject4::entry_t(
-            std::piecewise_construct,
-            std::forward_as_tuple(key.data(), key.size()),
-            std::forward_as_tuple());
-        so->tags[n] = tag;
-        so->count = static_cast<std::uint8_t>(n + 1u);
-        return so->entry(n).second;
+        small_obj_append_unique_entry_helper(so, key);
+        return so->val(n);
+    }
+
+    static void small_obj_append_unique_entry_helper(SmallObject4* so,
+                                                     const std::string_view key) {
+        json::small_obj_append_unique_entry(so, key, json());
     }
 
     static void commit_cloned_owned(json& dst, json&& owned) noexcept {
@@ -2024,6 +2253,14 @@ inline SharedString& empty_arena_string_singleton() noexcept {
     return h.ss;
 }
 
+struct HeapStrBlock {
+    static constexpr std::uint32_t kCap = 254u;
+    HeapStrBlock* next = nullptr;
+    std::uint32_t count = 0u;
+    std::uint32_t pad = 0u;
+    std::string* ptrs[kCap];
+};
+
 struct DocArenaChunk {
     DocArenaChunk* next = nullptr;
     std::size_t used = 0u;
@@ -2034,8 +2271,8 @@ struct DocArena {
     DocArenaChunk* head = nullptr;
     char* bump_ptr = nullptr;
     char* bump_end = nullptr;
+    HeapStrBlock* heap_str_head = nullptr;
     std::size_t next_chunk_bytes = 65536u;
-    std::vector<std::string*> heap_strings;
 
     NEOJSON_NOINLINE void* alloc_slow(const std::size_t n) {
         const std::size_t header_sz = (sizeof(DocArenaChunk) + 15u) & ~std::size_t{15u};
@@ -2075,13 +2312,20 @@ struct DocArena {
     }
 
     NEOJSON_NOINLINE void track_heap_string(std::string* s) {
-        try {
-            heap_strings.push_back(s);
-        } catch (...) {
-            using StringT = std::string;
-            s->~StringT();
-            throw;
+        HeapStrBlock* b = heap_str_head;
+        if (b == nullptr || b->count == HeapStrBlock::kCap) {
+            try {
+                void* mem = alloc(sizeof(HeapStrBlock));
+                b = ::new (mem) HeapStrBlock();
+            } catch (...) {
+                using StringT = std::string;
+                s->~StringT();
+                throw;
+            }
+            b->next = heap_str_head;
+            heap_str_head = b;
         }
+        b->ptrs[b->count++] = s;
     }
 
     const std::string* alloc_key_string_nonempty(const char* p, const std::size_t len) {
@@ -2095,10 +2339,16 @@ struct DocArena {
 
     void destroy_all() noexcept {
         using StringT = std::string;
-        for (std::string* s : heap_strings) {
-            s->~StringT();
+        HeapStrBlock* b = heap_str_head;
+        heap_str_head = nullptr;
+        while (b != nullptr) {
+            HeapStrBlock* next = b->next;
+            const std::uint32_t cnt = b->count;
+            for (std::uint32_t i = 0u; i < cnt; ++i) {
+                b->ptrs[i]->~StringT();
+            }
+            b = next;
         }
-        heap_strings.clear();
         DocArenaChunk* c = head;
         head = nullptr;
         bump_ptr = nullptr;
@@ -2111,28 +2361,51 @@ struct DocArena {
     }
 };
 
-} // namespace
-
-struct SharedYyDoc {
-    std::atomic<std::uint32_t> refcount{1u};
-    std::atomic<bool> tree_unique_verified{false};
-    yyjson_doc* doc = nullptr;
-    DocArena arena;
+struct SharedDocExtras {
 #if __cplusplus >= 202002L || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
-    std::atomic_flag arena_lock{};
     std::atomic_flag extra_lock{};
 #else
-    std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
     std::atomic_flag extra_lock = ATOMIC_FLAG_INIT;
 #endif
     std::vector<ArenaHashIndex*> arena_indices;
     std::unordered_map<const void*, std::pair<void*, value_t>> compat_cache;
+};
+
+} // namespace
+
+struct SharedYyDoc : SharedDocHeader {
+    yyjson_doc* doc = nullptr;
+    std::atomic<SharedDocExtras*> extras{nullptr};
+    DocArena arena;
 
     explicit SharedYyDoc(yyjson_doc* d) noexcept : doc(d) {}
 };
-static_assert(sizeof(SharedYyDoc) <= 256u, "SharedYyDoc should fit in 256-byte pooled slab");
+static_assert(sizeof(SharedYyDoc) <= 64u, "SharedYyDoc must fit in 64-byte pooled slab");
 
 namespace {
+
+inline SharedDocExtras* get_or_create_doc_extras(SharedYyDoc* sdoc) {
+    SharedDocExtras* ex = sdoc->extras.load(std::memory_order_acquire);
+    if (ex != nullptr) {
+        return ex;
+    }
+    void* mem = tcache_alloc(sizeof(SharedDocExtras));
+    SharedDocExtras* fresh = nullptr;
+    try {
+        fresh = ::new (mem) SharedDocExtras();
+    } catch (...) {
+        tcache_free(mem, sizeof(SharedDocExtras));
+        throw;
+    }
+    SharedDocExtras* expected = nullptr;
+    if (sdoc->extras.compare_exchange_strong(
+            expected, fresh, std::memory_order_release, std::memory_order_acquire)) {
+        return fresh;
+    }
+    fresh->~SharedDocExtras();
+    tcache_free(fresh, sizeof(SharedDocExtras));
+    return expected;
+}
 
 inline void destroy_arena_index(ArenaHashIndex* idx) noexcept {
     if (idx == nullptr) {
@@ -2148,23 +2421,25 @@ inline void destroy_shared_doc(SharedYyDoc* sdoc) noexcept {
     if (sdoc == nullptr) {
         return;
     }
-    // 1. Destroy compat_cache containers before arena memory goes away so m_storage == 4u
-    //    no-op elements remain harmless and zero reference cycle exists.
-    for (auto& kv : sdoc->compat_cache) {
-        json_access::destroy_erased_container(kv.second.first, kv.second.second);
+    // 1. Destroy extras (compat_cache before arena memory goes away, then arena_indices).
+    if (SharedDocExtras* ex = sdoc->extras.load(std::memory_order_acquire)) {
+        for (auto& kv : ex->compat_cache) {
+            json_access::destroy_erased_container(kv.second.first, kv.second.second);
+        }
+        ex->compat_cache.clear();
+        for (ArenaHashIndex* idx : ex->arena_indices) {
+            destroy_arena_index(idx);
+        }
+        ex->arena_indices.clear();
+        ex->~SharedDocExtras();
+        tcache_free(ex, sizeof(SharedDocExtras));
     }
-    sdoc->compat_cache.clear();
-    // 2. Free ArenaHashIndex tables.
-    for (ArenaHashIndex* idx : sdoc->arena_indices) {
-        destroy_arena_index(idx);
-    }
-    sdoc->arena_indices.clear();
-    // 3. Free all DocArena heap strings and chunks back to ThreadLargeCache / OS.
+    // 2. Free all DocArena heap strings and chunks back to ThreadLargeCache / OS.
     sdoc->arena.destroy_all();
-    // 4. Free yyjson document and SharedYyDoc slab object last.
+    // 3. Free yyjson document and SharedYyDoc slab object last.
     yyjson_doc* d = sdoc->doc;
     sdoc->~SharedYyDoc();
-    pool_free(sdoc, sizeof(SharedYyDoc));
+    tcache_free_fixed<sizeof(SharedYyDoc)>(sdoc);
     yyjson_doc_free(d);
 }
 
@@ -2447,21 +2722,24 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
         yyjson_val* keys[8];
         yyjson_val* vals[8];
         bool cheap_leaf = true;
+        std::size_t total_key_bytes = 0u;
         yyjson_obj_iter it = yyjson_obj_iter_with(val);
         for (std::size_t i = 0u; i < len; ++i) {
             yyjson_val* k = yyjson_obj_iter_next(&it);
             yyjson_val* v = yyjson_obj_iter_get_val(k);
-            if (unsafe_yyjson_get_len(k) > 32u ||
-                (yyjson_is_ctn(v) && unsafe_yyjson_get_len(v) != 0u)) {
+            const std::size_t kl = unsafe_yyjson_get_len(k);
+            if (kl > 32u || (yyjson_is_ctn(v) && unsafe_yyjson_get_len(v) != 0u)) {
                 cheap_leaf = false;
                 break;
             }
             keys[i] = k;
             vals[i] = v;
+            total_key_bytes += kl;
         }
         if (cheap_leaf) {
             if (len <= kSmallObjCap) {
-                SmallObject4* so = json_access::create_small_object_raw();
+                SmallObject4* so = json_access::create_small_object_raw_cap(
+                    SmallObject4::cap_for_size_and_keys(len, total_key_bytes));
                 struct SmallObjGuard {
                     SmallObject4* p;
                     ~SmallObjGuard() {
@@ -2515,7 +2793,7 @@ inline json make_lazy_child(SharedYyDoc* sdoc, yyjson_val* val, DocRefBatch& bat
     batch.take(remaining_hint);
     void* mem = nullptr;
     try {
-        mem = pool_alloc(sizeof(LazyNode));
+        mem = tcache_alloc_fixed<sizeof(LazyNode)>();
     } catch (...) {
         batch.unget();
         throw;
@@ -2625,14 +2903,14 @@ inline void* shallow_materialize(SharedYyDoc* sdoc, yyjson_val* val, const bool 
 }
 
 inline json lazy_make_root(yyjson_doc*& doc_ref, yyjson_val* root) {
-    void* smem = pool_alloc(sizeof(SharedYyDoc));
+    void* smem = tcache_alloc_fixed<sizeof(SharedYyDoc)>();
     auto* sdoc = ::new (smem) SharedYyDoc(doc_ref);
     void* mem = nullptr;
     try {
-        mem = pool_alloc(sizeof(LazyNode));
+        mem = tcache_alloc_fixed<sizeof(LazyNode)>();
     } catch (...) {
         sdoc->~SharedYyDoc();
-        pool_free(sdoc, sizeof(SharedYyDoc));
+        tcache_free_fixed<sizeof(SharedYyDoc)>(sdoc);
         throw;
     }
     doc_ref = nullptr;
@@ -2657,46 +2935,6 @@ inline bool is_yyjson_tree_unique(yyjson_val* root) {
         }
     }
     return true;
-}
-
-NEOJSON_ALWAYS_INLINE bool fast_memeq(const char* a, const char* b,
-                                    const std::size_t n) noexcept {
-    if (n <= 16u) {
-        if (n >= 8u) {
-            std::uint64_t a0 = 0u, a1 = 0u, b0 = 0u, b1 = 0u;
-            std::memcpy(&a0, a, 8u);
-            std::memcpy(&b0, b, 8u);
-            std::memcpy(&a1, a + n - 8u, 8u);
-            std::memcpy(&b1, b + n - 8u, 8u);
-            return ((a0 ^ b0) | (a1 ^ b1)) == 0u;
-        }
-        if (n >= 4u) {
-            std::uint32_t a0 = 0u, a1 = 0u, b0 = 0u, b1 = 0u;
-            std::memcpy(&a0, a, 4u);
-            std::memcpy(&b0, b, 4u);
-            std::memcpy(&a1, a + n - 4u, 4u);
-            std::memcpy(&b1, b + n - 4u, 4u);
-            return ((a0 ^ b0) | (a1 ^ b1)) == 0u;
-        }
-        if (n >= 2u) {
-            std::uint16_t a0 = 0u, a1 = 0u, b0 = 0u, b1 = 0u;
-            std::memcpy(&a0, a, 2u);
-            std::memcpy(&b0, b, 2u);
-            std::memcpy(&a1, a + n - 2u, 2u);
-            std::memcpy(&b1, b + n - 2u, 2u);
-            return ((a0 ^ b0) | (a1 ^ b1)) == 0u;
-        }
-        return n == 0u || *a == *b;
-    }
-    std::uint64_t f0 = 0u, f1 = 0u, l0 = 0u, l1 = 0u;
-    std::memcpy(&f0, a, 8u);
-    std::memcpy(&f1, b, 8u);
-    std::memcpy(&l0, a + n - 8u, 8u);
-    std::memcpy(&l1, b + n - 8u, 8u);
-    if (((f0 ^ f1) | (l0 ^ l1)) != 0u) {
-        return false;
-    }
-    return std::memcmp(a + 8u, b + 8u, n - 16u) == 0;
 }
 
 NEOJSON_ALWAYS_INLINE std::uint64_t hash_bytes_seeded(const char* data, const std::size_t len,
@@ -2907,9 +3145,9 @@ struct StrValInternSlot {
 static_assert(sizeof(StrValInternSlot) == 16u, "StrValInternSlot size");
 
 struct StringValInternTable {
-    static constexpr std::size_t kInitCap = 2048u;
+    static constexpr std::size_t kInitCap = 4096u;
     static constexpr std::size_t kMaxCap = 16384u;
-    static constexpr std::size_t kMaxProbes = 4u;
+    static constexpr std::size_t kMaxProbes = 8u;
 
     std::vector<StrValInternSlot> slots;
     std::uint32_t doc_stamp = 1u;
@@ -3011,7 +3249,7 @@ struct ShapeEntry {
 };
 
 struct ArenaShapeCache {
-    static constexpr std::size_t kNumSets = 16u;
+    static constexpr std::size_t kNumSets = 32u;
     static constexpr std::size_t kMaxCachedObjKeys = 64u;
 
     std::array<ShapeEntry, kNumSets * 2u> entries{};
@@ -3089,6 +3327,21 @@ inline ArenaMaterializeScratch& tls_arena_materialize_scratch() {
     return s;
 }
 
+NEOJSON_ALWAYS_INLINE SharedString* alloc_arena_string_short(SharedYyDoc* sdoc, const char* p,
+                                                           const std::size_t len) {
+    void* mem = sdoc->arena.alloc(sizeof(SharedString));
+    auto* ss = ::new (mem) SharedString(p, len);
+    ss->refcount.store(kArenaStringRef, std::memory_order_relaxed);
+    ss->owner_doc = sdoc;
+#if !(defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1) && \
+    !defined(_LIBCPP_VERSION) && !defined(_MSVC_STL_VERSION)
+    if (!string_is_inline(ss->value)) {
+        sdoc->arena.track_heap_string(&ss->value);
+    }
+#endif
+    return ss;
+}
+
 NEOJSON_NOINLINE SharedString* alloc_arena_string_long(SharedYyDoc* sdoc, const char* p,
                                                        const std::size_t len,
                                                        StringValInternTable& str_intern,
@@ -3147,7 +3400,7 @@ NEOJSON_ALWAYS_INLINE void construct_arena_scalar(json* dst, SharedYyDoc* sdoc, 
             const char* kp = unsafe_yyjson_get_str(val);
             SharedString* ss =
                 (kl <= 15u)
-                    ? alloc_arena_string_direct(sdoc, kp, kl)
+                    ? alloc_arena_string_short(sdoc, kp, kl)
                     : alloc_arena_string_long(sdoc, kp, kl, str_intern, str_intern_started, seed);
             json_access::init_arena_string(dst, ss);
             return;
@@ -3271,6 +3524,60 @@ inline ArenaArray* build_arena_array_node(SharedYyDoc* sdoc, yyjson_val* val,
                     cur = cur + 1u;
                 }
             } else if (clen <= 2u && yyjson_is_arr(cur)) {
+                if (clen == 2u && len >= 4u) {
+                    yyjson_val* e0 = cur + 1u;
+                    yyjson_val* e1 = e0 + 1u;
+                    if (yyjson_get_tag(e0) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL) &&
+                        yyjson_get_tag(e1) == (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
+                        static_assert(sizeof(ArenaArray) + 2u * sizeof(json) == 48u,
+                                      "2-element ArenaArray must fit in 48 bytes");
+                        char* bp = sdoc->arena.bump_ptr;
+                        char* bend = sdoc->arena.bump_end;
+                        for (;;) {
+                            void* lmem = nullptr;
+                            if (static_cast<std::size_t>(bend - bp) >= 48u) {
+                                lmem = bp;
+                                bp += 48u;
+                            } else {
+                                sdoc->arena.bump_ptr = bp;
+                                lmem = sdoc->arena.alloc_slow(48u);
+                                bp = sdoc->arena.bump_ptr;
+                                bend = sdoc->arena.bump_end;
+                            }
+                            auto* leaf = ::new (lmem) ArenaArray();
+                            leaf->count = 2u;
+                            leaf->doc = sdoc;
+                            json* lout = leaf->elems();
+                            json_access::init_arena_real(
+                                &lout[0],
+                                static_cast<json::number_float_t>(unsafe_yyjson_get_real(e0)));
+                            json_access::init_arena_real(
+                                &lout[1],
+                                static_cast<json::number_float_t>(unsafe_yyjson_get_real(e1)));
+                            json_access::init_arena_array_ptr(&out[i], leaf);
+                            ++i;
+                            if (i >= len) {
+                                sdoc->arena.bump_ptr = bp;
+                                return aa;
+                            }
+                            cur = e1 + 1u;
+                            if (!yyjson_is_arr(cur) || unsafe_yyjson_get_len(cur) != 2u) {
+                                sdoc->arena.bump_ptr = bp;
+                                --i;
+                                break;
+                            }
+                            e0 = cur + 1u;
+                            e1 = e0 + 1u;
+                            if (yyjson_get_tag(e0) != (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL) ||
+                                yyjson_get_tag(e1) != (YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL)) {
+                                sdoc->arena.bump_ptr = bp;
+                                --i;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if (ArenaArray* leaf = try_build_inline_leaf_arena_array(
                         sdoc, cur, clen, empty_str, str_intern, str_intern_started, seed)) {
                     json_access::init_arena_array_ptr(&out[i], leaf);
@@ -3309,8 +3616,8 @@ inline ArenaObject* build_arena_object_node(SharedYyDoc* sdoc, yyjson_val* val,
     yyjson_val* small_vals[ArenaShapeCache::kMaxCachedObjKeys];
 
     if (len >= 1u && len <= ArenaShapeCache::kMaxCachedObjKeys) {
-        yyjson_obj_iter hit_it = yyjson_obj_iter_with(val);
-        yyjson_val* k0 = yyjson_obj_iter_next(&hit_it);
+        yyjson_val* k0 = unsafe_yyjson_get_first(val);
+        yyjson_val* cv = k0 + 1u;
         const char* p0 = unsafe_yyjson_get_str(k0);
         const std::size_t l0 = unsafe_yyjson_get_len(k0);
         const std::size_t set_idx = ArenaShapeCache::compute_set(len, p0, l0);
@@ -3319,18 +3626,19 @@ inline ArenaObject* build_arena_object_node(SharedYyDoc* sdoc, yyjson_val* val,
             const ShapeEntry& se = scratch.shape_cache.entries[set_idx * 2u + way];
             if (se.doc_stamp == stamp && se.count == len && se.key0_len == l0 &&
                 fast_memeq(se.key0_data, p0, l0)) {
-                small_vals[0] = yyjson_obj_iter_get_val(k0);
+                small_vals[0] = cv;
                 const ShapeKeyRef* expected = scratch.shape_cache.key_pool.data() + se.pool_off;
                 bool matched = true;
                 for (std::size_t i = 1u; i < len; ++i) {
-                    yyjson_val* ck = yyjson_obj_iter_next(&hit_it);
+                    yyjson_val* ck = unsafe_yyjson_get_next(cv);
+                    cv = ck + 1u;
                     const std::size_t kl = unsafe_yyjson_get_len(ck);
                     const char* kp = unsafe_yyjson_get_str(ck);
                     if (kl != expected[i].len || !fast_memeq(kp, expected[i].data, kl)) {
                         matched = false;
                         break;
                     }
-                    small_vals[i] = yyjson_obj_iter_get_val(ck);
+                    small_vals[i] = cv;
                 }
                 if (matched) {
                     void* mem = sdoc->arena.alloc(sizeof(ArenaObject) + len * sizeof(json));
@@ -3496,18 +3804,8 @@ inline const void* materialize_doc_arena(SharedYyDoc* sdoc, yyjson_val* root,
 
 } // namespace
 
-void shared_doc_addref(SharedYyDoc* sdoc) noexcept {
-    if (sdoc != nullptr) {
-        sdoc->refcount.fetch_add(1u, std::memory_order_relaxed);
-    }
-}
-
-void shared_doc_release(SharedYyDoc* sdoc) noexcept {
-    if (sdoc != nullptr &&
-        (sdoc->refcount.load(std::memory_order_acquire) == 1u ||
-         sdoc->refcount.fetch_sub(1u, std::memory_order_acq_rel) == 1u)) {
-        destroy_shared_doc(sdoc);
-    }
+void destroy_shared_doc_slow(SharedDocHeader* hdr) noexcept {
+    destroy_shared_doc(static_cast<SharedYyDoc*>(hdr));
 }
 
 const void* lazy_materialize_arena(LazyHeader* hdr, const value_t type) {
@@ -3544,7 +3842,9 @@ ArenaHashIndex* arena_obj_build_index_slow(const ArenaObject* ao) noexcept {
         return nullptr;
     }
     try {
-        SpinGuard guard(ao->doc->extra_lock);
+        auto* sdoc = static_cast<SharedYyDoc*>(ao->doc);
+        SharedDocExtras* ex = get_or_create_doc_extras(sdoc);
+        SpinGuard guard(ex->extra_lock);
         if (ArenaHashIndex* existing = ao->index.load(std::memory_order_relaxed)) {
             return existing;
         }
@@ -3558,7 +3858,7 @@ ArenaHashIndex* arena_obj_build_index_slow(const ArenaObject* ao) noexcept {
         try {
             idx = static_cast<ArenaHashIndex*>(pool_alloc(sizeof(ArenaHashIndex)));
             ::new (idx) ArenaHashIndex{cap, slots};
-            ao->doc->arena_indices.reserve(ao->doc->arena_indices.size() + 1u);
+            ex->arena_indices.reserve(ex->arena_indices.size() + 1u);
         } catch (...) {
             if (idx != nullptr) {
                 pool_free(idx, sizeof(ArenaHashIndex));
@@ -3578,7 +3878,7 @@ ArenaHashIndex* arena_obj_build_index_slow(const ArenaObject* ao) noexcept {
             }
             slots[pos] = ArenaHashSlot{static_cast<std::uint32_t>(i + 1u), h32};
         }
-        ao->doc->arena_indices.push_back(idx);
+        ex->arena_indices.push_back(idx);
         ao->index.store(idx, std::memory_order_release);
         return idx;
     } catch (...) {
@@ -3682,46 +3982,55 @@ void arena_clone_to_owned(json& dst, const json& src) {
             const json* vs = ao->vals();
             if (n == 0u) {
                 *cur_dst = json_access::make_object();
-            } else if (n <= kSmallObjCap) {
-                SmallObject4* so = json_access::create_small_object_raw();
-                struct SmallObjGuard {
-                    SmallObject4* p;
-                    ~SmallObjGuard() {
-                        if (p != nullptr) {
-                            json_access::destroy_small_object_raw(p);
-                        }
-                    }
-                } guard{so};
-                for (std::size_t i = 0u; i < n; ++i) {
-                    bool nested = false;
-                    json val = clone_arena_leaf_or_placeholder(vs[i], nested);
-                    json_access::small_object_append_unique(so, *ks[i], std::move(val));
-                    if (nested) {
-                        workstack.emplace_back(&vs[i], &so->entry(i).second);
-                    }
-                }
-                guard.p = nullptr;
-                *cur_dst = json_access::make_from_small_object(so);
             } else {
-                json::object_t* obj = json_access::create_object_vec_cap(n);
-                struct ObjGuard {
-                    json::object_t* p;
-                    ~ObjGuard() {
-                        if (p != nullptr) {
-                            json_access::destroy_erased_container(p, value_t::object);
+                SmallObject4* so = nullptr;
+                if (n <= kSmallObjMaxCap) {
+                    std::size_t total_key_bytes = 0u;
+                    for (std::size_t i = 0u; i < n; ++i) {
+                        total_key_bytes += ks[i]->size();
+                    }
+                    so = json_access::create_small_object_raw_for(n, total_key_bytes);
+                }
+                if (so != nullptr) {
+                    struct SmallObjGuard {
+                        SmallObject4* p;
+                        ~SmallObjGuard() {
+                            if (p != nullptr) {
+                                json_access::destroy_small_object_raw(p);
+                            }
+                        }
+                    } guard{so};
+                    for (std::size_t i = 0u; i < n; ++i) {
+                        bool nested = false;
+                        json val = clone_arena_leaf_or_placeholder(vs[i], nested);
+                        json_access::small_object_append_unique(so, *ks[i], std::move(val));
+                        if (nested) {
+                            workstack.emplace_back(&vs[i], &so->val(i));
                         }
                     }
-                } guard{obj};
-                for (std::size_t i = 0u; i < n; ++i) {
-                    bool nested = false;
-                    json val = clone_arena_leaf_or_placeholder(vs[i], nested);
-                    obj->emplace_back_unindexed(*ks[i], std::move(val));
-                    if (nested) {
-                        workstack.emplace_back(&vs[i], &(*obj)[i].second);
+                    guard.p = nullptr;
+                    *cur_dst = json_access::make_from_small_object(so);
+                } else {
+                    json::object_t* obj = json_access::create_object_vec_cap(n);
+                    struct ObjGuard {
+                        json::object_t* p;
+                        ~ObjGuard() {
+                            if (p != nullptr) {
+                                json_access::destroy_erased_container(p, value_t::object);
+                            }
+                        }
+                    } guard{obj};
+                    for (std::size_t i = 0u; i < n; ++i) {
+                        bool nested = false;
+                        json val = clone_arena_leaf_or_placeholder(vs[i], nested);
+                        obj->emplace_back_unindexed(*ks[i], std::move(val));
+                        if (nested) {
+                            workstack.emplace_back(&vs[i], &(*obj)[i].second);
+                        }
                     }
+                    guard.p = nullptr;
+                    *cur_dst = json_access::make_from_object_ptr(obj);
                 }
-                guard.p = nullptr;
-                *cur_dst = json_access::make_from_object_ptr(obj);
             }
         }
     }
@@ -3730,11 +4039,12 @@ void arena_clone_to_owned(json& dst, const json& src) {
 }
 
 const void* arena_compat_array(const ArenaArray* aa) {
-    SharedYyDoc* sdoc = aa->doc;
+    auto* sdoc = static_cast<SharedYyDoc*>(aa->doc);
+    SharedDocExtras* ex = get_or_create_doc_extras(sdoc);
     {
-        SpinGuard guard(sdoc->extra_lock);
-        const auto it = sdoc->compat_cache.find(aa);
-        if (it != sdoc->compat_cache.end()) {
+        SpinGuard guard(ex->extra_lock);
+        const auto it = ex->compat_cache.find(aa);
+        if (it != ex->compat_cache.end()) {
             return it->second.first;
         }
     }
@@ -3759,10 +4069,10 @@ const void* arena_compat_array(const ArenaArray* aa) {
             arr->push_back(json_access::copy_arena_slot_raw(e));
         }
     }
-    SpinGuard lock_guard(sdoc->extra_lock);
+    SpinGuard lock_guard(ex->extra_lock);
     const auto [it, inserted] =
-        sdoc->compat_cache.emplace(static_cast<const void*>(aa),
-                                   std::make_pair(static_cast<void*>(arr), value_t::array));
+        ex->compat_cache.emplace(static_cast<const void*>(aa),
+                                 std::make_pair(static_cast<void*>(arr), value_t::array));
     if (inserted) {
         arr_guard.p = nullptr;
         return arr;
@@ -3771,11 +4081,12 @@ const void* arena_compat_array(const ArenaArray* aa) {
 }
 
 const void* arena_compat_object(const ArenaObject* ao) {
-    SharedYyDoc* sdoc = ao->doc;
+    auto* sdoc = static_cast<SharedYyDoc*>(ao->doc);
+    SharedDocExtras* ex = get_or_create_doc_extras(sdoc);
     {
-        SpinGuard guard(sdoc->extra_lock);
-        const auto it = sdoc->compat_cache.find(ao);
-        if (it != sdoc->compat_cache.end()) {
+        SpinGuard guard(ex->extra_lock);
+        const auto it = ex->compat_cache.find(ao);
+        if (it != ex->compat_cache.end()) {
             return it->second.first;
         }
     }
@@ -3801,10 +4112,10 @@ const void* arena_compat_object(const ArenaObject* ao) {
             obj->emplace_back_unindexed(*ks[i], json_access::copy_arena_slot_raw(v));
         }
     }
-    SpinGuard lock_guard(sdoc->extra_lock);
+    SpinGuard lock_guard(ex->extra_lock);
     const auto [it, inserted] =
-        sdoc->compat_cache.emplace(static_cast<const void*>(ao),
-                                   std::make_pair(static_cast<void*>(obj), value_t::object));
+        ex->compat_cache.emplace(static_cast<const void*>(ao),
+                                 std::make_pair(static_cast<void*>(obj), value_t::object));
     if (inserted) {
         obj_guard.p = nullptr;
         return obj;
@@ -3822,7 +4133,7 @@ void lazy_release(LazyHeader* hdr, const value_t type) noexcept {
         void* mat = node->materialized.load(std::memory_order_acquire);
         SharedYyDoc* sdoc = node->doc;
         node->~LazyNode();
-        pool_free(node, sizeof(LazyNode));
+        tcache_free_fixed<sizeof(LazyNode)>(node);
         if (mat != nullptr) {
             json_access::destroy_erased_container(mat, type);
         }
@@ -3866,7 +4177,7 @@ void* lazy_detach_mutable(LazyHeader* hdr, const value_t type) {
         }
         SharedYyDoc* sdoc = node->doc;
         node->~LazyNode();
-        pool_free(node, sizeof(LazyNode));
+        tcache_free_fixed<sizeof(LazyNode)>(node);
         shared_doc_release(sdoc);
         return mat;
     }
@@ -3881,7 +4192,7 @@ void* lazy_detach_mutable(LazyHeader* hdr, const value_t type) {
         void* mat = node->materialized.exchange(nullptr, std::memory_order_acq_rel);
         SharedYyDoc* sdoc = node->doc;
         node->~LazyNode();
-        pool_free(node, sizeof(LazyNode));
+        tcache_free_fixed<sizeof(LazyNode)>(node);
         shared_doc_release(sdoc);
         return mat;
     }
@@ -3963,7 +4274,7 @@ void* lazy_clear(LazyHeader* hdr, const value_t type) noexcept {
             }
             SharedYyDoc* sdoc = node->doc;
             node->~LazyNode();
-            pool_free(node, sizeof(LazyNode));
+            tcache_free_fixed<sizeof(LazyNode)>(node);
             shared_doc_release(sdoc);
             return mat;
         }
@@ -4035,23 +4346,23 @@ struct ObjView {
     const void* ptr = nullptr;
     std::size_t n = 0u;
 
-    const std::string& key(const std::size_t i) const noexcept {
+    std::string_view key_sv(const std::size_t i) const noexcept {
         switch (kind) {
             case Kind::Small:
-                return static_cast<const SmallObject4*>(ptr)->entry(i).first;
+                return static_cast<const SmallObject4*>(ptr)->key_view(i);
             case Kind::Arena:
-                return *static_cast<const ArenaObject*>(ptr)->keys()[i];
+                return std::string_view(*static_cast<const ArenaObject*>(ptr)->keys()[i]);
             case Kind::Eager:
             case Kind::Empty:
             default:
-                return (*static_cast<const json::object_t*>(ptr))[i].first;
+                return std::string_view((*static_cast<const json::object_t*>(ptr))[i].first);
         }
     }
 
     const json& val(const std::size_t i) const noexcept {
         switch (kind) {
             case Kind::Small:
-                return static_cast<const SmallObject4*>(ptr)->entry(i).second;
+                return static_cast<const SmallObject4*>(ptr)->val(i);
             case Kind::Arena:
                 return static_cast<const ArenaObject*>(ptr)->vals()[i];
             case Kind::Eager:
@@ -4130,7 +4441,7 @@ inline bool object_view_equal(const json& lhs, const json& rhs) {
         return false;
     }
     for (std::size_t i = 0u; i < lv.n; ++i) {
-        if (!(lv.key(i) == rv.key(i) && lv.val(i) == rv.val(i))) {
+        if (!(lv.key_sv(i) == rv.key_sv(i) && lv.val(i) == rv.val(i))) {
             return false;
         }
     }
@@ -4142,8 +4453,8 @@ inline bool object_view_less(const json& lhs, const json& rhs) {
     const ObjView rv = resolve_obj_view(rhs);
     const std::size_t common = (std::min)(lv.n, rv.n);
     for (std::size_t i = 0u; i < common; ++i) {
-        const std::string& lk = lv.key(i);
-        const std::string& rk = rv.key(i);
+        const std::string_view lk = lv.key_sv(i);
+        const std::string_view rk = rv.key_sv(i);
         if (lk < rk) {
             return true;
         }
@@ -4252,7 +4563,7 @@ void lazy_materialize_deep(json& root) {
                 auto* so = json_access::small_object_ptr(*cur);
                 json_access::drop_small_object_const_cache(so);
                 for (std::size_t i = 0u; i < so->count; ++i) {
-                    json& val = so->entry(i).second;
+                    json& val = so->val(i);
                     if (val.is_string()) {
                         json_access::detach_shared_string(val);
                     } else if (val.is_array() || val.is_object()) {
@@ -4284,7 +4595,7 @@ void* lazy_steal_owned_materialized(LazyHeader* hdr, const value_t /*type*/) noe
     }
     SharedYyDoc* sdoc = node->doc;
     node->~LazyNode();
-    pool_free(node, sizeof(LazyNode));
+    tcache_free_fixed<sizeof(LazyNode)>(node);
     shared_doc_release(sdoc);
     return mat;
 }
@@ -5010,9 +5321,8 @@ inline void dump_small_object_compact_strict(DumpBuffer& out, const SmallObject4
         if (i > 0u) {
             out.push(',');
         }
-        const auto& e = so.entry(i);
-        utf8_impl::dump_key_colon_fast_strict(out, e.first);
-        dump_compact_strict(out, e.second);
+        utf8_impl::dump_key_colon_fast_strict(out, so.key_view(i));
+        dump_compact_strict(out, so.val(i));
     }
     out.push('}');
 }
@@ -5034,12 +5344,11 @@ inline void dump_small_object_value(DumpBuffer& out, const SmallObject4& so,
                 (std::max)(indent_string.size() * 2, static_cast<std::size_t>(new_indent)), ' ');
         }
         for (std::size_t i = 0u; i < so.count; ++i) {
-            const auto& e = so.entry(i);
             out.append(indent_string.data(), new_indent);
             out.push('"');
-            utf8_impl::dump_escaped(out, e.first, ensure_ascii, error_handler);
+            utf8_impl::dump_escaped(out, so.key_view(i), ensure_ascii, error_handler);
             out.append("\": ", 3);
-            dump_value(out, e.second, true, ensure_ascii, error_handler, indent_step,
+            dump_value(out, so.val(i), true, ensure_ascii, error_handler, indent_step,
                        indent_string, new_indent);
             if (i + 1u < so.count) {
                 out.append(",\n", 2);
@@ -5055,11 +5364,10 @@ inline void dump_small_object_value(DumpBuffer& out, const SmallObject4& so,
             if (i > 0u) {
                 out.push(',');
             }
-            const auto& e = so.entry(i);
             out.push('"');
-            utf8_impl::dump_escaped(out, e.first, ensure_ascii, error_handler);
+            utf8_impl::dump_escaped(out, so.key_view(i), ensure_ascii, error_handler);
             out.append("\":", 2);
-            dump_value(out, e.second, false, ensure_ascii, error_handler, indent_step,
+            dump_value(out, so.val(i), false, ensure_ascii, error_handler, indent_step,
                        indent_string, current_indent);
         }
         out.push('}');

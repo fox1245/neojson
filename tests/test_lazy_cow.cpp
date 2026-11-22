@@ -1588,8 +1588,9 @@ TEST(LazyCow, OrderedMapSubstringSelfAliasGrowth) {
         heap_expected.emplace_back(k, i);
     }
     const std::string_view hsv4 = std::string_view(heap_obj.begin().key()).substr(5);
+    const std::string hsv4_expected(hsv4);
     heap_obj[hsv4] = 104;
-    heap_expected.emplace_back(std::string(hsv4), 104);
+    heap_expected.emplace_back(hsv4_expected, 104);
 
     ASSERT_EQ(obj.size(), expected.size());
     std::size_t idx = 0;
@@ -1984,6 +1985,420 @@ TEST(LazyCow, ArenaShapeCacheAndTaggedConstIterator) {
     EXPECT_EQ(mut_root.find("obj"), std::as_const(mut_root).find("obj"));
     EXPECT_EQ(std::as_const(mut_root).find("missing"), mut_root.end());
     EXPECT_EQ(std::as_const(mut_root).find("missing"), mut_root.cend());
+}
+
+TEST(LazyCow, FlatObjectGrowthSwarTagsAndTCacheStress) {
+    static_assert(sizeof(jk) == 16 && sizeof(jk::iterator) == 16 &&
+                      sizeof(jk::const_iterator) == 16,
+                  "handle and iterator sizes must stay 16 bytes");
+
+    auto make_key = [](const std::size_t i) -> std::string {
+        if ((i % 7u) == 0u) {
+            return "a" + std::to_string(i);
+        }
+        if ((i % 5u) == 0u) {
+            return "boundary_15_k" + std::to_string(i % 10u);
+        }
+        return "shared_prefix_long_key_name_" + std::to_string(i);
+    };
+
+    // 1. operator[] growth 0 -> 4 -> 8 -> 16 -> 32 -> 64 -> 80, overwrites, erase, clear,
+    // copy, move, dump equivalence against nlohmann::ordered_json.
+    jk mut = jk::object();
+    oj oracle = oj::object();
+    for (std::size_t i = 0u; i < 80u; ++i) {
+        const std::string k = make_key(i);
+        if ((i % 3u) == 0u) {
+            mut[k] = static_cast<std::int64_t>(i * 10u);
+            oracle[k] = static_cast<std::int64_t>(i * 10u);
+        } else if ((i % 3u) == 1u) {
+            mut[k] = "val_" + std::to_string(i) + "_with_padding_bytes";
+            oracle[k] = "val_" + std::to_string(i) + "_with_padding_bytes";
+        } else {
+            mut[k] = (i % 2u == 0u);
+            oracle[k] = (i % 2u == 0u);
+        }
+        if (i == 3u || i == 7u || i == 15u || i == 31u || i == 63u || i == 79u) {
+            // Overwrite an early key and a recent key right at capacity boundary.
+            const std::string k_first = make_key(0u);
+            const std::string k_cur = make_key(i);
+            mut[k_first] = static_cast<std::int64_t>(i + 1000u);
+            oracle[k_first] = static_cast<std::int64_t>(i + 1000u);
+            mut[k_cur] = "updated_" + std::to_string(i);
+            oracle[k_cur] = "updated_" + std::to_string(i);
+
+            jk copy(mut);
+            jk moved(std::move(copy));
+            EXPECT_EQ(moved.dump(), oracle.dump());
+            neojson::test::assert_equivalent(oracle, moved);
+
+            // Erase + re-insert on a copy without altering mut's growth trajectory.
+            jk scratch = moved;
+            oj scratch_oracle = oracle;
+            const std::string k_mid = make_key(i / 2u);
+            EXPECT_EQ(scratch.erase(k_mid), scratch_oracle.erase(k_mid));
+            EXPECT_EQ(scratch.dump(), scratch_oracle.dump());
+            scratch.clear();
+            scratch_oracle.clear();
+            EXPECT_TRUE(scratch.empty());
+            scratch["reborn"] = 42;
+            scratch_oracle["reborn"] = 42;
+            EXPECT_EQ(scratch.dump(), scratch_oracle.dump());
+        }
+    }
+    EXPECT_EQ(mut.erase(make_key(42u)), oracle.erase(make_key(42u)));
+    EXPECT_EQ(mut.dump(), oracle.dump());
+    mut.clear();
+    oracle.clear();
+    EXPECT_TRUE(mut.empty());
+    EXPECT_EQ(mut.dump(), oracle.dump());
+
+    // 2. Self-aliasing obj[obj["k0"]] across growth boundaries 4, 8, 16, 32, 64.
+    for (const std::size_t boundary : {4u, 8u, 16u, 32u, 64u}) {
+        jk obj = jk::object();
+        oj ref = oj::object();
+        const std::string target_key = "alias_trigger_" + std::to_string(boundary);
+        obj["k0"] = target_key;
+        ref["k0"] = target_key;
+        for (std::size_t i = 1u; i < boundary; ++i) {
+            const std::string k = "fill_" + std::to_string(i);
+            obj[k] = static_cast<std::int64_t>(i);
+            ref[k] = static_cast<std::int64_t>(i);
+        }
+        ASSERT_EQ(obj.size(), boundary);
+        // Inserts new key aliasing memory inside obj["k0"] while forcing buffer reallocation/promote.
+        obj[obj["k0"].get_ref<const jk::string_t&>()] = static_cast<std::int64_t>(boundary * 100u);
+        ref[ref["k0"].get_ref<const oj::string_t&>()] = static_cast<std::int64_t>(boundary * 100u);
+        EXPECT_EQ(obj.size(), boundary + 1u);
+        EXPECT_EQ(obj.dump(), ref.dump());
+
+        // Self-aliasing overwrite across the same storage.
+        obj[obj["k0"].get_ref<const jk::string_t&>()] = "overwritten_" + target_key;
+        ref[ref["k0"].get_ref<const oj::string_t&>()] = "overwritten_" + target_key;
+        EXPECT_EQ(obj.dump(), ref.dump());
+    }
+
+    // 3. Concurrent const get_ptr<const object_t*>() on cap 8 and cap 32, followed by mutation.
+    for (const std::size_t n : {6u, 28u}) {
+        jk base = jk::object();
+        oj ref = oj::object();
+        for (std::size_t i = 0u; i < n; ++i) {
+            const std::string k = "ck_" + std::to_string(i);
+            base[k] = static_cast<std::int64_t>(i * 3u);
+            ref[k] = static_cast<std::int64_t>(i * 3u);
+        }
+        const jk& cbase = base;
+        std::atomic<const jk::object_t*> first_ptr{nullptr};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 4; ++t) {
+            readers.emplace_back([&]() {
+                for (int r = 0; r < 64; ++r) {
+                    const jk::object_t* p = cbase.get_ptr<const jk::object_t*>();
+                    ASSERT_NE(p, nullptr);
+                    EXPECT_EQ(p->size(), n);
+                    const jk::object_t* expected = nullptr;
+                    if (!first_ptr.compare_exchange_strong(expected, p, std::memory_order_acq_rel)) {
+                        EXPECT_EQ(expected, p);
+                    }
+                }
+            });
+        }
+        for (auto& th : readers) {
+            th.join();
+        }
+        // Mutate base after concurrent const materialization; cached object_t* must invalidate.
+        for (std::size_t extra = 0u; extra < 40u; ++extra) {
+            const std::string ek = "mut_after_" + std::to_string(extra);
+            base[ek] = extra;
+            ref[ek] = extra;
+        }
+        const jk::object_t* updated_ptr = std::as_const(base).get_ptr<const jk::object_t*>();
+        ASSERT_NE(updated_ptr, nullptr);
+        EXPECT_EQ(updated_ptr->size(), n + 40u);
+        EXPECT_EQ(base.dump(), ref.dump());
+    }
+
+    // 4. 8-thread producer-exit + cross-thread destroy stress (TCache, SmallArray2,
+    // FlatObject cap 4..64, batched m_storage == 5u arena string release).
+    std::string shared_doc_src = R"({"short":"s","long_val":"value_string_longer_than_15_bytes_for_shared_doc_batch_release","items":[1.5,2.5]})";
+    for (int extra = 0; extra < 40; ++extra) {
+        shared_doc_src.pop_back();
+        shared_doc_src += R"(,"k)" + std::to_string(extra) + R"(":"shared_string_payload_exceeding_sso_limit_)" +
+                          std::to_string(extra) + R"("})";
+    }
+    const oj parsed_oracle = oj::parse(shared_doc_src);
+
+    constexpr int kProducers = 8;
+    std::vector<std::vector<jk>> harvested(static_cast<std::size_t>(kProducers));
+    std::vector<std::thread> producers;
+    for (int t = 0; t < kProducers; ++t) {
+        producers.emplace_back([&, t]() {
+            jk doc = jk::parse(shared_doc_src);
+            auto& out = harvested[static_cast<std::size_t>(t)];
+            out.reserve(32u);
+            for (int iter = 0; iter < 16; ++iter) {
+                jk arr = jk::array();
+                arr.push_back(doc["items"][0]);
+                arr.push_back(doc["long_val"]);
+                out.push_back(std::move(arr));
+
+                jk flat = jk::object();
+                for (int k = 0; k < 20; ++k) {
+                    const std::string key = "k" + std::to_string(k);
+                    flat[key] = doc[key];
+                }
+                flat["tag"] = "thr_" + std::to_string(t) + "_" + std::to_string(iter);
+                out.push_back(std::move(flat));
+            }
+            // doc itself drops on producer exit; harvested SmallArray2 and FlatObject keep
+            // SharedYyDoc alive via m_storage == 5u SharedStrings across thread exit.
+        });
+    }
+    for (auto& th : producers) {
+        th.join();
+    }
+
+    // Verify a sample before cross-thread destruction.
+    for (int t = 0; t < kProducers; ++t) {
+        const auto& vec = harvested[static_cast<std::size_t>(t)];
+        ASSERT_EQ(vec.size(), 32u);
+        EXPECT_EQ(vec[0].size(), 2u);
+        EXPECT_EQ(vec[1]["k0"], parsed_oracle["k0"].get<std::string>());
+    }
+
+    // Destroy half on 4 fresh consumer threads (triggers cross-thread slab freeing and
+    // FlatObject batched shared_doc_release_n on exited producers' TCache allocations)
+    // and destroy the remaining half on the main thread.
+    std::vector<std::thread> consumers;
+    for (int c = 0; c < 4; ++c) {
+        consumers.emplace_back([&, c]() {
+            std::vector<jk> dropped = std::move(harvested[static_cast<std::size_t>(c)]);
+            for (auto& item : dropped) {
+                jk copy(item);
+                EXPECT_EQ(copy.size(), item.size());
+            }
+        });
+    }
+    for (auto& th : consumers) {
+        th.join();
+    }
+    for (int c = 4; c < kProducers; ++c) {
+        harvested[static_cast<std::size_t>(c)].clear();
+    }
+}
+
+TEST(LazyCow, CompactObjectArrayAndDocCreditStress) {
+    // 1. CompactObject growth across every cap boundary (2 -> 4 -> 8 -> 16 -> 32 -> 64 -> >64)
+    // including self-aliasing obj[obj["k0"]] at every boundary.
+    for (const std::size_t boundary : {2u, 4u, 8u, 16u, 32u, 64u}) {
+        jk obj = jk::object();
+        oj ref = oj::object();
+        const std::string trigger = "compact_trigger_" + std::to_string(boundary);
+        obj["k0"] = trigger;
+        ref["k0"] = trigger;
+        for (std::size_t i = 1u; i < boundary; ++i) {
+            const std::string k = "p_" + std::to_string(i);
+            obj[k] = static_cast<std::int64_t>(i * 7u);
+            ref[k] = static_cast<std::int64_t>(i * 7u);
+        }
+        ASSERT_EQ(obj.size(), boundary);
+        obj[obj["k0"].get_ref<const jk::string_t&>()] = static_cast<std::int64_t>(boundary + 500u);
+        ref[ref["k0"].get_ref<const oj::string_t&>()] = static_cast<std::int64_t>(boundary + 500u);
+        EXPECT_EQ(obj.size(), boundary + 1u);
+        EXPECT_EQ(obj.dump(), ref.dump());
+        neojson::test::assert_equivalent(ref, obj);
+    }
+
+    // 2. Key buffer overflow paths & erase compaction.
+    {
+        const std::string key_100(100u, 'x');
+        jk o100 = jk::object();
+        o100[key_100] = 100;
+        EXPECT_EQ(o100.size(), 1u);
+        EXPECT_EQ(o100.at(key_100), 100);
+        EXPECT_EQ(o100.dump(), "{\"" + key_100 + "\":100}");
+
+        const std::string key_3000(3000u, 'y');
+        jk o3000 = jk::object();
+        o3000[key_3000] = "big";
+        EXPECT_EQ(o3000.size(), 1u);
+        EXPECT_EQ(o3000.at(key_3000), "big");
+
+        jk small_then_big = jk::object();
+        small_then_big["a"] = 1;
+        small_then_big["b"] = 2;
+        small_then_big[key_3000] = 3;
+        EXPECT_EQ(small_then_big.size(), 3u);
+        EXPECT_EQ(small_then_big.at("a"), 1);
+        EXPECT_EQ(small_then_big.at(key_3000), 3);
+
+        // Repeated erase + re-insert on cap-2 CompactObject triggers key-buffer compaction cleanly.
+        jk cycle = jk::object();
+        oj cycle_ref = oj::object();
+        cycle["keep"] = 77;
+        cycle_ref["keep"] = 77;
+        for (int round = 0; round < 32; ++round) {
+            const std::string dk = "tmp_key_slot_" + std::to_string(round) + "_pad";
+            cycle[dk] = round;
+            cycle_ref[dk] = round;
+            EXPECT_EQ(cycle.erase(dk), 1u);
+            EXPECT_EQ(cycle_ref.erase(dk), 1u);
+        }
+        cycle["final"] = 88;
+        cycle_ref["final"] = 88;
+        EXPECT_EQ(cycle.dump(), cycle_ref.dump());
+    }
+
+    // 3. Lazy it.key() materialization: value ref & key ref stability + concurrent TSan reads.
+    {
+        jk obj = jk::object();
+        obj["k0"] = 10;
+        obj["k1"] = 20;
+        obj["k2"] = "v2";
+        jk& vref = obj["k0"];
+        const std::string& kref = obj.begin().key();
+        EXPECT_EQ(kref, "k0");
+        obj["k0"] = 999;
+        obj.begin().value() = 1000;
+        EXPECT_EQ(&vref, &obj["k0"]);
+        EXPECT_EQ(vref, 1000);
+        EXPECT_EQ(kref, "k0");
+
+        const jk& cobj = obj;
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 4; ++t) {
+            readers.emplace_back([&]() {
+                for (int r = 0; r < 64; ++r) {
+                    std::size_t idx = 0u;
+                    for (auto it = cobj.cbegin(); it != cobj.cend(); ++it, ++idx) {
+                        EXPECT_EQ(it.key(), "k" + std::to_string(idx));
+                    }
+                    const jk::object_t* map_ptr = cobj.get_ptr<const jk::object_t*>();
+                    ASSERT_NE(map_ptr, nullptr);
+                    EXPECT_EQ(map_ptr->size(), 3u);
+                }
+            });
+        }
+        for (auto& th : readers) {
+            th.join();
+        }
+        obj["k3"] = true;
+        EXPECT_EQ(obj.size(), 4u);
+        EXPECT_EQ(obj.at("k3"), true);
+    }
+
+    // 4. Variable-cap SmallArray2 (0 -> 1 -> 2 -> 4 -> 8 -> 16 -> 32), self-push, and TSan.
+    {
+        jk arr = jk::array();
+        oj oracle = oj::array();
+        for (std::size_t i = 0u; i < 32u; ++i) {
+            if ((i % 3u) == 0u) {
+                arr.push_back(static_cast<std::int64_t>(i));
+                oracle.push_back(static_cast<std::int64_t>(i));
+            } else if ((i % 3u) == 1u) {
+                arr.push_back("elem_" + std::to_string(i));
+                oracle.push_back("elem_" + std::to_string(i));
+            } else {
+                arr.emplace_back(i % 2u == 0u);
+                oracle.emplace_back(i % 2u == 0u);
+            }
+            if (i == 0u || i == 1u || i == 3u || i == 7u || i == 15u || i == 31u) {
+                jk copy(arr);
+                jk moved(std::move(copy));
+                EXPECT_EQ(moved.dump(), oracle.dump());
+                neojson::test::assert_equivalent(oracle, moved);
+            }
+        }
+        arr.clear();
+        oracle.clear();
+        EXPECT_TRUE(arr.empty());
+        arr[6] = 42;
+        oracle[6] = 42;
+        EXPECT_EQ(arr.size(), 7u);
+        EXPECT_EQ(arr.dump(), oracle.dump());
+
+        for (const std::size_t boundary : {2u, 4u, 8u, 16u}) {
+            jk sa = jk::array();
+            oj sr = oj::array();
+            for (std::size_t i = 0u; i < boundary; ++i) {
+                sa.push_back("self_item_" + std::to_string(i));
+                sr.push_back("self_item_" + std::to_string(i));
+            }
+            sa.push_back(std::move(sa[0]));
+            sr.push_back(std::move(sr[0]));
+            sa.push_back(sa);
+            sr.push_back(sr);
+            EXPECT_EQ(sa.dump(), sr.dump());
+
+            const jk& csa = sa;
+            std::vector<std::thread> areaders;
+            for (int t = 0; t < 4; ++t) {
+                areaders.emplace_back([&]() {
+                    for (int r = 0; r < 64; ++r) {
+                        const jk::array_t* vp = csa.get_ptr<const jk::array_t*>();
+                        ASSERT_NE(vp, nullptr);
+                        EXPECT_EQ(vp->size(), boundary + 2u);
+                    }
+                });
+            }
+            for (auto& th : areaders) {
+                th.join();
+            }
+            sa[1] = 12345;
+            EXPECT_EQ(sa.get_ptr<const jk::array_t*>()->at(1), 12345);
+        }
+    }
+
+    // 5. ThreadDocCredit stress: >600 m_storage == 5u copies across multiple docs and threads.
+    {
+        std::string doc_a_src = "{";
+        std::string doc_b_src = "{";
+        for (int i = 0; i < 40; ++i) {
+            if (i > 0) {
+                doc_a_src.push_back(',');
+                doc_b_src.push_back(',');
+            }
+            doc_a_src += "\"a" + std::to_string(i) + "\":\"shared_doc_credit_alpha_payload_" +
+                         std::to_string(i) + "_padding_bytes\"";
+            doc_b_src += "\"b" + std::to_string(i) + "\":\"shared_doc_credit_beta_payload_" +
+                         std::to_string(i) + "_padding_bytes\"";
+        }
+        doc_a_src.push_back('}');
+        doc_b_src.push_back('}');
+
+        constexpr int kProd = 4;
+        std::vector<std::vector<jk>> batches(static_cast<std::size_t>(kProd));
+        std::vector<std::thread> prods;
+        for (int p = 0; p < kProd; ++p) {
+            prods.emplace_back([&, p]() {
+                jk da = jk::parse(doc_a_src);
+                jk db = jk::parse(doc_b_src);
+                auto& dst = batches[static_cast<std::size_t>(p)];
+                dst.reserve(700u);
+                for (int r = 0; r < 640; ++r) {
+                    const std::string ka = "a" + std::to_string(r % 40);
+                    const std::string kb = "b" + std::to_string(r % 40);
+                    dst.push_back(da[ka]);
+                    if ((r % 3) == 0) {
+                        dst.push_back(db[kb]);
+                    }
+                }
+            });
+        }
+        for (auto& th : prods) {
+            th.join();
+        }
+        std::vector<std::thread> cons;
+        for (int c = 0; c < kProd; ++c) {
+            cons.emplace_back([&, c]() {
+                auto moved = std::move(batches[static_cast<std::size_t>(c)]);
+                EXPECT_GT(moved.size(), 640u);
+            });
+        }
+        for (auto& th : cons) {
+            th.join();
+        }
+    }
 }
 
 } // namespace
