@@ -784,15 +784,8 @@ static_assert(sizeof(ArenaCtnHeader) == 16u && alignof(ArenaCtnHeader) == aligno
               "ArenaCtnHeader must stay 16-byte pointer-aligned");
 
 struct ArenaArray : ArenaCtnHeader {
-    json* elems() noexcept {
-        return std::launder(
-            reinterpret_cast<json*>(reinterpret_cast<unsigned char*>(this) + sizeof(ArenaArray)));
-    }
-
-    const json* elems() const noexcept {
-        return std::launder(reinterpret_cast<const json*>(
-            reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaArray)));
-    }
+    inline json* elems() noexcept;
+    inline const json* elems() const noexcept;
 };
 static_assert(sizeof(ArenaArray) == 16u && alignof(ArenaArray) == alignof(void*),
               "ArenaArray must stay 16-byte pointer-aligned");
@@ -815,15 +808,8 @@ struct ArenaObject : ArenaCtnHeader {
         return keys_ptr;
     }
 
-    json* vals() noexcept {
-        return std::launder(reinterpret_cast<json*>(
-            reinterpret_cast<unsigned char*>(this) + sizeof(ArenaObject)));
-    }
-
-    const json* vals() const noexcept {
-        return std::launder(reinterpret_cast<const json*>(
-            reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaObject)));
-    }
+    inline json* vals() noexcept;
+    inline const json* vals() const noexcept;
 };
 static_assert(sizeof(ArenaObject) == 32u && alignof(ArenaObject) == alignof(void*),
               "ArenaObject must stay 32-byte pointer-aligned");
@@ -2111,214 +2097,8 @@ private:
     // MSVC 19.52 for arm64 at /O2 stored the index from before ++ into the memory copy, so in
     // `for (auto it = j.begin(); it != j.end(); ++it)` each value() after the first returned the previous element
     // while key() returned the right one. Passed by value in two words, the iterator need not be in memory at all.
-    NEOJSON_NOINLINE static reference element_at_slow(handle_t handle, difference_type idx) {
-        const std::uintptr_t raw = to_raw(handle);
-        if constexpr (kIsConst) {
-            const std::uintptr_t tag = raw & std::uintptr_t{3u};
-            if (tag == std::uintptr_t{1u} || tag == std::uintptr_t{2u}) {
-                throw_invalid_iterator(214, "cannot get value");
-            }
-        }
-        if (raw == std::uintptr_t{0u}) {
-            throw_invalid_iterator(214, "cannot get value");
-        }
-        pointer object = reinterpret_cast<pointer>(raw);
-        switch (object->m_type) {
-            case value_t::object: {
-                if (object->m_storage == 2u) {
-                    const auto* cso = object->m_value.small_obj;
-                    const std::size_t sz = BasicJsonType::small_obj_size(cso);
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= sz) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    if constexpr (kIsConst) {
-                        return BasicJsonType::small_obj_val(cso, static_cast<std::size_t>(idx));
-                    } else {
-                        if (BasicJsonType::small_obj_has_const_cache(cso)) {
-                            auto* obj = object->promote_small_object_mutable();
-                            return (*obj)[static_cast<std::size_t>(idx)].second;
-                        }
-                        return BasicJsonType::small_obj_val(object->m_value.small_obj,
-                                                            static_cast<std::size_t>(idx));
-                    }
-                }
-                if constexpr (kIsConst) {
-                    if (object->m_storage == 4u) {
-                        const auto* ao = object->m_value.arena_obj;
-                        if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
-                            throw_invalid_iterator(214, "cannot get value");
-                        }
-                        return ao->vals()[static_cast<std::size_t>(idx)];
-                    }
-                    if (object->m_storage == 1u) {
-                        void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
-                        if (av == nullptr) {
-                            if (void* mat = object->m_value.lazy->materialized.load(
-                                    std::memory_order_acquire)) {
-                                const auto* obj =
-                                    static_cast<const typename BasicJsonType::object_t*>(mat);
-                                if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
-                                    throw_invalid_iterator(214, "cannot get value");
-                                }
-                                return (*obj)[static_cast<std::size_t>(idx)].second;
-                            }
-                            av = const_cast<void*>(
-                                detail::lazy_materialize_arena(object->m_value.lazy, value_t::object));
-                        }
-                        const auto* ao = static_cast<const detail::ArenaObject*>(av);
-                        if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
-                            throw_invalid_iterator(214, "cannot get value");
-                        }
-                        return ao->vals()[static_cast<std::size_t>(idx)];
-                    }
-                    if (object->m_storage != 0u) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    const auto* obj = object->m_value.object;
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    return (*obj)[static_cast<std::size_t>(idx)].second;
-                } else {
-                    if (object->m_storage == 3u) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    auto* obj = object->mutable_object();
-                    if (static_cast<std::size_t>(idx) >= obj->size()) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    return (*obj)[static_cast<std::size_t>(idx)].second;
-                }
-            }
-            case value_t::array: {
-                if (object->m_storage == 2u) {
-                    const auto* csa = object->m_value.small_arr;
-                    const std::size_t sz = BasicJsonType::small_arr_size(csa);
-                    if (static_cast<std::size_t>(idx) >= sz) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    if constexpr (kIsConst) {
-                        return BasicJsonType::small_arr_elem(csa, static_cast<std::size_t>(idx));
-                    } else {
-                        if (BasicJsonType::small_arr_has_const_cache(csa)) {
-                            auto* arr = object->promote_small_array_mutable();
-                            return (*arr)[static_cast<std::size_t>(idx)];
-                        }
-                        return BasicJsonType::small_arr_elem(object->m_value.small_arr,
-                                                             static_cast<std::size_t>(idx));
-                    }
-                }
-                if constexpr (kIsConst) {
-                    if (object->m_storage == 4u) {
-                        const auto* aa = object->m_value.arena_arr;
-                        if (idx < 0 || static_cast<std::size_t>(idx) >= aa->count) {
-                            throw_invalid_iterator(214, "cannot get value");
-                        }
-                        return aa->elems()[static_cast<std::size_t>(idx)];
-                    }
-                    if (object->m_storage == 1u) {
-                        void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
-                        if (av == nullptr) {
-                            if (void* mat = object->m_value.lazy->materialized.load(
-                                    std::memory_order_acquire)) {
-                                const auto* arr =
-                                    static_cast<const typename BasicJsonType::array_t*>(mat);
-                                if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
-                                    throw_invalid_iterator(214, "cannot get value");
-                                }
-                                return (*arr)[static_cast<std::size_t>(idx)];
-                            }
-                            av = const_cast<void*>(
-                                detail::lazy_materialize_arena(object->m_value.lazy, value_t::array));
-                        }
-                        const auto* aa = static_cast<const detail::ArenaArray*>(av);
-                        if (idx < 0 || static_cast<std::size_t>(idx) >= aa->count) {
-                            throw_invalid_iterator(214, "cannot get value");
-                        }
-                        return aa->elems()[static_cast<std::size_t>(idx)];
-                    }
-                    if (object->m_storage != 0u) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    const auto* arr = object->m_value.array;
-                    if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    return (*arr)[static_cast<std::size_t>(idx)];
-                } else {
-                    if (object->m_storage == 3u) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    auto* arr = object->mutable_array();
-                    if (static_cast<std::size_t>(idx) >= arr->size()) {
-                        throw_invalid_iterator(214, "cannot get value");
-                    }
-                    return (*arr)[static_cast<std::size_t>(idx)];
-                }
-            }
-            case value_t::null:
-                throw_invalid_iterator(214, "cannot get value");
-            default:
-                if (idx == 0) {
-                    return *object;
-                }
-                throw_invalid_iterator(214, "cannot get value");
-        }
-    }
-
-    NEOJSON_ALWAYS_INLINE static reference element_at(handle_t handle, difference_type idx) {
-        if constexpr (kIsConst) {
-            const auto u_idx = static_cast<std::size_t>(idx);
-            const std::uintptr_t tag = handle & std::uintptr_t{3u};
-            if (tag == std::uintptr_t{1u}) {
-                const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
-                    handle - std::uintptr_t{1u});
-                if (NEOJSON_LIKELY(u_idx < ao->count)) {
-                    return ao->vals()[u_idx];
-                }
-            } else if (tag == std::uintptr_t{2u}) {
-                const auto* aa = reinterpret_cast<const detail::ArenaArray*>(
-                    handle - std::uintptr_t{2u});
-                if (NEOJSON_LIKELY(u_idx < aa->count)) {
-                    return aa->elems()[u_idx];
-                }
-            }
-            return element_at_slow(handle, idx);
-        } else {
-            pointer object = handle;
-            if (object != nullptr && idx >= 0) {
-                const auto u_idx = static_cast<std::size_t>(idx);
-                if (object->m_type == value_t::object) {
-                    if (object->m_storage == 0u) {
-                        auto* obj = object->m_value.object;
-                        if (u_idx < obj->size()) {
-                            return (*obj)[u_idx].second;
-                        }
-                    } else if (object->m_storage == 2u) {
-                        auto* so = object->m_value.small_obj;
-                        if (u_idx < BasicJsonType::small_obj_size(so) &&
-                            !BasicJsonType::small_obj_has_const_cache(so)) {
-                            return BasicJsonType::small_obj_val(so, u_idx);
-                        }
-                    }
-                } else if (object->m_type == value_t::array) {
-                    if (object->m_storage == 0u) {
-                        auto* arr = object->m_value.array;
-                        if (u_idx < arr->size()) {
-                            return (*arr)[u_idx];
-                        }
-                    } else if (object->m_storage == 2u) {
-                        auto* sa = object->m_value.small_arr;
-                        if (u_idx < BasicJsonType::small_arr_size(sa) &&
-                            !BasicJsonType::small_arr_has_const_cache(sa)) {
-                            return BasicJsonType::small_arr_elem(sa, u_idx);
-                        }
-                    }
-                }
-            }
-            return element_at_slow(handle, idx);
-        }
-    }
+    static reference element_at_slow(handle_t handle, difference_type idx);
+    NEOJSON_ALWAYS_INLINE static reference element_at(handle_t handle, difference_type idx);
 
     NEOJSON_NOINLINE static const typename BasicJsonType::object_t::key_type& key_at_slow(
         handle_t handle, difference_type idx) {
@@ -7158,6 +6938,239 @@ static_assert(std::is_nothrow_move_constructible<std::pair<std::string, json>>::
               "ordered_map value_type must be nothrow move-constructible");
 
 namespace detail {
+
+inline json* ArenaArray::elems() noexcept {
+    return std::launder(
+        reinterpret_cast<json*>(reinterpret_cast<unsigned char*>(this) + sizeof(ArenaArray)));
+}
+
+inline const json* ArenaArray::elems() const noexcept {
+    return std::launder(reinterpret_cast<const json*>(
+        reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaArray)));
+}
+
+inline json* ArenaObject::vals() noexcept {
+    return std::launder(reinterpret_cast<json*>(
+        reinterpret_cast<unsigned char*>(this) + sizeof(ArenaObject)));
+}
+
+inline const json* ArenaObject::vals() const noexcept {
+    return std::launder(reinterpret_cast<const json*>(
+        reinterpret_cast<const unsigned char*>(this) + sizeof(ArenaObject)));
+}
+
+template <typename BasicJsonType>
+NEOJSON_NOINLINE inline typename iter_impl<BasicJsonType>::reference
+iter_impl<BasicJsonType>::element_at_slow(handle_t handle, difference_type idx) {
+    const std::uintptr_t raw = to_raw(handle);
+    if constexpr (kIsConst) {
+        const std::uintptr_t tag = raw & std::uintptr_t{3u};
+        if (tag == std::uintptr_t{1u} || tag == std::uintptr_t{2u}) {
+            throw_invalid_iterator(214, "cannot get value");
+        }
+    }
+    if (raw == std::uintptr_t{0u}) {
+        throw_invalid_iterator(214, "cannot get value");
+    }
+    pointer object = reinterpret_cast<pointer>(raw);
+    switch (object->m_type) {
+        case value_t::object: {
+            if (object->m_storage == 2u) {
+                const auto* cso = object->m_value.small_obj;
+                const std::size_t sz = BasicJsonType::small_obj_size(cso);
+                if (idx < 0 || static_cast<std::size_t>(idx) >= sz) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                if constexpr (kIsConst) {
+                    return BasicJsonType::small_obj_val(cso, static_cast<std::size_t>(idx));
+                } else {
+                    if (BasicJsonType::small_obj_has_const_cache(cso)) {
+                        auto* obj = object->promote_small_object_mutable();
+                        return (*obj)[static_cast<std::size_t>(idx)].second;
+                    }
+                    return BasicJsonType::small_obj_val(object->m_value.small_obj,
+                                                        static_cast<std::size_t>(idx));
+                }
+            }
+            if constexpr (kIsConst) {
+                if (object->m_storage == 4u) {
+                    const auto* ao = object->m_value.arena_obj;
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    return ao->vals()[static_cast<std::size_t>(idx)];
+                }
+                if (object->m_storage == 1u) {
+                    void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
+                    if (av == nullptr) {
+                        if (void* mat = object->m_value.lazy->materialized.load(
+                                std::memory_order_acquire)) {
+                            const auto* obj =
+                                static_cast<const typename BasicJsonType::object_t*>(mat);
+                            if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                                throw_invalid_iterator(214, "cannot get value");
+                            }
+                            return (*obj)[static_cast<std::size_t>(idx)].second;
+                        }
+                        av = const_cast<void*>(
+                            detail::lazy_materialize_arena(object->m_value.lazy, value_t::object));
+                    }
+                    const auto* ao = static_cast<const detail::ArenaObject*>(av);
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= ao->count) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    return ao->vals()[static_cast<std::size_t>(idx)];
+                }
+                if (object->m_storage != 0u) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                const auto* obj = object->m_value.object;
+                if (idx < 0 || static_cast<std::size_t>(idx) >= obj->size()) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                return (*obj)[static_cast<std::size_t>(idx)].second;
+            } else {
+                if (object->m_storage == 3u) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                auto* obj = object->mutable_object();
+                if (static_cast<std::size_t>(idx) >= obj->size()) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                return (*obj)[static_cast<std::size_t>(idx)].second;
+            }
+        }
+        case value_t::array: {
+            if (object->m_storage == 2u) {
+                const auto* csa = object->m_value.small_arr;
+                const std::size_t sz = BasicJsonType::small_arr_size(csa);
+                if (static_cast<std::size_t>(idx) >= sz) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                if constexpr (kIsConst) {
+                    return BasicJsonType::small_arr_elem(csa, static_cast<std::size_t>(idx));
+                } else {
+                    if (BasicJsonType::small_arr_has_const_cache(csa)) {
+                        auto* arr = object->promote_small_array_mutable();
+                        return (*arr)[static_cast<std::size_t>(idx)];
+                    }
+                    return BasicJsonType::small_arr_elem(object->m_value.small_arr,
+                                                         static_cast<std::size_t>(idx));
+                }
+            }
+            if constexpr (kIsConst) {
+                if (object->m_storage == 4u) {
+                    const auto* aa = object->m_value.arena_arr;
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= aa->count) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    return aa->elems()[static_cast<std::size_t>(idx)];
+                }
+                if (object->m_storage == 1u) {
+                    void* av = object->m_value.lazy->arena_view.load(std::memory_order_acquire);
+                    if (av == nullptr) {
+                        if (void* mat = object->m_value.lazy->materialized.load(
+                                std::memory_order_acquire)) {
+                            const auto* arr =
+                                static_cast<const typename BasicJsonType::array_t*>(mat);
+                            if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                                throw_invalid_iterator(214, "cannot get value");
+                            }
+                            return (*arr)[static_cast<std::size_t>(idx)];
+                        }
+                        av = const_cast<void*>(
+                            detail::lazy_materialize_arena(object->m_value.lazy, value_t::array));
+                    }
+                    const auto* aa = static_cast<const detail::ArenaArray*>(av);
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= aa->count) {
+                        throw_invalid_iterator(214, "cannot get value");
+                    }
+                    return aa->elems()[static_cast<std::size_t>(idx)];
+                }
+                if (object->m_storage != 0u) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                const auto* arr = object->m_value.array;
+                if (idx < 0 || static_cast<std::size_t>(idx) >= arr->size()) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                return (*arr)[static_cast<std::size_t>(idx)];
+            } else {
+                if (object->m_storage == 3u) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                auto* arr = object->mutable_array();
+                if (static_cast<std::size_t>(idx) >= arr->size()) {
+                    throw_invalid_iterator(214, "cannot get value");
+                }
+                return (*arr)[static_cast<std::size_t>(idx)];
+            }
+        }
+        case value_t::null:
+            throw_invalid_iterator(214, "cannot get value");
+        default:
+            if (idx == 0) {
+                return *object;
+            }
+            throw_invalid_iterator(214, "cannot get value");
+    }
+}
+
+template <typename BasicJsonType>
+NEOJSON_ALWAYS_INLINE typename iter_impl<BasicJsonType>::reference
+iter_impl<BasicJsonType>::element_at(handle_t handle, difference_type idx) {
+    if constexpr (kIsConst) {
+        const auto u_idx = static_cast<std::size_t>(idx);
+        const std::uintptr_t tag = handle & std::uintptr_t{3u};
+        if (tag == std::uintptr_t{1u}) {
+            const auto* ao = reinterpret_cast<const detail::ArenaObject*>(
+                handle - std::uintptr_t{1u});
+            if (NEOJSON_LIKELY(u_idx < ao->count)) {
+                return ao->vals()[u_idx];
+            }
+        } else if (tag == std::uintptr_t{2u}) {
+            const auto* aa = reinterpret_cast<const detail::ArenaArray*>(
+                handle - std::uintptr_t{2u});
+            if (NEOJSON_LIKELY(u_idx < aa->count)) {
+                return aa->elems()[u_idx];
+            }
+        }
+        return element_at_slow(handle, idx);
+    } else {
+        pointer object = handle;
+        if (object != nullptr && idx >= 0) {
+            const auto u_idx = static_cast<std::size_t>(idx);
+            if (object->m_type == value_t::object) {
+                if (object->m_storage == 0u) {
+                    auto* obj = object->m_value.object;
+                    if (u_idx < obj->size()) {
+                        return (*obj)[u_idx].second;
+                    }
+                } else if (object->m_storage == 2u) {
+                    auto* so = object->m_value.small_obj;
+                    if (u_idx < BasicJsonType::small_obj_size(so) &&
+                        !BasicJsonType::small_obj_has_const_cache(so)) {
+                        return BasicJsonType::small_obj_val(so, u_idx);
+                    }
+                }
+            } else if (object->m_type == value_t::array) {
+                if (object->m_storage == 0u) {
+                    auto* arr = object->m_value.array;
+                    if (u_idx < arr->size()) {
+                        return (*arr)[u_idx];
+                    }
+                } else if (object->m_storage == 2u) {
+                    auto* sa = object->m_value.small_arr;
+                    if (u_idx < BasicJsonType::small_arr_size(sa) &&
+                        !BasicJsonType::small_arr_has_const_cache(sa)) {
+                        return BasicJsonType::small_arr_elem(sa, u_idx);
+                    }
+                }
+            }
+        }
+        return element_at_slow(handle, idx);
+    }
+}
 
 struct SmallArray2 {
     static constexpr std::size_t kInlineCap = 2u;

@@ -1739,13 +1739,13 @@ inline std::size_t find_non_verbatim_ascii_sse2(const char* p, std::size_t pos,
 
 inline std::size_t find_non_verbatim_utf8(const char* p, std::size_t pos,
                                           const std::size_t len) noexcept {
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
     const std::size_t rem = len - pos;
 #if NEOJSON_X86_SIMD
     if (rem >= 32u && has_avx2()) {
         return find_non_verbatim_utf8_avx2(p, pos, len);
     }
 #endif
-#if defined(__SSE2__) || NEOJSON_X86_SIMD
     if (rem >= 16u) {
         return find_non_verbatim_utf8_sse2(p, pos, len);
     }
@@ -1755,13 +1755,13 @@ inline std::size_t find_non_verbatim_utf8(const char* p, std::size_t pos,
 
 inline std::size_t find_non_verbatim_valid_utf8(const char* p, std::size_t pos,
                                                 const std::size_t len) noexcept {
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
     const std::size_t rem = len - pos;
 #if NEOJSON_X86_SIMD
     if (rem >= 32u && has_avx2()) {
         return find_non_verbatim_valid_utf8_avx2(p, pos, len);
     }
 #endif
-#if defined(__SSE2__) || NEOJSON_X86_SIMD
     if (rem >= 16u) {
         return find_non_verbatim_valid_utf8_sse2(p, pos, len);
     }
@@ -1771,13 +1771,13 @@ inline std::size_t find_non_verbatim_valid_utf8(const char* p, std::size_t pos,
 
 inline std::size_t find_non_verbatim_ascii(const char* p, std::size_t pos,
                                            const std::size_t len) noexcept {
+#if defined(__SSE2__) || NEOJSON_X86_SIMD
     const std::size_t rem = len - pos;
 #if NEOJSON_X86_SIMD
     if (rem >= 32u && has_avx2()) {
         return find_non_verbatim_ascii_avx2(p, pos, len);
     }
 #endif
-#if defined(__SSE2__) || NEOJSON_X86_SIMD
     if (rem >= 16u) {
         return find_non_verbatim_ascii_sse2(p, pos, len);
     }

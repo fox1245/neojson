@@ -3538,12 +3538,17 @@ TEST(LazyCow, ArenaReadOptimizationsAndEdgeCases) {
         const oj o_esc = oj::parse(esc_all);
         EXPECT_EQ(j_esc.dump(), o_esc.dump());
         EXPECT_EQ(j_esc.at("uni").get<std::string>(), o_esc.at("uni").get<std::string>());
-        EXPECT_THROW((void)jk::parse(R"({"v":"\a"})"), jk::parse_error);
-        EXPECT_THROW((void)jk::parse(R"({"v":"\x"})"), jk::parse_error);
-        EXPECT_THROW((void)jk::parse(R"({"v":"\0"})"), jk::parse_error);
-        EXPECT_THROW((void)jk::parse(std::string("{\"v\":\"\\")), jk::parse_error);
-        EXPECT_THROW((void)jk::parse(std::string("{\"v\":\"") + std::string(34u, 'a') + "\\"),
-                     jk::parse_error);
+        const std::string bad_esc_a = "{\"v\":\"\\a\"}";
+        const std::string bad_esc_x = "{\"v\":\"\\x\"}";
+        const std::string bad_esc_0 = "{\"v\":\"\\0\"}";
+        const std::string bad_esc_eof_short = "{\"v\":\"\\";
+        const std::string bad_esc_eof_long =
+            std::string("{\"v\":\"") + std::string(34u, 'a') + "\\";
+        EXPECT_THROW((void)jk::parse(bad_esc_a), jk::parse_error);
+        EXPECT_THROW((void)jk::parse(bad_esc_x), jk::parse_error);
+        EXPECT_THROW((void)jk::parse(bad_esc_0), jk::parse_error);
+        EXPECT_THROW((void)jk::parse(bad_esc_eof_short), jk::parse_error);
+        EXPECT_THROW((void)jk::parse(bad_esc_eof_long), jk::parse_error);
     }
 
     // 13. TLS teardown order & cross-thread DocArena::destroy_all() without ThreadStrPool init.
