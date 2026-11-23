@@ -49,6 +49,15 @@
 #define NEOJSON_HEADER_SSE2 0
 #endif
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && \
+    (defined(__GNUC__) || defined(__clang__)) && \
+    (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#include <arm_neon.h>
+#define NEOJSON_HEADER_NEON 1
+#else
+#define NEOJSON_HEADER_NEON 0
+#endif
+
 #ifndef NEOJSON_NOINLINE
 #if defined(__GNUC__) || defined(__clang__)
 #define NEOJSON_NOINLINE __attribute__((noinline))
@@ -635,7 +644,7 @@ NEOJSON_ALWAYS_INLINE std::uint64_t fmix64(std::uint64_t k) noexcept {
 }
 
 NEOJSON_ALWAYS_INLINE std::uint64_t hash_bytes(const char* data, const std::size_t len) noexcept {
-    std::uint64_t seed = g_hash_seed.load(std::memory_order_acquire);
+    std::uint64_t seed = g_hash_seed.load(std::memory_order_relaxed);
     if (seed == 0u) {
         seed = hash_seed_slow();
     }
@@ -923,7 +932,9 @@ struct ordered_map : std::vector<std::pair<Key, T>, Allocator> {
         : Container(alloc) {}
 
     ~ordered_map() noexcept {
-        destroy_index(m_index.load(std::memory_order_acquire));
+        if (m_index.load(std::memory_order_relaxed) != nullptr) {
+            destroy_index(m_index.load(std::memory_order_acquire));
+        }
     }
 
     ordered_map(const ordered_map& other)
@@ -1397,14 +1408,14 @@ private:
 
     using IndexPtr = std::unique_ptr<HashIndex, HashIndexDeleter>;
 
-    static IndexPtr make_index(const std::size_t c) {
+    NEOJSON_NOINLINE static IndexPtr make_index(const std::size_t c) {
+        static_assert(std::is_trivially_copyable<Slot>::value,
+                      "Slot must be trivially copyable for zero-init via memset");
         auto* h = ::new (detail::pool_alloc(sizeof(HashIndex))) HashIndex{0, nullptr};
         IndexPtr ptr(h);
         const std::size_t bytes = c * sizeof(Slot);
         auto* s = static_cast<Slot*>(detail::pool_alloc(bytes));
-        for (std::size_t i = 0; i < c; ++i) {
-            ::new (s + i) Slot{0u, 0u};
-        }
+        std::memset(s, 0, bytes);
         h->cap = c;
         h->slots = s;
         return ptr;
@@ -1582,17 +1593,48 @@ private:
 
     NEOJSON_NOINLINE T& emplace_default_key_indexed(const std::string_view sv) {
         std::uint64_t h = 0;
-        const std::size_t found = find_pos_with_hash(sv, h);
-        if (found != kNpos) {
-            return (*this)[found].second;
-        }
-        const std::size_t next_n = this->size() + 1u;
+        std::size_t empty_pos = 0;
+        bool has_direct_slot = false;
         HashIndex* idx = m_index.load(std::memory_order_relaxed);
-        if (idx == nullptr || next_n * 2u > idx->cap || next_n > kMaxIndexedSize) {
-            const bool had_index = (idx != nullptr);
+        const std::size_t next_n = this->size() + 1u;
+        if (NEOJSON_LIKELY(idx != nullptr)) {
+            h = detail::hash_bytes(sv.data(), sv.size());
+            const std::uint32_t h32 = static_cast<std::uint32_t>(h >> 32u);
+            const std::size_t mask = idx->cap - 1u;
+            std::size_t pos = static_cast<std::size_t>(h) & mask;
+            const Slot* slots = idx->slots;
+            const value_type* elems = this->data();
+            for (;;) {
+                const Slot s = slots[pos];
+                if (s.idx_plus_one == 0u) {
+                    break;
+                }
+                if (s.hash32 == h32) {
+                    const std::size_t elem_idx = static_cast<std::size_t>(s.idx_plus_one - 1u);
+                    if (key_equals(elems[elem_idx].first, sv)) {
+                        return (*this)[elem_idx].second;
+                    }
+                }
+                pos = (pos + 1u) & mask;
+            }
+            if (NEOJSON_LIKELY(next_n * 2u <= idx->cap && next_n <= kMaxIndexedSize)) {
+                empty_pos = pos;
+                has_direct_slot = true;
+            } else {
+                ensure_index_for_next();
+                idx = m_index.load(std::memory_order_relaxed);
+            }
+        } else {
+            const value_type* elems = this->data();
+            const std::size_t n = this->size();
+            for (std::size_t i = 0; i < n; ++i) {
+                if (key_equals(elems[i].first, sv)) {
+                    return (*this)[i].second;
+                }
+            }
             ensure_index_for_next();
             idx = m_index.load(std::memory_order_relaxed);
-            if (idx != nullptr && !had_index) {
+            if (idx != nullptr) {
                 h = detail::hash_bytes(sv.data(), sv.size());
             }
         }
@@ -1615,7 +1657,10 @@ private:
                 std::forward_as_tuple(sv.data(), sv.size()),
                 std::forward_as_tuple());
         }
-        if (idx != nullptr) {
+        if (has_direct_slot) {
+            idx->slots[empty_pos] = {
+                static_cast<std::uint32_t>(this->size()), static_cast<std::uint32_t>(h >> 32u)};
+        } else if (idx != nullptr) {
             insert_index_entry(idx, this->size() - 1u, h);
         }
         return this->back().second;
@@ -4256,12 +4301,20 @@ private:
     static const string_t& small_obj_key(const detail::SmallObject4* so, std::size_t idx);
     static json& small_obj_val(detail::SmallObject4* so, std::size_t idx) noexcept;
     static const json& small_obj_val(const detail::SmallObject4* so, std::size_t idx) noexcept;
+    template <bool InlineGt8 = false>
     NEOJSON_ALWAYS_INLINE static std::size_t small_obj_find_with_tag(
         const detail::SmallObject4* so, std::string_view key, std::uint8_t tag) noexcept;
     NEOJSON_NOINLINE inline static std::size_t small_obj_verify_mask_bits(
         const detail::SmallObject4* so, std::string_view key, std::uint64_t mask) noexcept;
     NEOJSON_NOINLINE inline static std::size_t small_obj_verify_swar_u64(
         const detail::SmallObject4* so, std::string_view key, std::uint64_t mask) noexcept;
+#if NEOJSON_HEADER_NEON
+    NEOJSON_NOINLINE inline static std::size_t small_obj_verify_neon_mask4(
+        const detail::SmallObject4* so, std::string_view key, std::size_t base,
+        std::uint64_t mask4) noexcept;
+#endif
+    NEOJSON_ALWAYS_INLINE static std::size_t small_obj_find_gt8_inline(
+        const detail::SmallObject4* so, std::string_view key, std::uint8_t tag) noexcept;
     NEOJSON_NOINLINE inline static std::size_t small_obj_find_gt8(
         const detail::SmallObject4* so, std::string_view key, std::uint8_t tag) noexcept;
     static std::size_t small_obj_find(const detail::SmallObject4* so,
@@ -7239,6 +7292,11 @@ struct SmallArray2 {
     std::uint8_t pad[5]{};
     mutable std::atomic<void*> materialized_vec{nullptr};
 
+    SmallArray2() noexcept = default;
+    NEOJSON_ALWAYS_INLINE SmallArray2(const std::uint8_t n, const std::uint8_t c,
+                                      const std::uint8_t cls) noexcept
+        : count(n), cap(c), slab_cls(cls) {}
+
     static constexpr std::size_t alloc_bytes_for(const std::size_t c) noexcept {
         return 16u + c * sizeof(json);
     }
@@ -7322,6 +7380,12 @@ struct SmallObject4 {
     std::uint16_t key_used = 0u;
     std::uint16_t key_cap = 0u;
     mutable std::atomic<SmallObjAux*> aux{nullptr};
+
+    SmallObject4() noexcept = default;
+    NEOJSON_ALWAYS_INLINE SmallObject4(const std::uint8_t n, const std::uint8_t c,
+                                       const std::uint8_t cls, const std::uint8_t doff,
+                                       const std::uint16_t ku, const std::uint16_t kcap) noexcept
+        : count(n), cap(c), slab_cls(cls), desc_off(doff), key_used(ku), key_cap(kcap) {}
 
     static constexpr std::size_t tags_bytes_for(const std::size_t c) noexcept {
         return c < 8u ? 8u : c;
@@ -7504,18 +7568,14 @@ static_assert(SmallObject4::vals_off_for(2u) % 8u == 0u &&
 NEOJSON_ALWAYS_INLINE detail::SmallArray2* json::create_small_array_empty(const std::size_t cap) {
     const std::uint8_t cls = detail::SmallArray2::slab_cls_for_cap(cap);
     void* mem = detail::tcache_alloc_class(cls);
-    auto* sa = ::new (mem) detail::SmallArray2();
-    sa->cap = static_cast<std::uint8_t>(cap);
-    sa->slab_cls = cls;
-    return sa;
+    return ::new (mem) detail::SmallArray2(0u, static_cast<std::uint8_t>(cap), cls);
 }
 
 NEOJSON_ALWAYS_INLINE detail::SmallArray2* json::create_small_array1(json&& v) {
     constexpr std::size_t kBytes = detail::SmallArray2::alloc_bytes_for(2u);
     void* mem = detail::tcache_alloc_fixed<kBytes>();
-    auto* sa = ::new (mem) detail::SmallArray2();
-    sa->cap = 2u;
-    sa->slab_cls = detail::SmallArray2::slab_cls_for_cap(2u);
+    auto* sa = ::new (mem)
+        detail::SmallArray2(0u, 2u, detail::SmallArray2::slab_cls_for_cap(2u));
     ::new (sa->slot_ptr(0u)) json(std::move(v));
     sa->count = 1u;
     return sa;
@@ -7781,7 +7841,7 @@ void json::destroy_small_array(detail::SmallArray2*& sa) noexcept {
     }
     sa = nullptr;
     if (detail::t_destroy_depth < detail::kMaxRecursiveDestroyDepth &&
-        p->materialized_vec.load(std::memory_order_acquire) == nullptr) {
+        p->materialized_vec.load(std::memory_order_relaxed) == nullptr) {
         const std::size_t n = p->count;
         const std::uint8_t cls = p->slab_cls;
         if (n <= 2u) {
@@ -7885,12 +7945,11 @@ NEOJSON_ALWAYS_INLINE detail::SmallObject4* json::create_small_object1_default_i
     constexpr std::size_t kAllocBytes = detail::SmallObject4::slab_bytes_for(kCap);
     constexpr std::uint8_t kCls = detail::SmallObject4::slab_cls_for_cap(kCap);
     void* mem = detail::tcache_alloc_fixed<kAllocBytes>();
-    auto* so = ::new (mem) detail::SmallObject4();
-    so->cap = static_cast<std::uint8_t>(kCap);
-    so->slab_cls = kCls;
-    so->desc_off = static_cast<std::uint8_t>(detail::SmallObject4::desc_off_for(kCap));
-    so->key_used = static_cast<std::uint16_t>(key.size());
-    so->key_cap = static_cast<std::uint16_t>(detail::SmallObject4::key_cap_for(kCap));
+    auto* so = ::new (mem) detail::SmallObject4(
+        0u, static_cast<std::uint8_t>(kCap), kCls,
+        static_cast<std::uint8_t>(detail::SmallObject4::desc_off_for(kCap)),
+        static_cast<std::uint16_t>(key.size()),
+        static_cast<std::uint16_t>(detail::SmallObject4::key_cap_for(kCap)));
     const std::uint8_t tag = detail::small_obj_key_tag(key);
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     std::memset(so->tags_ptr(), 0, 8u);
@@ -8129,8 +8188,33 @@ std::size_t json::small_obj_verify_swar_u64(const detail::SmallObject4* so,
     return n;
 }
 
-std::size_t json::small_obj_find_gt8(const detail::SmallObject4* so, const std::string_view key,
-                                     const std::uint8_t tag) noexcept {
+#if NEOJSON_HEADER_NEON
+std::size_t json::small_obj_verify_neon_mask4(const detail::SmallObject4* so,
+                                              const std::string_view key, const std::size_t base,
+                                              std::uint64_t mask4) noexcept {
+    const std::size_t n = so->count;
+    const std::uint32_t* const descs = so->descs_ptr();
+    const char* const kbuf = so->kbuf_ptr();
+    while (mask4 != 0u) {
+        const std::size_t lane = static_cast<std::size_t>(detail::ctz64(mask4) >> 2u);
+        mask4 &= ~(std::uint64_t{0xFu} << (lane << 2u));
+        const std::size_t idx = base + lane;
+        if (idx >= n) {
+            return n;
+        }
+        const std::uint32_t d = descs[idx];
+        const std::size_t kl = static_cast<std::size_t>(d & 0xFFFFu);
+        if (kl == key.size() && detail::fast_memeq(kbuf + (d >> 16u), key.data(), kl)) {
+            return idx;
+        }
+    }
+    return n;
+}
+#endif
+
+std::size_t json::small_obj_find_gt8_inline(const detail::SmallObject4* so,
+                                            const std::string_view key,
+                                            const std::uint8_t tag) noexcept {
     const std::size_t n = so->count;
     const std::uint8_t* tags = so->tags_ptr();
 #if NEOJSON_HEADER_SSE2
@@ -8162,6 +8246,68 @@ std::size_t json::small_obj_find_gt8(const detail::SmallObject4* so, const std::
         return n;
     }
     return small_obj_verify_mask_bits(so, key, m);
+#elif NEOJSON_HEADER_NEON
+    static_assert(detail::SmallObject4::kMaxCap <= 64u,
+                  "NEON 4x16B tag scan requires kMaxCap <= 64");
+    const uint8x16_t needle16 = vdupq_n_u8(tag);
+    const uint8x16_t eq0 = vceqq_u8(vld1q_u8(tags), needle16);
+    if (n <= 16u) {
+        if (NEOJSON_LIKELY(vmaxvq_u32(vreinterpretq_u32_u8(eq0)) == 0u)) {
+            return n;
+        }
+        const std::uint64_t m0 = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4)), 0);
+        return small_obj_verify_neon_mask4(so, key, 0u, m0);
+    }
+    const uint8x16_t eq1 = vceqq_u8(vld1q_u8(tags + 16u), needle16);
+    uint8x16_t any_eq = vorrq_u8(eq0, eq1);
+    uint8x16_t eq2{};
+    uint8x16_t eq3{};
+    if (n > 32u) {
+        eq2 = vceqq_u8(vld1q_u8(tags + 32u), needle16);
+        any_eq = vorrq_u8(any_eq, eq2);
+        if (n > 48u) {
+            eq3 = vceqq_u8(vld1q_u8(tags + 48u), needle16);
+            any_eq = vorrq_u8(any_eq, eq3);
+        }
+    }
+    if (NEOJSON_LIKELY(vmaxvq_u32(vreinterpretq_u32_u8(any_eq)) == 0u)) {
+        return n;
+    }
+    const std::uint64_t m0 = vget_lane_u64(
+        vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4)), 0);
+    if (m0 != 0u) {
+        const std::size_t idx = small_obj_verify_neon_mask4(so, key, 0u, m0);
+        if (idx < n) {
+            return idx;
+        }
+    }
+    const std::uint64_t m1 = vget_lane_u64(
+        vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq1), 4)), 0);
+    if (m1 != 0u) {
+        const std::size_t idx = small_obj_verify_neon_mask4(so, key, 16u, m1);
+        if (idx < n) {
+            return idx;
+        }
+    }
+    if (n > 32u) {
+        const std::uint64_t m2 = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq2), 4)), 0);
+        if (m2 != 0u) {
+            const std::size_t idx = small_obj_verify_neon_mask4(so, key, 32u, m2);
+            if (idx < n) {
+                return idx;
+            }
+        }
+        if (n > 48u) {
+            const std::uint64_t m3 = vget_lane_u64(
+                vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq3), 4)), 0);
+            if (m3 != 0u) {
+                return small_obj_verify_neon_mask4(so, key, 48u, m3);
+            }
+        }
+    }
+    return n;
 #else
     const std::uint64_t needle = static_cast<std::uint64_t>(tag) * 0x0101010101010101ULL;
     const std::uint32_t* descs = nullptr;
@@ -8194,6 +8340,12 @@ std::size_t json::small_obj_find_gt8(const detail::SmallObject4* so, const std::
 #endif
 }
 
+std::size_t json::small_obj_find_gt8(const detail::SmallObject4* so, const std::string_view key,
+                                     const std::uint8_t tag) noexcept {
+    return small_obj_find_gt8_inline(so, key, tag);
+}
+
+template <bool InlineGt8>
 NEOJSON_ALWAYS_INLINE std::size_t json::small_obj_find_with_tag(
     const detail::SmallObject4* so, const std::string_view key, const std::uint8_t tag) noexcept {
     if (so == nullptr) {
@@ -8229,7 +8381,11 @@ NEOJSON_ALWAYS_INLINE std::size_t json::small_obj_find_with_tag(
         }
         return n;
     }
-    return small_obj_find_gt8(so, key, tag);
+    if constexpr (InlineGt8) {
+        return small_obj_find_gt8_inline(so, key, tag);
+    } else {
+        return small_obj_find_gt8(so, key, tag);
+    }
 #endif
 }
 
@@ -8408,7 +8564,7 @@ void json::destroy_small_object(detail::SmallObject4*& so) noexcept {
     }
     so = nullptr;
     if (detail::t_destroy_depth < detail::kMaxRecursiveDestroyDepth &&
-        p->aux.load(std::memory_order_acquire) == nullptr) {
+        p->aux.load(std::memory_order_relaxed) == nullptr) {
         const std::size_t n = p->count;
         const std::uint8_t cls = p->slab_cls;
         json* vals = p->vals_ptr();
@@ -8468,7 +8624,7 @@ inline void json::destroy_array(array_t* a) noexcept {
                     if (e.m_type == value_t::array) {
                         detail::SmallArray2* sa = e.m_value.small_arr;
                         if (sa != nullptr && sa->count == 2u &&
-                            sa->materialized_vec.load(std::memory_order_acquire) == nullptr &&
+                            sa->materialized_vec.load(std::memory_order_relaxed) == nullptr &&
                             !has_heap_payload(sa->elem(0u).m_type) &&
                             !has_heap_payload(sa->elem(1u).m_type)) {
                             const std::uint8_t cls = sa->slab_cls;
@@ -8647,10 +8803,15 @@ json::object_t* json::promote_small_object_mutable(const std::size_t reserve_cap
 json::reference json::small_obj_index_fast(const std::string_view sv) {
     detail::SmallObject4* so = m_value.small_obj;
     const std::uint8_t tag = detail::small_obj_key_tag(sv);
-    const std::size_t idx = small_obj_find_with_tag(so, sv, tag);
+#if NEOJSON_HEADER_SSE2
+    const std::size_t idx = small_obj_find_with_tag<true>(so, sv, tag);
+#else
+    const std::size_t idx = small_obj_find_with_tag<false>(so, sv, tag);
+#endif
     const std::size_t n = so->count;
     if (idx < n) {
-        if (small_obj_has_const_cache(so)) {
+        if (NEOJSON_UNLIKELY(so->aux.load(std::memory_order_relaxed) != nullptr) &&
+            small_obj_has_const_cache(so)) {
             auto* obj = promote_small_object_mutable();
             return (*obj)[idx].second;
         }
@@ -9443,7 +9604,8 @@ void json::push_back(json&& val) {
         }
         if (m_storage == 2u) {
             detail::SmallArray2* sa = m_value.small_arr;
-            if (sa->count < sa->cap && !small_arr_has_const_cache(sa)) {
+            if (sa->count < sa->cap &&
+                sa->materialized_vec.load(std::memory_order_relaxed) == nullptr) {
                 ::new (sa->slot_ptr(sa->count)) json(std::move(val));
                 ++sa->count;
                 return;

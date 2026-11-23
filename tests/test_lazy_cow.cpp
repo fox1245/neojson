@@ -3592,4 +3592,169 @@ TEST(LazyCow, ArenaReadOptimizationsAndEdgeCases) {
     }
 }
 
+TEST(LazyCow, MutableDomBuildNeonAndHashIndexStress) {
+    // 1. Exact function-pointer signature check for static object() and array() factories.
+    using FactoryFn = jk (*)(jk::initializer_list_t);
+    FactoryFn make_obj = &jk::object;
+    FactoryFn make_arr = &jk::array;
+    jk empty_o = make_obj({});
+    jk empty_a = make_arr({});
+    EXPECT_TRUE(empty_o.is_object() && empty_o.empty());
+    EXPECT_TRUE(empty_a.is_array() && empty_a.empty());
+    jk non_empty_o = make_obj({{"k", 1}});
+    jk non_empty_a = make_arr({1, 2});
+    EXPECT_EQ(non_empty_o.dump(), "{\"k\":1}");
+    EXPECT_EQ(non_empty_a.dump(), "[1,2]");
+
+    // 2. SmallObject4 fast path, tag collisions, keys > 64B, duplicates, self-aliasing & >64 promotion.
+    {
+        for (const std::size_t target : {1u, 8u, 9u, 16u, 17u, 32u, 33u, 48u, 49u, 64u, 70u}) {
+            jk obj = jk::object();
+            oj ref = oj::object();
+            std::vector<std::string> keys;
+            keys.reserve(target);
+            for (std::size_t i = 0u; i < target; ++i) {
+                // Keep len=14 and bytes at [0], [7], [13] identical so byte [1] variations
+                // share the exact same small_obj_key_tag and stress multi-lane verification.
+                std::string k = "tagcollide_mid";
+                k[1] = static_cast<char>('A' + (i / 10u));
+                k[2] = static_cast<char>('0' + (i % 10u));
+                keys.push_back(k);
+                obj[keys.back()] = static_cast<std::int64_t>(i);
+                ref[keys.back()] = static_cast<std::int64_t>(i);
+            }
+            for (std::size_t i = 0u; i < target; i += 3u) {
+                obj[keys[i]] = static_cast<std::int64_t>(i * 100u + 7u);
+                ref[keys[i]] = static_cast<std::int64_t>(i * 100u + 7u);
+            }
+            EXPECT_EQ(obj.size(), target);
+            EXPECT_EQ(obj.dump(), ref.dump());
+            for (std::size_t i = 0u; i < target; ++i) {
+                EXPECT_EQ(std::as_const(obj).at(keys[i]).get<std::int64_t>(),
+                          ref.at(keys[i]).get<std::int64_t>());
+            }
+        }
+
+        // First-key insertion on empty object() with key > 64B and std::string lvalue overload.
+        const std::string long_key(96u, 'Z');
+        jk big_first = jk::object();
+        big_first[long_key] = "long_val";
+        EXPECT_EQ(big_first.size(), 1u);
+        EXPECT_EQ(big_first.at(long_key), "long_val");
+
+        // Self-aliasing across SmallObject4 growth (1 -> 2 -> 8 -> 32 -> 64).
+        jk alias_obj = jk::object();
+        oj alias_ref = oj::object();
+        const std::string seed_key = "seed";
+        alias_obj[seed_key] = "self_alias_anchor";
+        alias_ref[seed_key] = "self_alias_anchor";
+        for (int i = 0; i < 65; ++i) {
+            const std::string k = "k_" + std::to_string(i);
+            alias_obj[k] = i;
+            alias_ref[k] = i;
+            if (i == 1 || i == 7 || i == 31 || i == 63) {
+                const std::string marker = "mark_" + std::to_string(i);
+                alias_obj[marker] = alias_obj[seed_key].get_ref<const std::string&>();
+                alias_ref[marker] = alias_ref[seed_key].get_ref<const std::string&>();
+                alias_obj[alias_obj[marker].get_ref<const std::string&>()] = i;
+                alias_ref[alias_ref[marker].get_ref<const std::string&>()] = i;
+            }
+        }
+        EXPECT_EQ(alias_obj.dump(), alias_ref.dump());
+    }
+
+    // 3. Concurrent const-cache population -> join -> mutate (push_back lvalue/rvalue & operator[]) -> destroy.
+    {
+        for (const std::size_t arr_n : {1u, 2u, 11u, 31u}) {
+            jk arr = jk::array();
+            oj ref = oj::array();
+            for (std::size_t i = 0u; i + 1u < arr_n; ++i) {
+                const jk elem("item_" + std::to_string(i));
+                arr.push_back(elem);
+                ref.push_back("item_" + std::to_string(i));
+            }
+            const jk tail_lval = jk("tail");
+            arr.push_back(tail_lval);
+            ref.push_back("tail");
+
+            const jk& carr = arr;
+            std::vector<std::thread> readers;
+            for (int t = 0; t < 4; ++t) {
+                readers.emplace_back([&]() {
+                    for (int r = 0; r < 16; ++r) {
+                        const jk::array_t* vec = carr.get_ptr<const jk::array_t*>();
+                        ASSERT_NE(vec, nullptr);
+                        EXPECT_EQ(vec->size(), arr_n);
+                    }
+                });
+            }
+            for (auto& th : readers) {
+                th.join();
+            }
+            arr.push_back(tail_lval);
+            arr.push_back(jk("rval_tail"));
+            ref.push_back("tail");
+            ref.push_back("rval_tail");
+            EXPECT_EQ(arr.dump(), ref.dump());
+        }
+
+        jk obj = jk::object();
+        for (int i = 0; i < 12; ++i) {
+            obj["m" + std::to_string(i)] = i;
+        }
+        const jk& cobj = obj;
+        std::vector<std::thread> oreaders;
+        for (int t = 0; t < 4; ++t) {
+            oreaders.emplace_back([&]() {
+                for (int r = 0; r < 16; ++r) {
+                    const jk::object_t* mp = cobj.get_ptr<const jk::object_t*>();
+                    ASSERT_NE(mp, nullptr);
+                    EXPECT_EQ(mp->size(), 12u);
+                    for (auto it = cobj.cbegin(); it != cobj.cend(); ++it) {
+                        EXPECT_FALSE(it.key().empty());
+                    }
+                }
+            });
+        }
+        for (auto& th : oreaders) {
+            th.join();
+        }
+        const std::string upd_key = "m3";
+        obj[upd_key] = 999;
+        const std::string new_key = "m12";
+        obj[new_key] = 1200;
+        EXPECT_EQ(obj.at("m3"), 999);
+        EXPECT_EQ(obj.at("m12"), 1200);
+    }
+
+    // 4. ordered_map single-probe insertion across 16 -> 17 -> 64 -> 260 keys, erasures, duplicates & rehash.
+    {
+        jk large = jk::object();
+        oj ref = oj::object();
+        const std::string anchor_key = "rehash_anchor";
+        large[anchor_key] = "key_from_own_storage_rehash_test";
+        ref[anchor_key] = "key_from_own_storage_rehash_test";
+        for (int i = 0; i < 260; ++i) {
+            const std::string k = "ord_key_" + std::to_string(i);
+            large[k] = i;
+            ref[k] = i;
+            if ((i % 7) == 0) {
+                large[k] = i * 3 + 1;
+                ref[k] = i * 3 + 1;
+            }
+            if (i > 20 && (i % 11) == 0) {
+                const std::string ek = "ord_key_" + std::to_string(i - 5);
+                EXPECT_EQ(large.erase(ek), ref.erase(ek));
+            }
+            if (i == 16 || i == 32 || i == 64 || i == 128 || i == 255) {
+                large[large.at(anchor_key).get_ref<const std::string&>()] = i;
+                ref[ref.at(anchor_key).get_ref<const std::string&>()] = i;
+            }
+        }
+        EXPECT_EQ(large.size(), ref.size());
+        EXPECT_EQ(large.dump(), ref.dump());
+        neojson::test::assert_equivalent(ref, large);
+    }
+}
+
 } // namespace
