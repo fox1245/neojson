@@ -8,7 +8,7 @@ All benchmark binaries live under [`bench/`](../bench/), compile with identical 
 
 | Target Binary | Library & Version | DOM / Execution Model | Notes |
 |---|---|---|---|
-| `bench_neojson` | **`neojson`** (vendored `yyjson` v0.13.0) | Ordered mutable DOM (`C++17`/`C++20`) | Insertion-ordered keys, copy-on-write string/node storage, AVX2 structural scanner on x86-64 |
+| `bench_neojson` | **`neojson`** (vendored `yyjson` v0.13.0) | Ordered mutable DOM (`C++17`/`C++20`) | Insertion-ordered keys, copy-on-write string/node storage, native AVX2 (x86-64) & NEON (ARM64) SIMD parsers |
 | `bench_yyjson` | `yyjson` v0.13.0 | Immutable/mutable C DOM | Pure C API baseline (`yyjson_read`, `yyjson_write`, `yyjson_mut_doc`) |
 | `bench_simdjson` | `simdjson` v5.3.0 | Read-only tape DOM | Pre-padded `simdjson::padded_string` (padding copy excluded from timed loop), reused `dom::parser`; mutable build N/A |
 | `bench_cppyyjson` | `cpp-yyjson` v2.1.0 | Ordered DOM wrapper | Linked against the same vendored `yyjson` v0.13.0 static library |
@@ -46,11 +46,11 @@ Each cell reports `throughput (median time, ratio vs yyjson C)`. Ratios `< 1.00�
 
 | Workload | `neojson` | `yyjson` (C) | `simdjson` (DOM) | `cpp-yyjson` | `RapidJSON` | `nlohmann::json` | `nlohmann::ordered` |
 |---|---|---|---|---|---|---|---|
-| Parse (Aggregate, 4 files) | **2,180 MB/s (3.64ms, 0.65×)** | 1,425 MB/s (5.57ms, 1.00×) | 1,754 MB/s (4.53ms, 0.81×) | 1,391 MB/s (5.71ms, 1.02×) | 598 MB/s (13.3ms, 2.38×) | 97 MB/s (81.6ms, 14.65×) | 83 MB/s (95.3ms, 17.12×) |
-| Parse + Full Traversal Read (4 files) | 1,336 MB/s (5.94ms, 0.92×) | 1,224 MB/s (6.49ms, 1.00×) | **1,379 MB/s (5.75ms, 0.89×)** | 1,202 MB/s (6.60ms, 1.02×) | 564 MB/s (14.1ms, 2.17×) | 94 MB/s (84.1ms, 12.97×) | 82 MB/s (97.1ms, 14.97×) |
-| Serialize / Write Minified (4 files) | **2,553 MB/s (3.11ms, 0.68×)** | 1,745 MB/s (4.55ms, 1.00×) | 1,600 MB/s (4.96ms, 1.09×) | 1,807 MB/s (4.39ms, 0.97×) | 716 MB/s (11.1ms, 2.44×) | 311 MB/s (25.5ms, 5.61×) | 280 MB/s (28.4ms, 6.24×) |
-| Mutable DOM Build (4 files) | 2,530 MB/s (3.14ms, 1.63×) | 4,129 MB/s (1.92ms, 1.00×) | — *(read-only)* | 4,034 MB/s (1.97ms, 1.02×) | **5,177 MB/s (1.53ms, 0.80×)** | 353 MB/s (22.5ms, 11.71×) | 224 MB/s (35.4ms, 18.43×) |
-| Field Lookup (`twitter.json`) | **168.6 K/s (5.93 µs, 0.59×)** | 99.0 K/s (10.10 µs, 1.00×) | 74.5 K/s (13.43 µs, 1.33×) | 89.6 K/s (11.16 µs, 1.10×) | 105.2 K/s (9.50 µs, 0.94×) | 36.4 K/s (27.45 µs, 2.72×) | 119.2 K/s (8.39 µs, 0.83×) |
+| Parse (Aggregate, 4 files) | **2,557 MB/s (3.10ms, 0.54×)** | 1,393 MB/s (5.70ms, 1.00×) | 1,779 MB/s (4.46ms, 0.78×) | 1,382 MB/s (5.75ms, 1.01×) | 599 MB/s (13.3ms, 2.33×) | 96 MB/s (82.3ms, 14.44×) | 83 MB/s (95.7ms, 16.80×) |
+| Parse + Full Traversal Read (4 files) | **1,498 MB/s (5.30ms, 0.79×)** | 1,189 MB/s (6.67ms, 1.00×) | 1,404 MB/s (5.65ms, 0.85×) | 1,196 MB/s (6.64ms, 0.99×) | 564 MB/s (14.1ms, 2.11×) | 94 MB/s (84.4ms, 12.64×) | 81 MB/s (97.5ms, 14.61×) |
+| Serialize / Write Minified (4 files) | **2,574 MB/s (3.08ms, 0.70×)** | 1,810 MB/s (4.39ms, 1.00×) | 1,604 MB/s (4.95ms, 1.13×) | 1,755 MB/s (4.52ms, 1.03×) | 716 MB/s (11.1ms, 2.53×) | 277 MB/s (28.6ms, 6.52×) | 321 MB/s (24.7ms, 5.63×) |
+| Mutable DOM Build (4 files) | 2,442 MB/s (3.25ms, 1.62×) | 3,962 MB/s (2.00ms, 1.00×) | — *(read-only)* | 4,180 MB/s (1.90ms, 0.95×) | **5,215 MB/s (1.52ms, 0.76×)** | 360 MB/s (22.1ms, 11.02×) | 233 MB/s (34.1ms, 17.04×) |
+| Field Lookup (`twitter.json`) | **161.0 K/s (6.21 µs, 0.60×)** | 97.3 K/s (10.28 µs, 1.00×) | 76.2 K/s (13.12 µs, 1.28×) | 88.5 K/s (11.30 µs, 1.09×) | 105.4 K/s (9.49 µs, 0.92×) | 37.1 K/s (26.94 µs, 2.61×) | 123.6 K/s (8.09 µs, 0.78×) |
 
 ### Per-File Breakdown (x86-64 AVX2)
 
@@ -58,29 +58,29 @@ Each cell reports `throughput (median time, ratio vs yyjson C)`. Ratios `< 1.00�
 
 | Workload | File | Size | `neojson` | `yyjson` (C) | `simdjson` (DOM) | `cpp-yyjson` | `RapidJSON` | `nlohmann::json` | `nlohmann::ordered` |
 |---|---|---|---|---|---|---|---|---|---|
-| `parse` | `canada.json` | 2.25 MB | **939 MB/s (2,398 µs, 0.87×)** | 816 MB/s (2,758 µs, 1.00×) | 813 MB/s (2,769 µs, 1.00×) | 790 MB/s (2,850 µs, 1.03×) | 472 MB/s (4,773 µs, 1.73×) | 54 MB/s (41,629 µs, 15.09×) | 54 MB/s (41,708 µs, 15.12×) |
-| `parse` | `citm_catalog.json` | 1.73 MB | **4,143 MB/s (417 µs, 0.42×)** | 1,748 MB/s (988 µs, 1.00×) | 2,815 MB/s (614 µs, 0.62×) | 1,673 MB/s (1,032 µs, 1.04×) | 1,226 MB/s (1,409 µs, 1.43×) | 160 MB/s (10,765 µs, 10.89×) | 100 MB/s (17,205 µs, 17.41×) |
-| `parse` | `gsoc-2018.json` | 3.33 MB | **5,297 MB/s (628 µs, 0.42×)** | 2,207 MB/s (1,508 µs, 1.00×) | 3,694 MB/s (901 µs, 0.60×) | 2,226 MB/s (1,495 µs, 0.99×) | 555 MB/s (5,993 µs, 3.97×) | 143 MB/s (23,326 µs, 15.47×) | 117 MB/s (28,524 µs, 18.91×) |
-| `parse` | `twitter.json` | 632 KB | **3,188 MB/s (198 µs, 0.63×)** | 2,008 MB/s (314 µs, 1.00×) | 2,601 MB/s (243 µs, 0.77×) | 1,915 MB/s (330 µs, 1.05×) | 578 MB/s (1,092 µs, 3.47×) | 108 MB/s (5,847 µs, 18.60×) | 80 MB/s (7,908 µs, 25.15×) |
-| `read` | `canada.json` | 2.25 MB | 633 MB/s (3,555 µs, 1.04×) | **657 MB/s (3,427 µs, 1.00×)** | 632 MB/s (3,563 µs, 1.04×) | 650 MB/s (3,463 µs, 1.01×) | 425 MB/s (5,299 µs, 1.55×) | 52 MB/s (43,247 µs, 12.62×) | 52 MB/s (42,922 µs, 12.52×) |
-| `read` | `citm_catalog.json` | 1.73 MB | **2,229 MB/s (775 µs, 0.69×)** | 1,534 MB/s (1,126 µs, 1.00×) | 2,056 MB/s (840 µs, 0.75×) | 1,465 MB/s (1,179 µs, 1.05×) | 1,114 MB/s (1,550 µs, 1.38×) | 155 MB/s (11,155 µs, 9.90×) | 99 MB/s (17,474 µs, 15.51×) |
-| `read` | `gsoc-2018.json` | 3.33 MB | 2,764 MB/s (1,204 µs, 0.77×) | 2,120 MB/s (1,570 µs, 1.00×) | **3,262 MB/s (1,020 µs, 0.65×)** | 2,125 MB/s (1,566 µs, 1.00×) | 547 MB/s (6,081 µs, 3.87×) | 141 MB/s (23,553 µs, 15.00×) | 116 MB/s (28,706 µs, 18.28×) |
-| `read` | `twitter.json` | 632 KB | 1,553 MB/s (407 µs, 1.12×) | 1,739 MB/s (363 µs, 1.00×) | **1,906 MB/s (331 µs, 0.91×)** | 1,604 MB/s (394 µs, 1.08×) | 548 MB/s (1,153 µs, 3.18×) | 103 MB/s (6,149 µs, 16.93×) | 79 MB/s (8,004 µs, 22.04×) |
-| `write` | `canada.json` | 2.25 MB | **1,065 MB/s (2,113 µs, 0.77×)** | 819 MB/s (2,749 µs, 1.00×) | 734 MB/s (3,065 µs, 1.12×) | 838 MB/s (2,688 µs, 0.98×) | 273 MB/s (8,247 µs, 3.00×) | 229 MB/s (9,831 µs, 3.58×) | 225 MB/s (10,026 µs, 3.65×) |
-| `write` | `citm_catalog.json` | 1.73 MB | **6,543 MB/s (264 µs, 0.83×)** | 5,427 MB/s (318 µs, 1.00×) | 3,462 MB/s (499 µs, 1.57×) | 6,067 MB/s (285 µs, 0.89×) | 2,467 MB/s (700 µs, 2.20×) | 1,101 MB/s (1,569 µs, 4.93×) | 985 MB/s (1,754 µs, 5.51×) |
-| `write` | `gsoc-2018.json` | 3.33 MB | **5,416 MB/s (614 µs, 0.48×)** | 2,583 MB/s (1,288 µs, 1.00×) | 2,950 MB/s (1,128 µs, 0.88×) | 2,645 MB/s (1,258 µs, 0.98×) | 2,111 MB/s (1,577 µs, 1.22×) | 268 MB/s (12,415 µs, 9.64×) | 225 MB/s (14,758 µs, 11.45×) |
-| `write` | `twitter.json` | 632 KB | **5,396 MB/s (117 µs, 0.61×)** | 3,274 MB/s (193 µs, 1.00×) | 2,345 MB/s (269 µs, 1.40×) | 3,871 MB/s (163 µs, 0.85×) | 1,127 MB/s (560 µs, 2.90×) | 375 MB/s (1,685 µs, 8.74×) | 345 MB/s (1,833 µs, 9.50×) |
-| `build` | `canada.json` | 2.25 MB | 1,508 MB/s (1,492 µs, 1.50×) | 2,261 MB/s (996 µs, 1.00×) | — | 2,513 MB/s (896 µs, 0.90×) | **3,114 MB/s (723 µs, 0.73×)** | 201 MB/s (11,197 µs, 11.24×) | 198 MB/s (11,394 µs, 11.44×) |
-| `build` | `citm_catalog.json` | 1.73 MB | 2,255 MB/s (766 µs, 2.04×) | 4,597 MB/s (376 µs, 1.00×) | — | 3,870 MB/s (446 µs, 1.19×) | **5,546 MB/s (311 µs, 0.83×)** | 396 MB/s (4,361 µs, 11.61×) | 186 MB/s (9,264 µs, 24.66×) |
-| `build` | `gsoc-2018.json` | 3.33 MB | 6,094 MB/s (546 µs, 1.45×) | 8,834 MB/s (377 µs, 1.00×) | — | 7,841 MB/s (424 µs, 1.13×) | **9,578 MB/s (347 µs, 0.92×)** | 775 MB/s (4,297 µs, 11.41×) | 323 MB/s (10,312 µs, 27.37×) |
-| `build` | `twitter.json` | 632 KB | 1,897 MB/s (333 µs, 1.91×) | 3,621 MB/s (174 µs, 1.00×) | — | 3,138 MB/s (201 µs, 1.15×) | **4,170 MB/s (151 µs, 0.87×)** | 238 MB/s (2,650 µs, 15.19×) | 141 MB/s (4,464 µs, 25.59×) |
-| `lookup` | `twitter.json` | 632 KB | **168.6 K/s (5.93 µs, 0.59×)** | 99.0 K/s (10.10 µs, 1.00×) | 74.5 K/s (13.43 µs, 1.33×) | 89.6 K/s (11.16 µs, 1.10×) | 105.2 K/s (9.50 µs, 0.94×) | 36.4 K/s (27.45 µs, 2.72×) | 119.2 K/s (8.39 µs, 0.83×) |
+| `parse` | `canada.json` | 2.25 MB | **1,230 MB/s (1,830 µs, 0.64×)** | 791 MB/s (2,847 µs, 1.00×) | 827 MB/s (2,722 µs, 0.96×) | 785 MB/s (2,867 µs, 1.01×) | 472 MB/s (4,766 µs, 1.67×) | 53 MB/s (42,148 µs, 14.81×) | 54 MB/s (41,520 µs, 14.58×) |
+| `parse` | `citm_catalog.json` | 1.73 MB | **4,012 MB/s (431 µs, 0.42×)** | 1,671 MB/s (1,033 µs, 1.00×) | 2,841 MB/s (608 µs, 0.59×) | 1,677 MB/s (1,030 µs, 1.00×) | 1,225 MB/s (1,410 µs, 1.37×) | 159 MB/s (10,833 µs, 10.48×) | 102 MB/s (16,883 µs, 16.32×) |
+| `parse` | `gsoc-2018.json` | 3.33 MB | **5,151 MB/s (646 µs, 0.43×)** | 2,234 MB/s (1,489 µs, 1.00×) | 3,721 MB/s (894 µs, 0.60×) | 2,184 MB/s (1,524 µs, 1.02×) | 555 MB/s (5,991 µs, 4.02×) | 142 MB/s (23,383 µs, 15.71×) | 113 MB/s (29,435 µs, 19.75×) |
+| `parse` | `twitter.json` | 632 KB | **3,192 MB/s (198 µs, 0.60×)** | 1,915 MB/s (330 µs, 1.00×) | 2,644 MB/s (239 µs, 0.72×) | 1,945 MB/s (325 µs, 0.99×) | 578 MB/s (1,092 µs, 3.32×) | 107 MB/s (5,929 µs, 17.99×) | 80 MB/s (7,899 µs, 23.95×) |
+| `read` | `canada.json` | 2.25 MB | **778 MB/s (2,895 µs, 0.82×)** | 640 MB/s (3,517 µs, 1.00×) | 644 MB/s (3,497 µs, 0.99×) | 646 MB/s (3,484 µs, 0.99×) | 425 MB/s (5,292 µs, 1.50×) | 52 MB/s (43,374 µs, 12.34×) | 53 MB/s (42,705 µs, 12.14×) |
+| `read` | `citm_catalog.json` | 1.73 MB | **2,183 MB/s (791 µs, 0.66×)** | 1,448 MB/s (1,193 µs, 1.00×) | 2,106 MB/s (820 µs, 0.69×) | 1,473 MB/s (1,173 µs, 0.98×) | 1,114 MB/s (1,550 µs, 1.30×) | 155 MB/s (11,153 µs, 9.35×) | 101 MB/s (17,142 µs, 14.37×) |
+| `read` | `gsoc-2018.json` | 3.33 MB | 2,774 MB/s (1,200 µs, 0.76×) | 2,116 MB/s (1,572 µs, 1.00×) | **3,285 MB/s (1,013 µs, 0.64×)** | 2,089 MB/s (1,593 µs, 1.01×) | 547 MB/s (6,085 µs, 3.87×) | 141 MB/s (23,628 µs, 15.04×) | 112 MB/s (29,641 µs, 18.86×) |
+| `read` | `twitter.json` | 632 KB | 1,528 MB/s (413 µs, 1.06×) | 1,617 MB/s (391 µs, 1.00×) | **1,956 MB/s (323 µs, 0.83×)** | 1,629 MB/s (388 µs, 0.99×) | 548 MB/s (1,152 µs, 2.95×) | 102 MB/s (6,221 µs, 15.93×) | 79 MB/s (7,992 µs, 20.45×) |
+| `write` | `canada.json` | 2.25 MB | **1,077 MB/s (2,089 µs, 0.78×)** | 838 MB/s (2,686 µs, 1.00×) | 735 MB/s (3,062 µs, 1.14×) | 822 MB/s (2,738 µs, 1.02×) | 273 MB/s (8,250 µs, 3.07×) | 225 MB/s (10,026 µs, 3.73×) | 226 MB/s (9,945 µs, 3.70×) |
+| `write` | `citm_catalog.json` | 1.73 MB | **6,553 MB/s (264 µs, 0.93×)** | 6,091 MB/s (284 µs, 1.00×) | 3,452 MB/s (500 µs, 1.76×) | 5,534 MB/s (312 µs, 1.10×) | 2,472 MB/s (699 µs, 2.46×) | 992 MB/s (1,741 µs, 6.14×) | 1,152 MB/s (1,499 µs, 5.29×) |
+| `write` | `gsoc-2018.json` | 3.33 MB | **5,416 MB/s (614 µs, 0.49×)** | 2,655 MB/s (1,254 µs, 1.00×) | 2,976 MB/s (1,118 µs, 0.89×) | 2,594 MB/s (1,283 µs, 1.02×) | 2,107 MB/s (1,579 µs, 1.26×) | 223 MB/s (14,914 µs, 11.92×) | 282 MB/s (11,797 µs, 9.41×) |
+| `write` | `twitter.json` | 632 KB | **5,404 MB/s (117 µs, 0.72×)** | 3,868 MB/s (163 µs, 1.00×) | 2,351 MB/s (269 µs, 1.64×) | 3,321 MB/s (190 µs, 1.16×) | 1,127 MB/s (560 µs, 3.43×) | 328 MB/s (1,927 µs, 11.80×) | 430 MB/s (1,469 µs, 9.00×) |
+| `build` | `canada.json` | 2.25 MB | 1,436 MB/s (1,567 µs, 1.37×) | 1,961 MB/s (1,148 µs, 1.00×) | — | 2,538 MB/s (887 µs, 0.77×) | **3,148 MB/s (715 µs, 0.62×)** | 208 MB/s (10,835 µs, 9.44×) | 208 MB/s (10,822 µs, 9.43×) |
+| `build` | `citm_catalog.json` | 1.73 MB | 2,210 MB/s (782 µs, 2.30×) | 5,073 MB/s (340 µs, 1.00×) | — | 4,073 MB/s (424 µs, 1.25×) | **5,553 MB/s (311 µs, 0.91×)** | 398 MB/s (4,338 µs, 12.76×) | 196 MB/s (8,816 µs, 25.91×) |
+| `build` | `gsoc-2018.json` | 3.33 MB | 5,896 MB/s (564 µs, 1.57×) | 9,284 MB/s (358 µs, 1.00×) | — | 8,305 MB/s (401 µs, 1.12×) | **9,660 MB/s (344 µs, 0.97×)** | 781 MB/s (4,263 µs, 11.93×) | 327 MB/s (10,171 µs, 28.32×) |
+| `build` | `twitter.json` | 632 KB | 1,875 MB/s (337 µs, 2.15×) | 4,035 MB/s (157 µs, 1.00×) | — | 3,373 MB/s (187 µs, 1.20×) | **4,172 MB/s (151 µs, 0.97×)** | 240 MB/s (2,633 µs, 16.92×) | 146 MB/s (4,327 µs, 27.69×) |
+| `lookup` | `twitter.json` | 632 KB | **161.0 K/s (6.21 µs, 0.60×)** | 97.3 K/s (10.28 µs, 1.00×) | 76.2 K/s (13.12 µs, 1.28×) | 88.5 K/s (11.30 µs, 1.09×) | 105.4 K/s (9.49 µs, 0.92×) | 37.1 K/s (26.94 µs, 2.61×) | 123.6 K/s (8.09 µs, 0.78×) |
 
 ---
 
 ## ARM64 (NEON) Results
 
-> **Architecture note:** `neojson`'s x86 AVX2 parser is guarded by `#define NEOJSON_X86_SIMD 0` on `__aarch64__` (`src/json.cpp`), so ARM64 currently exercises the portable scalar `yyjson` + COW ordered-DOM path (whereas `simdjson` executes its native ARM64 NEON kernels). Even without native ARM SIMD parsing yet, `neojson` parses within **2.5%** of C `yyjson` (`1,115 MB/s` vs `1,145 MB/s`, **19.8× faster** than `nlohmann::ordered_json`), leads minified serialization (**1,702 MB/s**, **1.27×** vs `yyjson`), and leads `twitter.json` field lookup (**124.8 K/s**, `8.02 µs`).
+> **Architecture note:** `neojson` runs its native AArch64 NEON SIMD parser backend (`NeonParserOps` over `SimdOps` in `src/json.cpp`, `#define NEOJSON_ARM_NEON 1`) with 4×16B NEON escape/UTF-8 scanning and SWAR/Eisel-Lemire number parsing. On ARM64, `neojson` leads aggregate Parse at **1,685 MB/s** (**1.47×** faster than C `yyjson`, **1.44×** faster than `simdjson` DOM, **30.9×** faster than `nlohmann::ordered_json`), leads Parse + Full Read (**1,074 MB/s**), leads Write (**1,705 MB/s**, **1.28×** vs `yyjson`), and leads `twitter.json` Field Lookup (**122.2 K/s**, `8.18 µs`).
 
 ![JSON Throughput on ARM64 NEON](../assets/bench_arm64_neon.svg)
 
@@ -88,57 +88,58 @@ Each cell reports `throughput (median time, ratio vs yyjson C)`. Ratios `< 1.00�
 
 | Workload | `neojson` | `yyjson` (C) | `simdjson` (DOM) | `cpp-yyjson` | `RapidJSON` | `nlohmann::json` | `nlohmann::ordered` |
 |---|---|---|---|---|---|---|---|
-| Parse (Aggregate, 4 files) | 1,115 MB/s (7.12ms, 1.03×) | 1,145 MB/s (6.93ms, 1.00×) | **1,174 MB/s (6.76ms, 0.98×)** | 1,145 MB/s (6.93ms, 1.00×) | 443 MB/s (17.9ms, 2.58×) | 62 MB/s (128ms, 18.47×) | 56 MB/s (141ms, 20.33×) |
-| Parse + Full Traversal Read (4 files) | 779 MB/s (10.2ms, 1.25×) | 973 MB/s (8.15ms, 1.00×) | 968 MB/s (8.20ms, 1.01×) | **1,005 MB/s (7.90ms, 0.97×)** | 419 MB/s (18.9ms, 2.32×) | 60 MB/s (132ms, 16.18×) | 55 MB/s (144ms, 17.62×) |
-| Serialize / Write Minified (4 files) | **1,702 MB/s (4.66ms, 0.79×)** | 1,337 MB/s (5.94ms, 1.00×) | 1,083 MB/s (7.33ms, 1.23×) | 1,340 MB/s (5.92ms, 1.00×) | 557 MB/s (14.2ms, 2.40×) | 258 MB/s (30.8ms, 5.19×) | 267 MB/s (29.7ms, 5.01×) |
-| Mutable DOM Build (4 files) | 1,670 MB/s (4.75ms, 2.05×) | 3,421 MB/s (2.32ms, 1.00×) | — *(read-only)* | 3,096 MB/s (2.56ms, 1.11×) | **4,137 MB/s (1.92ms, 0.83×)** | 240 MB/s (33.1ms, 14.27×) | 168 MB/s (47.2ms, 20.33×) |
-| Field Lookup (`twitter.json`) | **124.8 K/s (8.02 µs, 0.79×)** | 98.2 K/s (10.18 µs, 1.00×) | 63.5 K/s (15.74 µs, 1.55×) | 84.2 K/s (11.88 µs, 1.17×) | 96.4 K/s (10.38 µs, 1.02×) | 49.1 K/s (20.37 µs, 2.00×) | 106.6 K/s (9.38 µs, 0.92×) |
+| Parse (Aggregate, 4 files) | **1,685 MB/s (4.71ms, 0.68×)** | 1,145 MB/s (6.93ms, 1.00×) | 1,171 MB/s (6.78ms, 0.98×) | 1,145 MB/s (6.93ms, 1.00×) | 445 MB/s (17.9ms, 2.58×) | 63 MB/s (126ms, 18.22×) | 55 MB/s (145ms, 20.99×) |
+| Parse + Full Traversal Read (4 files) | **1,074 MB/s (7.39ms, 0.91×)** | 975 MB/s (8.14ms, 1.00×) | 967 MB/s (8.21ms, 1.01×) | 1,005 MB/s (7.89ms, 0.97×) | 421 MB/s (18.9ms, 2.32×) | 61 MB/s (130ms, 15.93×) | 54 MB/s (148ms, 18.21×) |
+| Serialize / Write Minified (4 files) | **1,705 MB/s (4.66ms, 0.78×)** | 1,336 MB/s (5.94ms, 1.00×) | 1,080 MB/s (7.35ms, 1.24×) | 1,341 MB/s (5.92ms, 1.00×) | 561 MB/s (14.1ms, 2.38×) | 257 MB/s (30.9ms, 5.19×) | 264 MB/s (30.1ms, 5.06×) |
+| Mutable DOM Build (4 files) | 1,692 MB/s (4.69ms, 2.02×) | 3,422 MB/s (2.32ms, 1.00×) | — *(read-only)* | 3,160 MB/s (2.51ms, 1.08×) | **4,157 MB/s (1.91ms, 0.82×)** | 243 MB/s (32.7ms, 14.08×) | 168 MB/s (47.4ms, 20.41×) |
+| Field Lookup (`twitter.json`) | **122.2 K/s (8.18 µs, 0.80×)** | 98.2 K/s (10.19 µs, 1.00×) | 63.7 K/s (15.70 µs, 1.54×) | 80.4 K/s (12.44 µs, 1.22×) | 96.4 K/s (10.38 µs, 1.02×) | 49.0 K/s (20.40 µs, 2.00×) | 106.8 K/s (9.37 µs, 0.92×) |
 
 ### Per-File Breakdown (ARM64 NEON)
 
 | Workload | File | Size | `neojson` | `yyjson` (C) | `simdjson` (DOM) | `cpp-yyjson` | `RapidJSON` | `nlohmann::json` | `nlohmann::ordered` |
 |---|---|---|---|---|---|---|---|---|---|
-| `parse` | `canada.json` | 2.25 MB | 639 MB/s (3,524 µs, 1.01×) | 645 MB/s (3,490 µs, 1.00×) | 611 MB/s (3,681 µs, 1.05×) | **647 MB/s (3,480 µs, 1.00×)** | 415 MB/s (5,426 µs, 1.55×) | 39 MB/s (57,672 µs, 16.52×) | 40 MB/s (56,746 µs, 16.26×) |
-| `parse` | `citm_catalog.json` | 1.73 MB | 1,557 MB/s (1,109 µs, 1.06×) | 1,650 MB/s (1,047 µs, 1.00×) | **1,666 MB/s (1,037 µs, 0.99×)** | 1,650 MB/s (1,047 µs, 1.00×) | 781 MB/s (2,210 µs, 2.11×) | 90 MB/s (19,173 µs, 18.32×) | 68 MB/s (25,412 µs, 24.28×) |
-| `parse` | `gsoc-2018.json` | 3.33 MB | 1,603 MB/s (2,075 µs, 1.04×) | 1,663 MB/s (2,001 µs, 1.00×) | **2,069 MB/s (1,609 µs, 0.80×)** | 1,656 MB/s (2,009 µs, 1.00×) | 383 MB/s (8,700 µs, 4.35×) | 80 MB/s (41,498 µs, 20.74×) | 70 MB/s (47,786 µs, 23.88×) |
-| `parse` | `twitter.json` | 632 KB | 1,551 MB/s (407 µs, 1.03×) | **1,590 MB/s (397 µs, 1.00×)** | 1,448 MB/s (436 µs, 1.10×) | 1,589 MB/s (397 µs, 1.00×) | 398 MB/s (1,586 µs, 3.99×) | 65 MB/s (9,757 µs, 24.57×) | 57 MB/s (11,042 µs, 27.80×) |
-| `read` | `canada.json` | 2.25 MB | 487 MB/s (4,626 µs, 1.06×) | 514 MB/s (4,383 µs, 1.00×) | 494 MB/s (4,556 µs, 1.04×) | **549 MB/s (4,102 µs, 0.94×)** | 374 MB/s (6,011 µs, 1.37×) | 38 MB/s (59,684 µs, 13.62×) | 38 MB/s (58,637 µs, 13.38×) |
-| `read` | `citm_catalog.json` | 1.73 MB | 1,048 MB/s (1,648 µs, 1.36×) | **1,422 MB/s (1,214 µs, 1.00×)** | 1,338 MB/s (1,291 µs, 1.06×) | 1,404 MB/s (1,230 µs, 1.01×) | 722 MB/s (2,392 µs, 1.97×) | 85 MB/s (20,272 µs, 16.69×) | 67 MB/s (25,815 µs, 21.26×) |
-| `read` | `gsoc-2018.json` | 3.33 MB | 1,050 MB/s (3,168 µs, 1.51×) | 1,586 MB/s (2,098 µs, 1.00×) | **1,831 MB/s (1,817 µs, 0.87×)** | 1,585 MB/s (2,099 µs, 1.00×) | 375 MB/s (8,877 µs, 4.23×) | 80 MB/s (41,616 µs, 19.84×) | 69 MB/s (47,997 µs, 22.88×) |
-| `read` | `twitter.json` | 632 KB | 841 MB/s (751 µs, 1.64×) | **1,378 MB/s (458 µs, 1.00×)** | 1,187 MB/s (532 µs, 1.16×) | 1,358 MB/s (465 µs, 1.01×) | 382 MB/s (1,654 µs, 3.61×) | 61 MB/s (10,370 µs, 22.63×) | 56 MB/s (11,199 µs, 24.43×) |
-| `write` | `canada.json` | 2.25 MB | **757 MB/s (2,973 µs, 0.79×)** | 599 MB/s (3,756 µs, 1.00×) | 459 MB/s (4,901 µs, 1.30×) | 601 MB/s (3,748 µs, 1.00×) | 218 MB/s (10,334 µs, 2.75×) | 199 MB/s (11,308 µs, 3.01×) | 197 MB/s (11,416 µs, 3.04×) |
-| `write` | `citm_catalog.json` | 1.73 MB | **5,414 MB/s (319 µs, 0.82×)** | 4,445 MB/s (389 µs, 1.00×) | 2,776 MB/s (622 µs, 1.60×) | 4,449 MB/s (388 µs, 1.00×) | 1,372 MB/s (1,259 µs, 3.24×) | 678 MB/s (2,549 µs, 6.56×) | 717 MB/s (2,410 µs, 6.20×) |
-| `write` | `gsoc-2018.json` | 3.33 MB | **2,729 MB/s (1,219 µs, 0.78×)** | 2,129 MB/s (1,563 µs, 1.00×) | 2,292 MB/s (1,452 µs, 0.93×) | 2,137 MB/s (1,557 µs, 1.00×) | 1,736 MB/s (1,917 µs, 1.23×) | 239 MB/s (13,907 µs, 8.90×) | 243 MB/s (13,692 µs, 8.76×) |
-| `write` | `twitter.json` | 632 KB | **4,168 MB/s (152 µs, 0.66×)** | 2,754 MB/s (229 µs, 1.00×) | 1,771 MB/s (357 µs, 1.56×) | 2,744 MB/s (230 µs, 1.00×) | 854 MB/s (739 µs, 3.22×) | 206 MB/s (3,058 µs, 13.34×) | 286 MB/s (2,206 µs, 9.62×) |
-| `build` | `canada.json` | 2.25 MB | 994 MB/s (2,265 µs, 1.87×) | 1,854 MB/s (1,214 µs, 1.00×) | — | 1,849 MB/s (1,218 µs, 1.00×) | **2,756 MB/s (817 µs, 0.67×)** | 159 MB/s (14,119 µs, 11.63×) | 164 MB/s (13,762 µs, 11.34×) |
-| `build` | `citm_catalog.json` | 1.73 MB | 1,569 MB/s (1,101 µs, 2.50×) | 3,921 MB/s (441 µs, 1.00×) | — | 3,147 MB/s (549 µs, 1.25×) | **4,527 MB/s (382 µs, 0.87×)** | 242 MB/s (7,145 µs, 16.22×) | 136 MB/s (12,700 µs, 28.83×) |
-| `build` | `gsoc-2018.json` | 3.33 MB | 3,852 MB/s (864 µs, 1.86×) | **7,152 MB/s (465 µs, 1.00×)** | — | 6,070 MB/s (548 µs, 1.18×) | 6,410 MB/s (519 µs, 1.12×) | 504 MB/s (6,601 µs, 14.19×) | 222 MB/s (14,963 µs, 32.16×) |
-| `build` | `twitter.json` | 632 KB | 1,209 MB/s (523 µs, 2.61×) | **3,154 MB/s (200 µs, 1.00×)** | — | 2,530 MB/s (250 µs, 1.25×) | 3,140 MB/s (201 µs, 1.00×) | 121 MB/s (5,235 µs, 26.14×) | 110 MB/s (5,740 µs, 28.66×) |
-| `lookup` | `twitter.json` | 632 KB | **124.8 K/s (8.02 µs, 0.79×)** | 98.2 K/s (10.18 µs, 1.00×) | 63.5 K/s (15.74 µs, 1.55×) | 84.2 K/s (11.88 µs, 1.17×) | 96.4 K/s (10.38 µs, 1.02×) | 49.1 K/s (20.37 µs, 2.00×) | 106.6 K/s (9.38 µs, 0.92×) |
+| `parse` | `canada.json` | 2.25 MB | **976 MB/s (2,307 µs, 0.66×)** | 646 MB/s (3,486 µs, 1.00×) | 610 MB/s (3,689 µs, 1.06×) | 647 MB/s (3,481 µs, 1.00×) | 417 MB/s (5,400 µs, 1.55×) | 39 MB/s (57,262 µs, 16.46×) | 39 MB/s (58,460 µs, 16.78×) |
+| `parse` | `citm_catalog.json` | 1.73 MB | **1,871 MB/s (923 µs, 0.88×)** | 1,653 MB/s (1,045 µs, 1.00×) | 1,671 MB/s (1,034 µs, 0.99×) | 1,650 MB/s (1,047 µs, 1.00×) | 783 MB/s (2,206 µs, 2.11×) | 94 MB/s (18,446 µs, 17.62×) | 67 MB/s (25,848 µs, 24.74×) |
+| `parse` | `gsoc-2018.json` | 3.33 MB | **2,896 MB/s (1,149 µs, 0.57×)** | 1,660 MB/s (2,004 µs, 1.00×) | 2,057 MB/s (1,618 µs, 0.81×) | 1,661 MB/s (2,004 µs, 1.00×) | 384 MB/s (8,668 µs, 4.33×) | 81 MB/s (40,981 µs, 20.37×) | 67 MB/s (49,936 µs, 24.96×) |
+| `parse` | `twitter.json` | 632 KB | **1,908 MB/s (331 µs, 0.83×)** | 1,588 MB/s (398 µs, 1.00×) | 1,441 MB/s (438 µs, 1.10×) | 1,587 MB/s (398 µs, 1.00×) | 399 MB/s (1,583 µs, 3.98×) | 66 MB/s (9,612 µs, 24.22×) | 56 MB/s (11,234 µs, 28.25×) |
+| `read` | `canada.json` | 2.25 MB | **671 MB/s (3,353 µs, 0.77×)** | 514 MB/s (4,380 µs, 1.00×) | 493 MB/s (4,561 µs, 1.04×) | 548 MB/s (4,105 µs, 0.94×) | 376 MB/s (5,988 µs, 1.37×) | 38 MB/s (58,588 µs, 13.39×) | 37 MB/s (60,517 µs, 13.81×) |
+| `read` | `citm_catalog.json` | 1.73 MB | 1,247 MB/s (1,386 µs, 1.14×) | **1,423 MB/s (1,214 µs, 1.00×)** | 1,340 MB/s (1,289 µs, 1.06×) | 1,403 MB/s (1,231 µs, 1.01×) | 728 MB/s (2,373 µs, 1.95×) | 89 MB/s (19,516 µs, 16.05×) | 66 MB/s (26,196 µs, 21.60×) |
+| `read` | `gsoc-2018.json` | 3.33 MB | 1,635 MB/s (2,036 µs, 0.97×) | 1,592 MB/s (2,090 µs, 1.00×) | **1,822 MB/s (1,826 µs, 0.87×)** | 1,590 MB/s (2,094 µs, 1.00×) | 375 MB/s (8,875 µs, 4.24×) | 81 MB/s (41,170 µs, 19.74×) | 66 MB/s (50,150 µs, 24.00×) |
+| `read` | `twitter.json` | 632 KB | 1,020 MB/s (619 µs, 1.35×) | **1,376 MB/s (459 µs, 1.00×)** | 1,182 MB/s (534 µs, 1.16×) | 1,357 MB/s (465 µs, 1.01×) | 385 MB/s (1,638 µs, 3.55×) | 61 MB/s (10,421 µs, 22.61×) | 55 MB/s (11,420 µs, 24.90×) |
+| `write` | `canada.json` | 2.25 MB | **756 MB/s (2,978 µs, 0.79×)** | 600 MB/s (3,750 µs, 1.00×) | 458 MB/s (4,915 µs, 1.31×) | 601 MB/s (3,743 µs, 1.00×) | 216 MB/s (10,422 µs, 2.78×) | 198 MB/s (11,365 µs, 3.03×) | 194 MB/s (11,617 µs, 3.10×) |
+| `write` | `citm_catalog.json` | 1.73 MB | **5,491 MB/s (315 µs, 0.81×)** | 4,446 MB/s (389 µs, 1.00×) | 2,764 MB/s (625 µs, 1.61×) | 4,447 MB/s (388 µs, 1.00×) | 1,444 MB/s (1,196 µs, 3.06×) | 683 MB/s (2,529 µs, 6.51×) | 693 MB/s (2,494 µs, 6.42×) |
+| `write` | `gsoc-2018.json` | 3.33 MB | **2,747 MB/s (1,211 µs, 0.77×)** | 2,116 MB/s (1,573 µs, 1.00×) | 2,286 MB/s (1,455 µs, 0.92×) | 2,134 MB/s (1,560 µs, 0.99×) | 1,755 MB/s (1,896 µs, 1.21×) | 239 MB/s (13,909 µs, 8.84×) | 243 MB/s (13,712 µs, 8.71×) |
+| `write` | `twitter.json` | 632 KB | **4,161 MB/s (152 µs, 0.66×)** | 2,742 MB/s (230 µs, 1.00×) | 1,782 MB/s (354 µs, 1.54×) | 2,758 MB/s (229 µs, 0.99×) | 997 MB/s (633 µs, 2.76×) | 207 MB/s (3,058 µs, 13.28×) | 280 MB/s (2,257 µs, 9.80×) |
+| `build` | `canada.json` | 2.25 MB | 989 MB/s (2,277 µs, 1.88×) | 1,856 MB/s (1,213 µs, 1.00×) | — | 1,932 MB/s (1,165 µs, 0.96×) | **2,765 MB/s (814 µs, 0.67×)** | 164 MB/s (13,696 µs, 11.30×) | 162 MB/s (13,867 µs, 11.40×) |
+| `build` | `citm_catalog.json` | 1.73 MB | 1,568 MB/s (1,102 µs, 2.50×) | 3,920 MB/s (441 µs, 1.00×) | — | 3,147 MB/s (549 µs, 1.25×) | **4,510 MB/s (383 µs, 0.87×)** | 244 MB/s (7,065 µs, 16.07×) | 135 MB/s (12,800 µs, 29.08×) |
+| `build` | `gsoc-2018.json` | 3.33 MB | 4,012 MB/s (830 µs, 1.78×) | **7,147 MB/s (466 µs, 1.00×)** | — | 6,056 MB/s (549 µs, 1.18×) | 6,503 MB/s (512 µs, 1.10×) | 501 MB/s (6,638 µs, 14.24×) | 223 MB/s (14,930 µs, 31.99×) |
+| `build` | `twitter.json` | 632 KB | 1,304 MB/s (484 µs, 2.42×) | **3,153 MB/s (200 µs, 1.00×)** | — | 2,538 MB/s (249 µs, 1.24×) | 3,146 MB/s (201 µs, 1.01×) | 120 MB/s (5,257 µs, 26.25×) | 110 MB/s (5,753 µs, 28.73×) |
+| `lookup` | `twitter.json` | 632 KB | **122.2 K/s (8.18 µs, 0.80×)** | 98.2 K/s (10.19 µs, 1.00×) | 63.7 K/s (15.70 µs, 1.54×) | 80.4 K/s (12.44 µs, 1.22×) | 96.4 K/s (10.38 µs, 1.02×) | 49.0 K/s (20.40 µs, 2.00×) | 106.8 K/s (9.37 µs, 0.92×) |
 
 ---
 
 ## Why `neojson` Outperforms `yyjson` (C)
 
-A C++ `nlohmann::ordered_json` wrapper beating the C `yyjson` baseline on parse (`1.53×` on x86-64), write (`1.46×` x86-64 / `1.27×` ARM64), and lookup (`1.70×` x86-64 / `1.27×` ARM64) comes from four architectural choices in [`src/json.cpp`](../src/json.cpp) and [`include/neojson/json.hpp`](../include/neojson/json.hpp):
+A C++ `nlohmann::ordered_json` wrapper beating the C `yyjson` baseline on parse (`1.84×` on x86-64 / `1.47×` on ARM64), full read (`1.26×` x86-64 / `1.10×` ARM64), write (`1.42×` x86-64 / `1.28×` ARM64), and lookup (`1.66×` x86-64 / `1.25×` ARM64) comes from four architectural choices in [`src/json.cpp`](../src/json.cpp) and [`include/neojson/json.hpp`](../include/neojson/json.hpp):
 
-1. **Native AVX2/SWAR Parser & Pooled Buffers (Parse)**:
-   - On x86-64 hosts with runtime-detected AVX2, standard JSON inputs (`>= 32 B`, no comments or UTF-8 BOM) bypass `yyjson_read()` via `try_parse_native_simd_doc()` → `parse_native_simd_avx2()`. That path performs 32-byte AVX2 whitespace/string/Keiser-Lemire UTF-8 scanning, SWAR 4/8-digit integer conversion, and Eisel-Lemire float parsing into a flat `yyjson_doc`-compatible layout.
-   - Both native AVX2 parses and `yyjson` fallbacks draw large value/string pools from a bounded thread-local buffer cache (`ThreadLargeCache` via `yyjson_parse_alc()`), eliminating repeated OS `malloc`/`free` calls across parses while remaining boundable and reclaimable via `neojson::set_thread_cache_limits()` and `neojson::trim_thread_caches()`.
-   - Because `NEOJSON_X86_SIMD` is currently `0` on `__aarch64__`, ARM64 uses the vendored `yyjson` scalar parser with that pooled allocator — explaining why ARM64 parse throughput (`1,115 MB/s`) sits within `2.5%` of `yyjson (C)` (`1,145 MB/s`) instead of pulling ahead.
+1. **Native AVX2/NEON/SWAR Parsers & Pooled Buffers (Parse)**:
+   - For standard JSON inputs (`>= 32 B`, no comments or UTF-8 BOM), `try_parse_native_simd_doc()` dispatches an arch-neutral `parse_native_simd_impl<SimdOps>` core instantiated with `Avx2ParserOps` on x86-64 AVX2 and `NeonParserOps` on ARM64 NEON.
+   - Both backends accelerate whitespace skipping, structural scanning, string escape/Keiser-Lemire UTF-8 validation, 8-digit SWAR integer/fraction parsing, Eisel-Lemire float multipliers (`finish_float_noexp`), and tight `,[` coordinate-pair runs directly into a flat `yyjson_doc`-compatible layout.
+   - Both native SIMD parses and `yyjson` fallbacks draw large value/string pools from a bounded thread-local buffer cache (`ThreadLargeCache` via `yyjson_parse_alc()`), eliminating repeated OS `malloc`/`free` calls across parses while remaining boundable and reclaimable via `neojson::set_thread_cache_limits()` and `neojson::trim_thread_caches()`.
 
-2. **Lazy Copy-on-Write DOM vs Eager Tree Materialization (Parse & Read)**:
-   - `json::parse()` returns a 16-byte lazy handle referencing the flat parsed document rather than eagerly allocating `std::map`/`std::vector`/`std::string` nodes (`nlohmann::ordered_json` allocates per node, hence `83 MB/s` vs `2,180 MB/s`).
-   - Read-only traversal (`cbegin()`/`cend()`, `const` indexing) materializes a compact bump-allocated `DocArena` view on demand (`lazy_materialize_arena()` with key interning and `ArenaShapeCache` shape reuse), while owned mutable containers are only materialized when mutated. Even when paying full read traversal (`Parse + Full Traversal Read`), x86-64 stays faster than C `yyjson` (`1,336` vs `1,224 MB/s`).
+2. **Lazy Copy-on-Write DOM & Optimized `DocArena` Traversal (Parse & Read)**:
+   - `json::parse()` returns a 16-byte lazy handle referencing the flat parsed document rather than eagerly allocating `std::map`/`std::vector`/`std::string` nodes (`nlohmann::ordered_json` allocates per node, hence `83 MB/s` vs `2,557 MB/s` on x86-64).
+   - Read-only traversal (`cbegin()`/`cend()`, `const` indexing) materializes a compact bump-allocated `DocArena` view via `lazy_materialize_arena()`, using direct arena traversal, shape reuse (`ArenaShapeCache`), fast string interning (`LongStrInternCache`), and portable object-run builders — beating both C `yyjson` and `simdjson` (DOM) on aggregate `Parse + Full Read` on both x86-64 (`1,498` vs `1,404 MB/s`) and ARM64 (`1,074` vs `975 MB/s`).
 
 3. **Flat Direct Serializer into the Output `std::string` (Write)**:
    - `bench_yyjson` calls `yyjson_write()` (which allocates a C buffer with `malloc`), copies it into `std::string`, and calls `free()`.
-   - For unmaterialized lazy objects/arrays, `neojson::json::dump()` runs `try_dump_yyjson_direct()` → `dump_yyjson_direct_flat()`, streaming through an 8 KiB stack staging buffer straight into a pre-reserved `std::string` (sized from `yyjson_doc_get_read_size()`), using `YYJSON_SUBTYPE_NOESC` fast paths, consecutive numeric-pair runs (helpful on `canada.json`), and AVX2 escape checks on x86-64.
-   - On the first dump/arena view of a root parsed document, `neojson` records whether all object keys are duplicate-free (`tree_unique_verified`), so subsequent timed `dump()` calls skip duplicate-key scanning (matching `yyjson_write`, which does not check duplicates). Note that even on ARM64 without x86 AVX2, `neojson` still writes **1.27× faster** than `yyjson (C)` (`1,702` vs `1,337 MB/s`).
+   - For unmaterialized lazy objects/arrays, `neojson::json::dump()` runs `try_dump_yyjson_direct()` → `dump_yyjson_direct_flat()`, streaming through an 8 KiB stack staging buffer straight into a pre-reserved `std::string` (sized from `yyjson_doc_get_read_size()`), using `YYJSON_SUBTYPE_NOESC` fast paths, consecutive numeric-pair runs, and AVX2 escape checks on x86-64.
+   - On the first dump/arena view of a root parsed document, `neojson` records whether all object keys are duplicate-free (`tree_unique_verified`), so subsequent timed `dump()` calls skip duplicate-key scanning (matching `yyjson_write`, which does not check duplicates).
 
-4. **Contiguous Keys & Lazy Open-Addressed Hash Index (Field Lookup)**:
-   - `yyjson` immutable objects are stored as flat preorder key/value arrays without a hash index, so `yyjson_obj_getn()` performs an `O(N)` linear scan per key lookup (stepping over nested subtrees via `uni.ofs` and dereferencing each key's string pointer).
-   - `neojson`'s `ArenaObject` stores keys in a contiguous array (cache-friendly linear comparison up to 16 keys, `kOrderedMapHashThreshold`) and lazily builds a compact open-addressed `ArenaHashIndex` above 16 keys — turning `twitter.json` repeated lookups into `O(1)` (`168.6 K/s` / `5.93 µs` on x86-64 and `124.8 K/s` / `8.02 µs` on ARM64).
+4. **Contiguous Keys, Open-Addressed Indexing & Compact Mutable Builders (Lookup & Build)**:
+   - `yyjson` immutable objects are stored as flat preorder key/value arrays without a hash index, so `yyjson_obj_getn()` performs an `O(N)` linear scan per key lookup.
+   - `neojson`'s `ArenaObject` stores keys contiguously (cache-friendly linear scan up to 16 keys, `kOrderedMapHashThreshold`) and lazily builds a compact open-addressed `ArenaHashIndex` above 16 keys — turning `twitter.json` repeated lookups into `O(1)` (`161.0 K/s` / `6.21 µs` on x86-64 and `122.2 K/s` / `8.18 µs` on ARM64).
+   - Mutable `json` objects/arrays also use compact `SmallArray2`/`SmallObject4` slabs with NEON 4×16B (`small_obj_verify_neon_mask4`) and SSE2 tag scanning plus single-probe `ordered_map` index insertion (`10.5×` / `10.1×` faster build than `nlohmann::ordered_json` on x86-64 / ARM64).
 
 ---
 

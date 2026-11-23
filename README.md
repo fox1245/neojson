@@ -4,7 +4,7 @@
 
 # neojson
 
-**An nlohmann-compatible C++ JSON API combining a native AVX2/SWAR parser, vendored yyjson, and a lazy COW DOM.**
+**An nlohmann-compatible C++ JSON API combining native AVX2/NEON/SWAR SIMD parsers, vendored yyjson, and a lazy COW DOM.**
 
 [![CI](https://github.com/fox1245/neojson/actions/workflows/ci.yml/badge.svg)](https://github.com/fox1245/neojson/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -14,7 +14,7 @@
 
 ---
 
-An implementation of the `nlohmann::ordered_json` API combining a native x86-64 AVX2/SWAR parser (with vendored `yyjson` fallback on non-AVX2 hosts and small/unsupported inputs) and a lazy Copy-on-Write DOM. The library exposes one value type, `neojson::json`: an owned node tree with nlohmann's semantics (objects keep the order of insertion, integers are signed or unsigned, and so on) that materializes lazily from the flat parsed document. Differential tests against nlohmann/json are the specification. Work in progress.
+An implementation of the `nlohmann::ordered_json` API combining native x86-64 AVX2 and ARM64 NEON SIMD parsers (with vendored `yyjson` fallback on unsupported targets and small/comment/BOM inputs) and a lazy Copy-on-Write DOM. The library exposes one value type, `neojson::json`: an owned node tree with nlohmann's semantics (objects keep the order of insertion, integers are signed or unsigned, and so on) that materializes lazily from the flat parsed document. Differential tests against nlohmann/json are the specification. Work in progress.
 
 License: MIT. yyjson (vendor/yyjson) is MIT licensed.
 
@@ -22,29 +22,29 @@ License: MIT. yyjson (vendor/yyjson) is MIT licensed.
 
 Single-thread in-memory throughput across the standard 4-file JSON benchmark corpus (`canada.json`, `citm_catalog.json`, `gsoc-2018.json`, `twitter.json`; `7.94 MB` total, median of 7 alternating rounds × 7 batches, GCC 13.3.0 `-O3 -DNDEBUG`, no `-march=native`, C++20 benchmark harnesses with `libneojson` built as C++17 per root `CMakeLists.txt`).
 
-On x86-64 AVX2 (`Intel Core i7-8750H`), `neojson` parses **26.2× faster** than `nlohmann::ordered_json` and **1.53× faster** than the `yyjson` C API while serializing **1.46× faster**. On ARM64 NEON (`ARM Neoverse-N1`), where `neojson` currently uses its portable scalar `yyjson` + COW path rather than native ARM SIMD intrinsics, parse throughput stays within **2.5%** of `yyjson` (`0.97×`) while serialization remains **1.27× faster**.
+On x86-64 AVX2 (`Intel Core i7-8750H`), `neojson` parses **30.8× faster** than `nlohmann::ordered_json`, **1.84× faster** than the `yyjson` C API, and **1.44× faster** than `simdjson` DOM, while also leading Parse + Full Read (**1.26×** vs `yyjson`), Write (**1.42×**), and Field Lookup (**1.66×**). On ARM64 NEON (`ARM Neoverse-N1`), with its native NEON SIMD parser backend, `neojson` parses **30.9× faster** than `nlohmann::ordered_json`, **1.47× faster** than `yyjson` C, and **1.44× faster** than `simdjson` DOM (`1,685` vs `1,171 MB/s`), while leading Parse + Full Read (**1,074 MB/s**), Write (**1.28×**), and Field Lookup (**1.25×**).
 
 ![neojson throughput on x86-64 AVX2](assets/bench_overview_x86_64.svg)
 
 | Architecture / CPU | Workload | `neojson` | `yyjson (C)` | `simdjson` (DOM) | `cpp-yyjson` | `RapidJSON` | `nlohmann::json` | `nlohmann::ordered` |
 |---|---|---|---|---|---|---|---|---|
-| **x86-64 AVX2**<br>Intel Core i7-8750H | Parse (4 files) | **2,180 MB/s** (`3.64 ms`) | 1,425 MB/s | 1,754 MB/s | 1,391 MB/s | 598 MB/s | 97 MB/s | 83 MB/s |
-| | Parse + Full Read | 1,336 MB/s (`5.94 ms`) | 1,224 MB/s | **1,379 MB/s** | 1,202 MB/s | 564 MB/s | 94 MB/s | 82 MB/s |
-| | Write (Minified) | **2,553 MB/s** (`3.11 ms`) | 1,745 MB/s | 1,600 MB/s | 1,807 MB/s | 716 MB/s | 311 MB/s | 280 MB/s |
-| | Mutable Build | 2,530 MB/s (`3.14 ms`) | 4,129 MB/s | — *(read-only)* | 4,034 MB/s | **5,177 MB/s** | 353 MB/s | 224 MB/s |
-| | Field Lookup (`twitter.json`) | **168.6 K/s** (`5.93 µs`) | 99.0 K/s | 74.5 K/s | 89.6 K/s | 105.2 K/s | 36.4 K/s | 119.2 K/s |
-| **ARM64 NEON**<br>ARM Neoverse-N1 | Parse (4 files) | 1,115 MB/s (`7.12 ms`) | 1,145 MB/s | **1,174 MB/s** | 1,145 MB/s | 443 MB/s | 62 MB/s | 56 MB/s |
-| | Parse + Full Read | 779 MB/s (`10.2 ms`) | 973 MB/s | 968 MB/s | **1,005 MB/s** | 419 MB/s | 60 MB/s | 55 MB/s |
-| | Write (Minified) | **1,702 MB/s** (`4.66 ms`) | 1,337 MB/s | 1,083 MB/s | 1,340 MB/s | 557 MB/s | 258 MB/s | 267 MB/s |
-| | Mutable Build | 1,670 MB/s (`4.75 ms`) | 3,421 MB/s | — *(read-only)* | 3,096 MB/s | **4,137 MB/s** | 240 MB/s | 168 MB/s |
-| | Field Lookup (`twitter.json`) | **124.8 K/s** (`8.02 µs`) | 98.2 K/s | 63.5 K/s | 84.2 K/s | 96.4 K/s | 49.1 K/s | 106.6 K/s |
+| **x86-64 AVX2**<br>Intel Core i7-8750H | Parse (4 files) | **2,557 MB/s** (`3.10 ms`) | 1,393 MB/s | 1,779 MB/s | 1,382 MB/s | 599 MB/s | 96 MB/s | 83 MB/s |
+| | Parse + Full Read | **1,498 MB/s** (`5.30 ms`) | 1,189 MB/s | 1,404 MB/s | 1,196 MB/s | 564 MB/s | 94 MB/s | 81 MB/s |
+| | Write (Minified) | **2,574 MB/s** (`3.08 ms`) | 1,810 MB/s | 1,604 MB/s | 1,755 MB/s | 716 MB/s | 277 MB/s | 321 MB/s |
+| | Mutable Build | 2,442 MB/s (`3.25 ms`) | 3,962 MB/s | — *(read-only)* | 4,180 MB/s | **5,215 MB/s** | 360 MB/s | 233 MB/s |
+| | Field Lookup (`twitter.json`) | **161.0 K/s** (`6.21 µs`) | 97.3 K/s | 76.2 K/s | 88.5 K/s | 105.4 K/s | 37.1 K/s | 123.6 K/s |
+| **ARM64 NEON**<br>ARM Neoverse-N1 | Parse (4 files) | **1,685 MB/s** (`4.71 ms`) | 1,145 MB/s | 1,171 MB/s | 1,145 MB/s | 445 MB/s | 63 MB/s | 55 MB/s |
+| | Parse + Full Read | **1,074 MB/s** (`7.39 ms`) | 975 MB/s | 967 MB/s | 1,005 MB/s | 421 MB/s | 61 MB/s | 54 MB/s |
+| | Write (Minified) | **1,705 MB/s** (`4.66 ms`) | 1,336 MB/s | 1,080 MB/s | 1,341 MB/s | 561 MB/s | 257 MB/s | 264 MB/s |
+| | Mutable Build | 1,692 MB/s (`4.69 ms`) | 3,422 MB/s | — *(read-only)* | 3,160 MB/s | **4,157 MB/s** | 243 MB/s | 168 MB/s |
+| | Field Lookup (`twitter.json`) | **122.2 K/s** (`8.18 µs`) | 98.2 K/s | 63.7 K/s | 80.4 K/s | 96.4 K/s | 49.0 K/s | 106.8 K/s |
 
 ### Why is `neojson` faster than `yyjson` (C)?
 
-1. **Native AVX2/SWAR parser + pooled document buffers (`1.53×` parse on x86-64)**: For standard inputs (`>= 32 B`, no comments/BOM) on x86-64 AVX2 hosts, `json::parse()` bypasses `yyjson_read()` and runs its runtime-dispatched AVX2/SWAR parser (32-byte whitespace/string/Keiser-Lemire UTF-8 scanning, SWAR integer parsing, Eisel-Lemire floats) directly into a `yyjson_doc`-compatible layout backed by bounded thread-local pooled buffers (`ThreadLargeCache`, configurable via `set_thread_cache_limits()` / `trim_thread_caches()`), avoiding per-parse `malloc`/`free`. On ARM64 (`NEOJSON_X86_SIMD == 0`), it falls back to vendored `yyjson` + pooled allocator, which is why ARM64 parse tracks `yyjson` within `2.5%`.
-2. **Lazy COW DOM (no eager `std::map`/`std::vector`/`std::string` tree build)**: `json::parse()` wraps the parsed flat document in a 16-byte lazy handle without allocating per-node containers up front, materializing compact read-only `DocArena` views only on first traversal and owned mutable containers only on mutation — so even full-traversal `Parse + Read` stays ahead of C `yyjson` on x86-64 (`1,336` vs `1,224 MB/s`).
-3. **Flat direct serializer into `std::string` (`1.46×` x86-64, `1.27×` ARM64)**: Unmaterialized lazy documents serialize directly into the caller's `std::string` using an 8 KiB stack staging buffer, pre-reserved input-size hint, `YYJSON_SUBTYPE_NOESC` fast paths, numeric-pair coordinate runs, and AVX2 escape scanning on x86-64 — skipping `yyjson_write()`'s separate `malloc` + copy + `free` cycle and caching object key-uniqueness checks after the first dump/view.
-4. **Contiguous keys + lazy open-addressed hash index (`1.70×` lookup x86-64, `1.27×` ARM64)**: Immutable `yyjson` objects are flat preorder arrays without a hash index (`O(N)` linear scan via `yyjson_obj_getn`), whereas `neojson`'s `ArenaObject` stores keys contiguously and lazily builds an open-addressed hash table (`ArenaHashIndex`) above 16 keys (`kOrderedMapHashThreshold`), giving cache-local linear scans on small objects and `O(1)` lookup on larger ones.
+1. **Native AVX2/NEON/SWAR parsers + pooled buffers (`1.84×` parse on x86-64, `1.47×` on ARM64)**: For standard inputs (`>= 32 B`, no comments/BOM), `json::parse()` bypasses `yyjson_read()` and dispatches an arch-neutral native SIMD parser core (`Avx2ParserOps` on x86-64 AVX2 and `NeonParserOps` on ARM64 NEON), featuring SIMD whitespace/string/Keiser-Lemire UTF-8 scanning, SWAR 8-digit integer & fractional float parsing, Eisel-Lemire multipliers, and tight coordinate-pair runs into a `yyjson_doc`-compatible layout backed by bounded thread-local caches (`ThreadLargeCache`, configurable via `set_thread_cache_limits()` / `trim_thread_caches()`), avoiding per-parse `malloc`/`free`.
+2. **Lazy COW DOM + direct `DocArena` traversal (`1.26×` read x86-64, `1.10×` ARM64)**: `json::parse()` wraps the flat parsed document in a 16-byte lazy handle instead of allocating per-node containers up front. Read-only traversal materializes compact bump-allocated `DocArena` views with shape caching (`ArenaShapeCache`), fast string interning (`LongStrInternCache`), and portable object-run builders — outperforming both `yyjson (C)` and `simdjson (DOM)` on full-traversal `Parse + Read` across both architectures.
+3. **Flat direct serializer into `std::string` (`1.42×` write x86-64, `1.28×` ARM64)**: Unmaterialized lazy documents serialize straight into the caller's `std::string` via an 8 KiB staging buffer, input-size reserve hint, `YYJSON_SUBTYPE_NOESC` fast paths, numeric-pair coordinate runs, and AVX2 escape scanning on x86-64 — avoiding `yyjson_write()`'s `malloc` + copy + `free` cycle and caching object key uniqueness after first inspection.
+4. **Contiguous keys + open-addressed indexing & compact DOM builders (`1.66×` lookup x86-64, `1.25×` ARM64)**: Unlike `yyjson`'s flat preorder object scan (`O(N)`), `ArenaObject` stores keys contiguously and builds an open-addressed `ArenaHashIndex` lazily above 16 keys (`kOrderedMapHashThreshold`), while mutable `json` containers use compact `SmallArray2`/`SmallObject4` slabs with NEON/SSE2 tag scanning and single-probe `ordered_map` indexing (`10.5×` / `10.1×` faster build than `nlohmann::ordered_json` on x86-64 / ARM64).
 
 See [docs/benchmarks.md](docs/benchmarks.md) for the ARM64 NEON chart, full per-file breakdown chart and tables, methodology notes (`simdjson` pre-padded DOM, `RapidJSON` baseline SIMD flags), and reproduction commands under [`bench/`](bench/).
 

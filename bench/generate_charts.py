@@ -325,7 +325,7 @@ def main():
     render_per_file_svg(x86_files, x86_med, out_dir / "bench_per_file_x86_64.svg")
     render_overview_svg(
         "JSON Throughput on ARM64 (NEON)",
-        "ARM Neoverse-N1 (4 vCPU, NEON) · GCC 13.3.0 -O3 -DNDEBUG · yyjson+COW path (no native ARM SIMD parser) · Higher is faster",
+        f"ARM Neoverse-N1 (4 vCPU, NEON) · GCC 13.3.0 -O3 -DNDEBUG · Native ARM64 NEON parser · {arm_bytes / 1e6:.2f} MB across 4 files · Higher is faster",
         arm_files,
         arm_bytes,
         arm_med,
