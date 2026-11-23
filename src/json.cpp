@@ -25,6 +25,13 @@
 #define NEOJSON_X86_SIMD 0
 #endif
 
+#if defined(__ARM_NEON) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_neon.h>
+#define NEOJSON_ARM_NEON 1
+#else
+#define NEOJSON_ARM_NEON 0
+#endif
+
 #if defined(_WIN32)
 #include <malloc.h>
 #endif
@@ -10146,6 +10153,10 @@ NEOJSON_NOINLINE std::string dump_formatted_fallback(const json& val, const int 
 #if (NEOJSON_X86_SIMD && defined(__SIZEOF_INT128__))
 #define NEOJSON_NATIVE_PARSER 1
 #define NEOJSON_PARSER_TARGET __attribute__((target("avx2")))
+#elif (NEOJSON_ARM_NEON && defined(__aarch64__) && defined(__SIZEOF_INT128__) && \
+       defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define NEOJSON_NATIVE_PARSER 1
+#define NEOJSON_PARSER_TARGET
 #else
 #define NEOJSON_NATIVE_PARSER 0
 #define NEOJSON_PARSER_TARGET
@@ -10256,12 +10267,23 @@ struct alignas(64) SimpleEscTable {
 };
 static constexpr SimpleEscTable kSimpleEsc{};
 
+#if NEOJSON_X86_SIMD
+using ParserMask = std::uint32_t;
+#else
+using ParserMask = std::uint64_t;
+#endif
+
 struct IndentSlot {
     std::uint32_t k = 0u;
-    std::uint32_t mask = 0u;
+    ParserMask mask = 0u;
 };
-static_assert(sizeof(IndentSlot) == 8u, "IndentSlot must stay 8 bytes");
+#if NEOJSON_X86_SIMD
+static_assert(sizeof(IndentSlot) == 8u, "IndentSlot must stay 8 bytes on x86");
+#else
+static_assert(sizeof(IndentSlot) == 16u, "IndentSlot must stay 16 bytes on ARM64");
+#endif
 
+#if NEOJSON_X86_SIMD
 static constexpr std::uint32_t kIndentMask32[32] = {
     0x00000000u, 0x00000001u, 0x00000003u, 0x00000007u,
     0x0000000Fu, 0x0000001Fu, 0x0000003Fu, 0x0000007Fu,
@@ -10272,6 +10294,18 @@ static constexpr std::uint32_t kIndentMask32[32] = {
     0x00FFFFFFu, 0x01FFFFFFu, 0x03FFFFFFu, 0x07FFFFFFu,
     0x0FFFFFFFu, 0x1FFFFFFFu, 0x3FFFFFFFu, 0x7FFFFFFFu,
 };
+#else
+static constexpr std::uint64_t kIndentMask64_4bit[16] = {
+    0x0000000000000000ULL, 0x000000000000000FULL,
+    0x00000000000000FFULL, 0x0000000000000FFFULL,
+    0x000000000000FFFFULL, 0x00000000000FFFFFULL,
+    0x0000000000FFFFFFULL, 0x000000000FFFFFFFULL,
+    0x00000000FFFFFFFFULL, 0x0000000FFFFFFFFFULL,
+    0x000000FFFFFFFFFFULL, 0x00000FFFFFFFFFFFULL,
+    0x0000FFFFFFFFFFFFULL, 0x000FFFFFFFFFFFFFULL,
+    0x00FFFFFFFFFFFFFFULL, 0x0FFFFFFFFFFFFFFFULL,
+};
+#endif
 
 struct StrParseRes {
     const char* p;
@@ -11011,8 +11045,17 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool utf8_chunk_valid_avx2
 }
 
 struct Avx2ParserOps {
+    using Mask = std::uint32_t;
     static constexpr std::size_t kVecBytes = 32u;
     static constexpr std::size_t kMinLen = 32u;
+
+    static NEOJSON_ALWAYS_INLINE unsigned first_bit(const Mask m) noexcept {
+        return static_cast<unsigned>(__builtin_ctz(m));
+    }
+
+    static NEOJSON_ALWAYS_INLINE Mask indent_mask(const unsigned n) noexcept {
+        return kIndentMask32[n];
+    }
 
     static NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* skip_ws_slow(
         const char* p, const char* const end) noexcept {
@@ -11579,7 +11622,600 @@ struct Avx2ParserOps {
     }
 };
 
-#endif // NEOJSON_X86_SIMD
+#elif (NEOJSON_ARM_NEON && defined(__aarch64__) && defined(__SIZEOF_INT128__) && \
+       defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+
+namespace {
+
+alignas(16) static constexpr std::uint8_t kUtf8PrefixMask16[32] = {
+    0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu,
+    0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
+};
+
+alignas(16) static constexpr std::uint8_t kUtf8LutHi1_16[16] = {
+    0x02u, 0x02u, 0x02u, 0x02u, 0x02u, 0x02u, 0x02u, 0x02u,
+    0x80u, 0x80u, 0x80u, 0x80u, 0x11u, 0x01u, 0x0Du, 0x61u,
+};
+alignas(16) static constexpr std::uint8_t kUtf8LutLo1_16[16] = {
+    0xB7u, 0x93u, 0x83u, 0x83u, 0xC3u, 0xE3u, 0xE3u, 0xE3u,
+    0xE3u, 0xE3u, 0xE3u, 0xE3u, 0xE3u, 0xEBu, 0xE3u, 0xE3u,
+};
+alignas(16) static constexpr std::uint8_t kUtf8LutHi2_16[16] = {
+    0x01u, 0x01u, 0x01u, 0x01u, 0x01u, 0x01u, 0x01u, 0x01u,
+    0xB6u, 0xD6u, 0xDAu, 0xDAu, 0x01u, 0x01u, 0x01u, 0x01u,
+};
+
+// Precondition: every byte lane in `m` must be strictly 0x00 or 0xFF.
+NEOJSON_ALWAYS_INLINE std::uint64_t neon_movemask4(const uint8x16_t m) noexcept {
+    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0);
+}
+
+NEOJSON_ALWAYS_INLINE bool neon_is_zero(const uint8x16_t v) noexcept {
+    return vmaxvq_u32(vreinterpretq_u32_u8(v)) == 0u;
+}
+
+NEOJSON_ALWAYS_INLINE bool neon_has_high_bit(const uint8x16_t v) noexcept {
+    return vmaxvq_u8(v) >= 0x80u;
+}
+
+NEOJSON_ALWAYS_INLINE void validate_utf8_step_neon(
+    const uint8x16_t p, const uint8x16_t c, uint8x16_t& err) noexcept {
+    const uint8x16_t zero = vdupq_n_u8(0u);
+    const uint8x16_t lut_hi1 = vld1q_u8(kUtf8LutHi1_16);
+    const uint8x16_t lut_lo1 = vld1q_u8(kUtf8LutLo1_16);
+    const uint8x16_t lut_hi2 = vld1q_u8(kUtf8LutHi2_16);
+
+    const uint8x16_t prev1 = vextq_u8(p, c, 15);
+    const uint8x16_t prev2 = vextq_u8(p, c, 14);
+    const uint8x16_t prev3 = vextq_u8(p, c, 13);
+
+    const uint8x16_t hi1 = vshrq_n_u8(prev1, 4);
+    const uint8x16_t lo1 = vandq_u8(prev1, vdupq_n_u8(0x0Fu));
+    const uint8x16_t hi2 = vshrq_n_u8(c, 4);
+
+    const uint8x16_t sc = vandq_u8(
+        vandq_u8(vqtbl1q_u8(lut_hi1, hi1), vqtbl1q_u8(lut_lo1, lo1)),
+        vqtbl1q_u8(lut_hi2, hi2));
+    const uint8x16_t must23 =
+        vorrq_u8(vqsubq_u8(prev2, vdupq_n_u8(0xDFu)), vqsubq_u8(prev3, vdupq_n_u8(0xEFu)));
+    const uint8x16_t must23_80 = vandq_u8(vcgtq_u8(must23, zero), vdupq_n_u8(0x80u));
+    err = vorrq_u8(err, veorq_u8(sc, must23_80));
+}
+
+NEOJSON_ALWAYS_INLINE bool utf8_chunk_valid_neon(const uint8x16_t curr) noexcept {
+    const uint8x16_t zero = vdupq_n_u8(0u);
+    uint8x16_t err = zero;
+    validate_utf8_step_neon(zero, curr, err);
+    return neon_is_zero(err);
+}
+
+struct NeonParserOps {
+    using Mask = std::uint64_t;
+    static constexpr std::size_t kVecBytes = 16u;
+    static constexpr std::size_t kMinLen = 32u;
+
+    static NEOJSON_ALWAYS_INLINE unsigned first_bit(const Mask m) noexcept {
+        return static_cast<unsigned>(__builtin_ctzll(m)) >> 2u;
+    }
+
+    static NEOJSON_ALWAYS_INLINE Mask indent_mask(const unsigned n) noexcept {
+        return kIndentMask64_4bit[n];
+    }
+
+    static NEOJSON_NOINLINE const char* skip_ws_slow(
+        const char* p, const char* const end) noexcept {
+        if (p < end && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
+            return p;
+        }
+        const uint8x16_t v_sp = vdupq_n_u8(static_cast<std::uint8_t>(' '));
+        const uint8x16_t v_nl = vdupq_n_u8(static_cast<std::uint8_t>('\n'));
+        const uint8x16_t v_cr = vdupq_n_u8(static_cast<std::uint8_t>('\r'));
+        const uint8x16_t v_tb = vdupq_n_u8(static_cast<std::uint8_t>('\t'));
+        while (end - p >= 16) {
+            const uint8x16_t v = vld1q_u8(reinterpret_cast<const std::uint8_t*>(p));
+            const uint8x16_t eq1 = vorrq_u8(vceqq_u8(v, v_sp), vceqq_u8(v, v_nl));
+            const uint8x16_t eq2 = vorrq_u8(vceqq_u8(v, v_cr), vceqq_u8(v, v_tb));
+            const Mask non_ws = ~neon_movemask4(vorrq_u8(eq1, eq2));
+            if (non_ws != 0u) {
+                return p + first_bit(non_ws);
+            }
+            p += 16;
+        }
+        while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) {
+            ++p;
+        }
+        return p;
+    }
+
+    static NEOJSON_ALWAYS_INLINE const char* skip_ws_inline(
+        const char* p, const char* const end) noexcept {
+        if (NEOJSON_LIKELY(p < end && static_cast<unsigned char>(*p) > 0x20u)) {
+            return p;
+        }
+        return skip_ws_slow(p, end);
+    }
+
+    static NEOJSON_ALWAYS_INLINE Mask scan_non_space_mask(const char* p) noexcept {
+        const uint8x16_t v_20 = vdupq_n_u8(0x20u);
+        const uint8x16_t v = vld1q_u8(reinterpret_cast<const std::uint8_t*>(p));
+        return ~neon_movemask4(vceqq_u8(v, v_20));
+    }
+
+    static NEOJSON_ALWAYS_INLINE const char* skip_spaces_once(
+        const char* p, const char* const end, IndentSlot& slot) noexcept {
+        if (NEOJSON_LIKELY(end - p >= 16)) {
+            const Mask non_sp = scan_non_space_mask(p);
+            const std::uint32_t k = slot.k;
+            const Mask mask = slot.mask;
+            if (NEOJSON_LIKELY((non_sp & mask) == 0u &&
+                               static_cast<unsigned char>(p[k]) > 0x20u)) {
+                return p + k;
+            }
+            if (NEOJSON_LIKELY(non_sp != 0u)) {
+                const unsigned n = first_bit(non_sp);
+                p += n;
+                if (NEOJSON_LIKELY(static_cast<unsigned char>(*p) > 0x20u)) {
+                    if (n <= 15u) {
+                        slot = IndentSlot{n, kIndentMask64_4bit[n]};
+                    }
+                    return p;
+                }
+                return skip_ws_slow(p, end);
+            }
+            return skip_ws_slow(p + 16, end);
+        }
+        return skip_ws_slow(p, end);
+    }
+
+    static NEOJSON_ALWAYS_INLINE Mask copy_and_scan_key_ascii(
+        const char* p, char* str_cur) noexcept {
+        const uint8x16_t v_quote = vdupq_n_u8(static_cast<std::uint8_t>('"'));
+        const uint8x16_t v_bslash = vdupq_n_u8(static_cast<std::uint8_t>('\\'));
+        const int8x16_t v_1f = vdupq_n_s8(0x1F);
+        const uint8x16_t v = vld1q_u8(reinterpret_cast<const std::uint8_t*>(p));
+        vst1q_u8(reinterpret_cast<std::uint8_t*>(str_cur), v);
+        const uint8x16_t bad = vorrq_u8(
+            vorrq_u8(vceqq_u8(v, v_quote), vceqq_u8(v, v_bslash)),
+            vcleq_s8(vreinterpretq_s8_u8(v), v_1f));
+        return neon_movemask4(bad);
+    }
+
+    static NEOJSON_NOINLINE StrParseRes parse_string_slow(
+        const char* p, const char* const end, char* const dst_start, char* dst,
+        yyjson_val* const out, const bool has_esc_init = false) noexcept {
+        bool has_esc = has_esc_init;
+        if (p < end) {
+            const unsigned char b0 = static_cast<unsigned char>(*p);
+            if (NEOJSON_UNLIKELY(b0 < 0x20u)) {
+                return {nullptr, dst_start};
+            }
+            if (b0 == '\\') {
+                goto handle_escape;
+            }
+        }
+
+        for (;;) {
+            if (end - p >= 16) {
+                const uint8x16_t v_quote = vdupq_n_u8(static_cast<std::uint8_t>('"'));
+                const uint8x16_t v_bslash = vdupq_n_u8(static_cast<std::uint8_t>('\\'));
+                const uint8x16_t v_20 = vdupq_n_u8(0x20u);
+                do {
+                    const uint8x16_t v = vld1q_u8(reinterpret_cast<const std::uint8_t*>(p));
+                    vst1q_u8(reinterpret_cast<std::uint8_t*>(dst), v);
+                    const uint8x16_t q_or_b =
+                        vorrq_u8(vceqq_u8(v, v_quote), vceqq_u8(v, v_bslash));
+                    const uint8x16_t ctrl = vcltq_u8(v, v_20);
+                    const Mask mask = neon_movemask4(vorrq_u8(q_or_b, ctrl));
+                    if (mask == 0u) {
+                        if (neon_has_high_bit(v)) {
+                            if (NEOJSON_UNLIKELY(!utf8_chunk_valid_neon(v))) {
+                                return {nullptr, dst_start};
+                            }
+                            const unsigned char c13 = static_cast<unsigned char>(p[13]);
+                            const unsigned char c14 = static_cast<unsigned char>(p[14]);
+                            const unsigned char c15 = static_cast<unsigned char>(p[15]);
+                            std::size_t adv = 16u;
+                            adv = (c13 >= 0xF0u) ? 13u : adv;
+                            adv = (c14 >= 0xE0u) ? 14u : adv;
+                            adv = (c15 >= 0xC0u) ? 15u : adv;
+                            p += adv;
+                            dst += adv;
+                        } else {
+                            p += 16;
+                            dst += 16;
+                        }
+                        continue;
+                    }
+                    const unsigned n = first_bit(mask);
+                    if (n > 0u) {
+                        const uint8x16_t pmask = vld1q_u8(kUtf8PrefixMask16 + 16u - n);
+                        const uint8x16_t v_pre = vandq_u8(v, pmask);
+                        if (neon_has_high_bit(v_pre) &&
+                            NEOJSON_UNLIKELY(!utf8_chunk_valid_neon(v_pre))) {
+                            return {nullptr, dst_start};
+                        }
+                        p += n;
+                        dst += n;
+                    }
+                    if (NEOJSON_LIKELY(*p == '"')) {
+                        *dst = '\0';
+                        const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
+                        out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
+                                   (has_esc ? YYJSON_SUBTYPE_NONE : YYJSON_SUBTYPE_NOESC);
+                        out->uni.str = dst_start;
+                        return {p + 1, dst + 1};
+                    }
+                    if (NEOJSON_UNLIKELY(*p != '\\')) {
+                        return {nullptr, dst_start};
+                    }
+                    goto handle_escape;
+                } while (end - p >= 16);
+            }
+
+            while (p < end) {
+                const unsigned char b = static_cast<unsigned char>(*p);
+                if (b == '"') {
+                    *dst = '\0';
+                    const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
+                    out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
+                               (has_esc ? YYJSON_SUBTYPE_NONE : YYJSON_SUBTYPE_NOESC);
+                    out->uni.str = dst_start;
+                    return {p + 1, dst + 1};
+                }
+                if (b == '\\') {
+                    goto handle_escape;
+                }
+                if (b >= 0x80u) {
+                    do {
+                        const unsigned char b0 = static_cast<unsigned char>(*p);
+                        if (NEOJSON_LIKELY(end - p >= 4)) {
+                            std::uint32_t u = 0u;
+                            std::memcpy(&u, p, 4u);
+                            if (b0 >= 0xE1u && b0 <= 0xEFu) {
+                                if (b0 == 0xEDu) {
+                                    if (NEOJSON_UNLIKELY((u & 0x00C0E000u) != 0x00808000u)) {
+                                        return {nullptr, dst_start};
+                                    }
+                                } else if (NEOJSON_UNLIKELY((u & 0x00C0C000u) != 0x00808000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 4u);
+                                dst += 3;
+                                p += 3;
+                            } else if (b0 == 0xE0u) {
+                                if (NEOJSON_UNLIKELY((u & 0x00C0E000u) != 0x0080A000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 4u);
+                                dst += 3;
+                                p += 3;
+                            } else if (b0 >= 0xC2u && b0 <= 0xDFu) {
+                                if (NEOJSON_UNLIKELY((u & 0x0000C000u) != 0x00008000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 2u);
+                                dst += 2;
+                                p += 2;
+                            } else if (b0 >= 0xF0u && b0 <= 0xF4u) {
+                                const unsigned char b1 =
+                                    static_cast<unsigned char>((u >> 8u) & 0xFFu);
+                                if (NEOJSON_UNLIKELY((u & 0xC0C00000u) != 0x80800000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                if (b0 == 0xF0u) {
+                                    if (b1 < 0x90u || b1 > 0xBFu) {
+                                        return {nullptr, dst_start};
+                                    }
+                                } else if (b0 == 0xF4u) {
+                                    if ((u & 0x0000F000u) != 0x00008000u) {
+                                        return {nullptr, dst_start};
+                                    }
+                                } else if ((b1 & 0xC0u) != 0x80u) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 4u);
+                                dst += 4;
+                                p += 4;
+                            } else {
+                                return {nullptr, dst_start};
+                            }
+                        } else if (b0 >= 0xC2u && b0 <= 0xDFu) {
+                            if (NEOJSON_UNLIKELY(end - p < 2 ||
+                                                 (static_cast<unsigned char>(p[1]) & 0xC0u) !=
+                                                     0x80u)) {
+                                return {nullptr, dst_start};
+                            }
+                            dst[0] = p[0];
+                            dst[1] = p[1];
+                            dst += 2;
+                            p += 2;
+                        } else if (b0 >= 0xE0u && b0 <= 0xEFu) {
+                            if (NEOJSON_UNLIKELY(end - p < 3)) {
+                                return {nullptr, dst_start};
+                            }
+                            const unsigned char b1 = static_cast<unsigned char>(p[1]);
+                            const unsigned char b2 = static_cast<unsigned char>(p[2]);
+                            if ((b2 & 0xC0u) != 0x80u) {
+                                return {nullptr, dst_start};
+                            }
+                            if (b0 == 0xE0u) {
+                                if (b1 < 0xA0u || b1 > 0xBFu) {
+                                    return {nullptr, dst_start};
+                                }
+                            } else if (b0 == 0xEDu) {
+                                if (b1 < 0x80u || b1 > 0x9Fu) {
+                                    return {nullptr, dst_start};
+                                }
+                            } else if ((b1 & 0xC0u) != 0x80u) {
+                                return {nullptr, dst_start};
+                            }
+                            dst[0] = p[0];
+                            dst[1] = p[1];
+                            dst[2] = p[2];
+                            dst += 3;
+                            p += 3;
+                        } else {
+                            return {nullptr, dst_start};
+                        }
+                    } while (p < end && static_cast<unsigned char>(*p) >= 0x80u);
+                    continue;
+                }
+                if (NEOJSON_UNLIKELY(b < 0x20u)) {
+                    return {nullptr, dst_start};
+                }
+                *dst++ = static_cast<char>(b);
+                ++p;
+            }
+            return {nullptr, dst_start};
+
+        handle_escape:
+            has_esc = true;
+            ++p;
+            if (NEOJSON_UNLIKELY(p >= end)) {
+                return {nullptr, dst_start};
+            }
+            const unsigned char esc = static_cast<unsigned char>(*p++);
+            const char dec = kSimpleEsc.ch[esc];
+            if (NEOJSON_LIKELY(dec != 0)) {
+                *dst++ = dec;
+            } else if (esc == 'u') {
+                if (NEOJSON_UNLIKELY(!decode_unicode_escape(p, end, dst))) {
+                    return {nullptr, dst_start};
+                }
+            } else {
+                return {nullptr, dst_start};
+            }
+        }
+    }
+
+    static NEOJSON_NOINLINE StrParseRes parse_string_utf8(
+        const char* p, const char* const end, char* const dst_start, char* dst,
+        yyjson_val* const out, std::uint8_t subtype) noexcept {
+        const uint8x16_t zero = vdupq_n_u8(0u);
+        const uint8x16_t v_quote = vdupq_n_u8(static_cast<std::uint8_t>('"'));
+        const uint8x16_t v_bslash = vdupq_n_u8(static_cast<std::uint8_t>('\\'));
+        const uint8x16_t v_20 = vdupq_n_u8(0x20u);
+        uint8x16_t prev = zero;
+        uint8x16_t err = zero;
+
+        while (end - p >= 16) {
+            const uint8x16_t v = vld1q_u8(reinterpret_cast<const std::uint8_t*>(p));
+            vst1q_u8(reinterpret_cast<std::uint8_t*>(dst), v);
+            const uint8x16_t q_or_b = vorrq_u8(vceqq_u8(v, v_quote), vceqq_u8(v, v_bslash));
+            const uint8x16_t ctrl = vcltq_u8(v, v_20);
+            const Mask mask = neon_movemask4(vorrq_u8(q_or_b, ctrl));
+            if (mask == 0u) {
+                if (neon_has_high_bit(vorrq_u8(prev, v))) {
+                    validate_utf8_step_neon(prev, v, err);
+                }
+                prev = v;
+                p += 16;
+                dst += 16;
+                continue;
+            }
+            const unsigned n = first_bit(mask);
+            if (n > 0u) {
+                const uint8x16_t pmask = vld1q_u8(kUtf8PrefixMask16 + 16u - n);
+                const uint8x16_t v_pre = vandq_u8(v, pmask);
+                if (neon_has_high_bit(vorrq_u8(prev, v_pre))) {
+                    validate_utf8_step_neon(prev, v_pre, err);
+                }
+                p += n;
+                dst += n;
+            } else if (neon_has_high_bit(prev)) {
+                validate_utf8_step_neon(prev, zero, err);
+            }
+            prev = zero;
+            if (NEOJSON_LIKELY(*p == '"')) {
+                if (NEOJSON_UNLIKELY(!neon_is_zero(err))) {
+                    return {nullptr, dst_start};
+                }
+                *dst = '\0';
+                const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
+                out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
+                out->uni.str = dst_start;
+                return {p + 1, dst + 1};
+            }
+            if (NEOJSON_LIKELY(*p == '\\')) {
+                if (p + 1 < end) {
+                    const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                    if (NEOJSON_LIKELY(ec != 0)) {
+                        *dst++ = ec;
+                        p += 2;
+                        subtype = YYJSON_SUBTYPE_NONE;
+                        continue;
+                    }
+                }
+                if (NEOJSON_UNLIKELY(!neon_is_zero(err))) {
+                    return {nullptr, dst_start};
+                }
+                return parse_string_slow(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+            }
+            return {nullptr, dst_start};
+        }
+
+        if (NEOJSON_UNLIKELY(!neon_is_zero(err))) {
+            return {nullptr, dst_start};
+        }
+        if (neon_has_high_bit(prev)) {
+            std::size_t back = 0u;
+            if (static_cast<unsigned char>(p[-1]) >= 0xC0u) {
+                back = 1u;
+            } else if (static_cast<unsigned char>(p[-2]) >= 0xE0u) {
+                back = 2u;
+            } else if (static_cast<unsigned char>(p[-3]) >= 0xF0u) {
+                back = 3u;
+            }
+            p -= back;
+            dst -= back;
+        }
+        return parse_string_slow(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+    }
+
+    static NEOJSON_NOINLINE StrParseRes parse_string_key_tail(
+        const char* p, const char* const end, char* const dst_start, char* dst,
+        yyjson_val* const out) noexcept {
+        const uint8x16_t v_quote = vdupq_n_u8(static_cast<std::uint8_t>('"'));
+        const uint8x16_t v_bslash = vdupq_n_u8(static_cast<std::uint8_t>('\\'));
+        const int8x16_t v_1f = vdupq_n_s8(0x1F);
+        while (end - p >= 16) {
+            const uint8x16_t vc = vld1q_u8(reinterpret_cast<const std::uint8_t*>(p));
+            vst1q_u8(reinterpret_cast<std::uint8_t*>(dst), vc);
+            const uint8x16_t bad = vorrq_u8(
+                vorrq_u8(vceqq_u8(vc, v_quote), vceqq_u8(vc, v_bslash)),
+                vcleq_s8(vreinterpretq_s8_u8(vc), v_1f));
+            const Mask bm = neon_movemask4(bad);
+            if (bm != 0u) {
+                const unsigned b = first_bit(bm);
+                if (NEOJSON_LIKELY(p[b] == '"')) {
+                    dst[b] = '\0';
+                    const std::size_t slen = static_cast<std::size_t>((dst + b) - dst_start);
+                    out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
+                               YYJSON_SUBTYPE_NOESC;
+                    out->uni.str = dst_start;
+                    return {p + b + 1u, dst + b + 1u};
+                }
+                return parse_string_slow(p + b, end, dst_start, dst + b, out, false);
+            }
+            p += 16;
+            dst += 16;
+        }
+        return parse_string_slow(p, end, dst_start, dst, out, false);
+    }
+
+    static NEOJSON_ALWAYS_INLINE bool parse_string_val_fast(
+        const char*& p_io, const char* const end, char*& str_cur_io,
+        yyjson_val* const out) noexcept {
+        const char* p = p_io;
+        char* const dst_start = str_cur_io;
+        char* dst = dst_start;
+        if (NEOJSON_LIKELY(end - p >= 16)) {
+            const Mask spec_mask = copy_and_scan_key_ascii(p, dst_start);
+            std::uint8_t subtype = YYJSON_SUBTYPE_NOESC;
+            if (spec_mask != 0u) {
+                const unsigned n = first_bit(spec_mask);
+                if (NEOJSON_LIKELY(p[n] == '"')) {
+                    dst_start[n] = '\0';
+                    out->tag = (static_cast<std::uint64_t>(n) << 8u) | YYJSON_TYPE_STR |
+                               YYJSON_SUBTYPE_NOESC;
+                    out->uni.str = dst_start;
+                    p_io = p + n + 1u;
+                    str_cur_io = dst_start + n + 1u;
+                    return true;
+                }
+                p += n;
+                dst = dst_start + n;
+                if (static_cast<unsigned char>(*p) >= 0x80u) {
+                    const StrParseRes sr =
+                        parse_string_utf8(p, end, dst_start, dst, out, YYJSON_SUBTYPE_NOESC);
+                    p_io = sr.p;
+                    str_cur_io = sr.str_cur;
+                    return sr.p != nullptr;
+                }
+                if (*p == '\\' && p + 1 < end) {
+                    const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                    if (NEOJSON_LIKELY(ec != 0)) {
+                        *dst++ = ec;
+                        p += 2;
+                        subtype = YYJSON_SUBTYPE_NONE;
+                    } else {
+                        const StrParseRes sr =
+                            parse_string_slow(p, end, dst_start, dst, out, false);
+                        p_io = sr.p;
+                        str_cur_io = sr.str_cur;
+                        return sr.p != nullptr;
+                    }
+                } else {
+                    const StrParseRes sr = parse_string_slow(p, end, dst_start, dst, out, false);
+                    p_io = sr.p;
+                    str_cur_io = sr.str_cur;
+                    return sr.p != nullptr;
+                }
+            } else {
+                p += 16;
+                dst = dst_start + 16;
+            }
+
+            if (end - p >= 16) {
+                do {
+                    const Mask sm = copy_and_scan_key_ascii(p, dst);
+                    if (sm != 0u) {
+                        const unsigned m = first_bit(sm);
+                        if (NEOJSON_LIKELY(p[m] == '"')) {
+                            dst[m] = '\0';
+                            const std::size_t slen =
+                                static_cast<std::size_t>((dst + m) - dst_start);
+                            out->tag =
+                                (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
+                            out->uni.str = dst_start;
+                            p_io = p + m + 1u;
+                            str_cur_io = dst + m + 1u;
+                            return true;
+                        }
+                        p += m;
+                        dst += m;
+                        if (static_cast<unsigned char>(*p) >= 0x80u) {
+                            const StrParseRes sr =
+                                parse_string_utf8(p, end, dst_start, dst, out, subtype);
+                            p_io = sr.p;
+                            str_cur_io = sr.str_cur;
+                            return sr.p != nullptr;
+                        }
+                        if (*p == '\\' && p + 1 < end) {
+                            const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                            if (NEOJSON_LIKELY(ec != 0)) {
+                                *dst++ = ec;
+                                p += 2;
+                                subtype = YYJSON_SUBTYPE_NONE;
+                                continue;
+                            }
+                        }
+                        const StrParseRes sr = parse_string_slow(
+                            p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+                        p_io = sr.p;
+                        str_cur_io = sr.str_cur;
+                        return sr.p != nullptr;
+                    }
+                    p += 16;
+                    dst += 16;
+                } while (end - p >= 16);
+            }
+            const StrParseRes sr =
+                parse_string_slow(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+            p_io = sr.p;
+            str_cur_io = sr.str_cur;
+            return sr.p != nullptr;
+        }
+        const StrParseRes sr = parse_string_slow(p, end, dst_start, dst, out, false);
+        p_io = sr.p;
+        str_cur_io = sr.str_cur;
+        return sr.p != nullptr;
+    }
+};
+
+#endif // NEOJSON_X86_SIMD / NEOJSON_ARM_NEON
 
 template <typename SimdOps>
 NEOJSON_NOINLINE NEOJSON_PARSER_TARGET int parse_num_pair_run(
@@ -11773,20 +12409,20 @@ NEOJSON_NOINLINE NEOJSON_PARSER_TARGET yyjson_doc* parse_native_simd_impl(
 
 obj_key_begin_spaces:
     if (NEOJSON_LIKELY(end - p >= static_cast<std::ptrdiff_t>(SimdOps::kVecBytes))) {
-        const std::uint32_t non_sp = SimdOps::scan_non_space_mask(p);
+        const typename SimdOps::Mask non_sp = SimdOps::scan_non_space_mask(p);
         IndentSlot& slot = ctx->indent_by_depth[ctx->depth_rem & 15u];
         const std::uint32_t k = slot.k;
-        const std::uint32_t mask = slot.mask;
+        const typename SimdOps::Mask mask = slot.mask;
         if (NEOJSON_LIKELY((non_sp & mask) == 0u && p[k] == '"')) {
             p += k;
             goto obj_key_got_quote;
         }
         if (NEOJSON_LIKELY(non_sp != 0u)) {
-            const unsigned n = static_cast<unsigned>(__builtin_ctz(non_sp));
+            const unsigned n = SimdOps::first_bit(non_sp);
             p += n;
             if (NEOJSON_LIKELY(*p == '"')) {
                 if (n < SimdOps::kVecBytes) {
-                    slot = IndentSlot{n, kIndentMask32[n]};
+                    slot = IndentSlot{n, SimdOps::indent_mask(n)};
                 }
                 goto obj_key_got_quote;
             }
@@ -11827,9 +12463,9 @@ obj_key_got_quote:
     ++p;
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     if (NEOJSON_LIKELY(end - p >= static_cast<std::ptrdiff_t>(SimdOps::kVecBytes + 3u))) {
-        const std::uint32_t spec_mask = SimdOps::copy_and_scan_key_ascii(p, str_cur);
+        const typename SimdOps::Mask spec_mask = SimdOps::copy_and_scan_key_ascii(p, str_cur);
         if (NEOJSON_LIKELY(spec_mask != 0u)) {
-            const unsigned n = static_cast<unsigned>(__builtin_ctz(spec_mask));
+            const unsigned n = SimdOps::first_bit(spec_mask);
             std::uint32_t w4 = 0u;
             std::memcpy(&w4, p + n, 4u);
             if (NEOJSON_LIKELY((w4 & 0x00FFFFFFu) == 0x00203A22u)) {
@@ -11898,9 +12534,9 @@ obj_key_got_quote:
     }
 #else
     if (NEOJSON_LIKELY(end - p >= static_cast<std::ptrdiff_t>(SimdOps::kVecBytes))) {
-        const std::uint32_t spec_mask = SimdOps::copy_and_scan_key_ascii(p, str_cur);
+        const typename SimdOps::Mask spec_mask = SimdOps::copy_and_scan_key_ascii(p, str_cur);
         if (NEOJSON_LIKELY(spec_mask != 0u)) {
-            const unsigned n = static_cast<unsigned>(__builtin_ctz(spec_mask));
+            const unsigned n = SimdOps::first_bit(spec_mask);
             if (NEOJSON_LIKELY(p[n] == '"')) {
                 str_cur[n] = '\0';
                 val->tag = (static_cast<std::uint64_t>(n) << 8u) | YYJSON_TYPE_STR |
@@ -12444,6 +13080,13 @@ inline yyjson_doc* try_parse_native_simd_doc(const std::string_view s,
                        static_cast<unsigned char>(s[0]) != 0xEFu)) {
         ParseRunCtx ctx{};
         return parse_native_simd_impl<Avx2ParserOps>(s.data(), s.size(), max_depth, &ctx);
+    }
+#elif (NEOJSON_NATIVE_PARSER && NEOJSON_ARM_NEON && defined(__aarch64__) && \
+       defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    if (NEOJSON_LIKELY(s.size() >= NeonParserOps::kMinLen && max_depth > 0u &&
+                       static_cast<unsigned char>(s[0]) != 0xEFu)) {
+        ParseRunCtx ctx{};
+        return parse_native_simd_impl<NeonParserOps>(s.data(), s.size(), max_depth, &ctx);
     }
 #else
     (void)s;
