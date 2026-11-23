@@ -4,9 +4,9 @@
 <text x="72" y="42" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="18.5" font-weight="800">JSON Throughput on x86-64 (AVX2)</text>
 <text x="72" y="64" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5">Intel Core i7-8750H (6C/12T, AVX2) · GCC 13.3.0 -O3 -DNDEBUG · 7.94 MB across 4 files · Higher is faster</text>
 <rect x="472" y="21" width="216" height="25" rx="12.5" fill="#431407" stroke="#fb923c" stroke-width="1"/>
-<text x="580" y="37" text-anchor="middle" fill="#fed7aa" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="9.8" font-weight="700">Parse 26.2× vs nlohmann::ordered</text>
+<text x="580" y="37" text-anchor="middle" fill="#fed7aa" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="9.8" font-weight="700">Parse 30.8× vs nlohmann::ordered</text>
 <rect x="698" y="21" width="238" height="25" rx="12.5" fill="#0c4a6e" stroke="#38bdf8" stroke-width="1"/>
-<text x="817" y="37" text-anchor="middle" fill="#bae6fd" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="9.8" font-weight="700">Parse 1.53× · Write 1.46× vs yyjson (C)</text>
+<text x="817" y="37" text-anchor="middle" fill="#bae6fd" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="9.8" font-weight="700">Parse 1.84× · Write 1.42× vs yyjson (C)</text>
 <rect x="24" y="88" width="448" height="244" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
 <text x="40" y="113" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="13.5" font-weight="700">Parse (Aggregate, 4 Files)</text>
 <text x="458" y="113" text-anchor="end" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="10.8" font-weight="600">MB/s · Higher is faster</text>
@@ -23,25 +23,25 @@
 <line x1="322.0" y1="128" x2="322.0" y2="312" stroke="#334155" stroke-width="1" stroke-dasharray="2 3" opacity="0.65"/>
 <text x="160" y="143" text-anchor="end" fill="#ffffff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="700">neojson</text>
 <rect x="168" y="131" width="154.0" height="16" rx="4" fill="#fb923c" stroke="#ffedd5" stroke-width="0.9"/>
-<text x="458" y="143" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">2,180 MB/s (3.64ms)</text>
+<text x="458" y="143" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">2,557 MB/s (3.10ms)</text>
 <text x="160" y="170" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">simdjson (DOM)</text>
-<rect x="168" y="158" width="123.9" height="16" rx="4" fill="#a78bfa"/>
-<text x="458" y="170" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,754 MB/s (4.53ms)</text>
+<rect x="168" y="158" width="107.1" height="16" rx="4" fill="#a78bfa"/>
+<text x="458" y="170" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,779 MB/s (4.46ms)</text>
 <text x="160" y="197" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">yyjson (C)</text>
-<rect x="168" y="185" width="100.7" height="16" rx="4" fill="#38bdf8"/>
-<text x="458" y="197" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,425 MB/s (5.57ms)</text>
+<rect x="168" y="185" width="83.9" height="16" rx="4" fill="#38bdf8"/>
+<text x="458" y="197" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,393 MB/s (5.70ms)</text>
 <text x="160" y="224" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">cpp-yyjson</text>
-<rect x="168" y="212" width="98.2" height="16" rx="4" fill="#2dd4bf"/>
-<text x="458" y="224" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,391 MB/s (5.71ms)</text>
+<rect x="168" y="212" width="83.2" height="16" rx="4" fill="#2dd4bf"/>
+<text x="458" y="224" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,382 MB/s (5.75ms)</text>
 <text x="160" y="251" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">RapidJSON</text>
-<rect x="168" y="239" width="42.3" height="16" rx="4" fill="#60a5fa"/>
-<text x="458" y="251" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">598 MB/s (13.3ms)</text>
+<rect x="168" y="239" width="36.1" height="16" rx="4" fill="#60a5fa"/>
+<text x="458" y="251" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">599 MB/s (13.3ms)</text>
 <text x="160" y="278" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::json</text>
-<rect x="168" y="266" width="6.9" height="16" rx="4" fill="#94a3b8"/>
-<text x="458" y="278" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">97 MB/s (81.6ms)</text>
+<rect x="168" y="266" width="5.8" height="16" rx="4" fill="#94a3b8"/>
+<text x="458" y="278" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">96 MB/s (82.3ms)</text>
 <text x="160" y="305" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::ordered</text>
-<rect x="168" y="293" width="5.9" height="16" rx="4" fill="#64748b"/>
-<text x="458" y="305" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">83 MB/s (95.3ms)</text>
+<rect x="168" y="293" width="5.0" height="16" rx="4" fill="#64748b"/>
+<text x="458" y="305" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">83 MB/s (95.7ms)</text>
 <rect x="488" y="88" width="448" height="244" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
 <text x="504" y="113" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="13.5" font-weight="700">Parse + Full Traversal Read</text>
 <text x="922" y="113" text-anchor="end" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="10.8" font-weight="600">MB/s · Higher is faster</text>
@@ -56,27 +56,27 @@
 <line x1="709.0" y1="128" x2="709.0" y2="312" stroke="#334155" stroke-width="1" stroke-dasharray="2 3" opacity="0.65"/>
 <line x1="747.5" y1="128" x2="747.5" y2="312" stroke="#334155" stroke-width="1" stroke-dasharray="2 3" opacity="0.65"/>
 <line x1="786.0" y1="128" x2="786.0" y2="312" stroke="#334155" stroke-width="1" stroke-dasharray="2 3" opacity="0.65"/>
-<text x="624" y="143" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">simdjson (DOM)</text>
-<rect x="632" y="131" width="154.0" height="16" rx="4" fill="#a78bfa"/>
-<text x="922" y="143" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,379 MB/s (5.75ms)</text>
-<text x="624" y="170" text-anchor="end" fill="#ffffff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="700">neojson</text>
-<rect x="632" y="158" width="149.2" height="16" rx="4" fill="#fb923c" stroke="#ffedd5" stroke-width="0.9"/>
-<text x="922" y="170" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">1,336 MB/s (5.94ms)</text>
-<text x="624" y="197" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">yyjson (C)</text>
-<rect x="632" y="185" width="136.6" height="16" rx="4" fill="#38bdf8"/>
-<text x="922" y="197" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,224 MB/s (6.49ms)</text>
-<text x="624" y="224" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">cpp-yyjson</text>
-<rect x="632" y="212" width="134.2" height="16" rx="4" fill="#2dd4bf"/>
-<text x="922" y="224" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,202 MB/s (6.60ms)</text>
+<text x="624" y="143" text-anchor="end" fill="#ffffff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="700">neojson</text>
+<rect x="632" y="131" width="154.0" height="16" rx="4" fill="#fb923c" stroke="#ffedd5" stroke-width="0.9"/>
+<text x="922" y="143" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">1,498 MB/s (5.30ms)</text>
+<text x="624" y="170" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">simdjson (DOM)</text>
+<rect x="632" y="158" width="144.4" height="16" rx="4" fill="#a78bfa"/>
+<text x="922" y="170" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,404 MB/s (5.65ms)</text>
+<text x="624" y="197" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">cpp-yyjson</text>
+<rect x="632" y="185" width="122.9" height="16" rx="4" fill="#2dd4bf"/>
+<text x="922" y="197" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,196 MB/s (6.64ms)</text>
+<text x="624" y="224" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">yyjson (C)</text>
+<rect x="632" y="212" width="122.3" height="16" rx="4" fill="#38bdf8"/>
+<text x="922" y="224" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,189 MB/s (6.67ms)</text>
 <text x="624" y="251" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">RapidJSON</text>
-<rect x="632" y="239" width="62.9" height="16" rx="4" fill="#60a5fa"/>
+<rect x="632" y="239" width="58.0" height="16" rx="4" fill="#60a5fa"/>
 <text x="922" y="251" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">564 MB/s (14.1ms)</text>
 <text x="624" y="278" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::json</text>
-<rect x="632" y="266" width="10.5" height="16" rx="4" fill="#94a3b8"/>
-<text x="922" y="278" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">94 MB/s (84.1ms)</text>
+<rect x="632" y="266" width="9.7" height="16" rx="4" fill="#94a3b8"/>
+<text x="922" y="278" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">94 MB/s (84.4ms)</text>
 <text x="624" y="305" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::ordered</text>
-<rect x="632" y="293" width="9.1" height="16" rx="4" fill="#64748b"/>
-<text x="922" y="305" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">82 MB/s (97.1ms)</text>
+<rect x="632" y="293" width="8.4" height="16" rx="4" fill="#64748b"/>
+<text x="922" y="305" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">81 MB/s (97.5ms)</text>
 <rect x="24" y="344" width="448" height="244" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
 <text x="40" y="369" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="13.5" font-weight="700">Serialize / Write (Minified)</text>
 <text x="458" y="369" text-anchor="end" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="10.8" font-weight="600">MB/s · Higher is faster</text>
@@ -93,25 +93,25 @@
 <line x1="322.0" y1="384" x2="322.0" y2="568" stroke="#334155" stroke-width="1" stroke-dasharray="2 3" opacity="0.65"/>
 <text x="160" y="399" text-anchor="end" fill="#ffffff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="700">neojson</text>
 <rect x="168" y="387" width="154.0" height="16" rx="4" fill="#fb923c" stroke="#ffedd5" stroke-width="0.9"/>
-<text x="458" y="399" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">2,553 MB/s (3.11ms)</text>
-<text x="160" y="426" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">cpp-yyjson</text>
-<rect x="168" y="414" width="109.0" height="16" rx="4" fill="#2dd4bf"/>
-<text x="458" y="426" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,807 MB/s (4.39ms)</text>
-<text x="160" y="453" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">yyjson (C)</text>
-<rect x="168" y="441" width="105.3" height="16" rx="4" fill="#38bdf8"/>
-<text x="458" y="453" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,745 MB/s (4.55ms)</text>
+<text x="458" y="399" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">2,574 MB/s (3.08ms)</text>
+<text x="160" y="426" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">yyjson (C)</text>
+<rect x="168" y="414" width="108.3" height="16" rx="4" fill="#38bdf8"/>
+<text x="458" y="426" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,810 MB/s (4.39ms)</text>
+<text x="160" y="453" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">cpp-yyjson</text>
+<rect x="168" y="441" width="105.0" height="16" rx="4" fill="#2dd4bf"/>
+<text x="458" y="453" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,755 MB/s (4.52ms)</text>
 <text x="160" y="480" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">simdjson (DOM)</text>
-<rect x="168" y="468" width="96.5" height="16" rx="4" fill="#a78bfa"/>
-<text x="458" y="480" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,600 MB/s (4.96ms)</text>
+<rect x="168" y="468" width="96.0" height="16" rx="4" fill="#a78bfa"/>
+<text x="458" y="480" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">1,604 MB/s (4.95ms)</text>
 <text x="160" y="507" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">RapidJSON</text>
-<rect x="168" y="495" width="43.2" height="16" rx="4" fill="#60a5fa"/>
+<rect x="168" y="495" width="42.8" height="16" rx="4" fill="#60a5fa"/>
 <text x="458" y="507" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">716 MB/s (11.1ms)</text>
-<text x="160" y="534" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::json</text>
-<rect x="168" y="522" width="18.8" height="16" rx="4" fill="#94a3b8"/>
-<text x="458" y="534" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">311 MB/s (25.5ms)</text>
-<text x="160" y="561" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::ordered</text>
-<rect x="168" y="549" width="16.9" height="16" rx="4" fill="#64748b"/>
-<text x="458" y="561" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">280 MB/s (28.4ms)</text>
+<text x="160" y="534" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::ordered</text>
+<rect x="168" y="522" width="19.2" height="16" rx="4" fill="#64748b"/>
+<text x="458" y="534" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">321 MB/s (24.7ms)</text>
+<text x="160" y="561" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::json</text>
+<rect x="168" y="549" width="16.6" height="16" rx="4" fill="#94a3b8"/>
+<text x="458" y="561" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">277 MB/s (28.6ms)</text>
 <rect x="488" y="344" width="448" height="244" rx="12" fill="#1e293b" stroke="#334155" stroke-width="1"/>
 <text x="504" y="369" fill="#f8fafc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="13.5" font-weight="700">Field Lookup (twitter.json)</text>
 <text x="922" y="369" text-anchor="end" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="10.8" font-weight="600">K ops/s · Higher is faster</text>
@@ -128,25 +128,25 @@
 <line x1="786.0" y1="384" x2="786.0" y2="568" stroke="#334155" stroke-width="1" stroke-dasharray="2 3" opacity="0.65"/>
 <text x="624" y="399" text-anchor="end" fill="#ffffff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="700">neojson</text>
 <rect x="632" y="387" width="154.0" height="16" rx="4" fill="#fb923c" stroke="#ffedd5" stroke-width="0.9"/>
-<text x="922" y="399" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">168.6 K/s (5.93µs)</text>
+<text x="922" y="399" text-anchor="end" fill="#fdba74" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="700">161.0 K/s (6.21µs)</text>
 <text x="624" y="426" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::ordered</text>
-<rect x="632" y="414" width="108.9" height="16" rx="4" fill="#64748b"/>
-<text x="922" y="426" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">119.2 K/s (8.39µs)</text>
+<rect x="632" y="414" width="118.3" height="16" rx="4" fill="#64748b"/>
+<text x="922" y="426" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">123.6 K/s (8.09µs)</text>
 <text x="624" y="453" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">RapidJSON</text>
-<rect x="632" y="441" width="96.1" height="16" rx="4" fill="#60a5fa"/>
-<text x="922" y="453" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">105.2 K/s (9.50µs)</text>
+<rect x="632" y="441" width="100.8" height="16" rx="4" fill="#60a5fa"/>
+<text x="922" y="453" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">105.4 K/s (9.49µs)</text>
 <text x="624" y="480" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">yyjson (C)</text>
-<rect x="632" y="468" width="90.4" height="16" rx="4" fill="#38bdf8"/>
-<text x="922" y="480" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">99.0 K/s (10.10µs)</text>
+<rect x="632" y="468" width="93.0" height="16" rx="4" fill="#38bdf8"/>
+<text x="922" y="480" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">97.3 K/s (10.28µs)</text>
 <text x="624" y="507" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">cpp-yyjson</text>
-<rect x="632" y="495" width="81.9" height="16" rx="4" fill="#2dd4bf"/>
-<text x="922" y="507" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">89.6 K/s (11.16µs)</text>
+<rect x="632" y="495" width="84.7" height="16" rx="4" fill="#2dd4bf"/>
+<text x="922" y="507" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">88.5 K/s (11.30µs)</text>
 <text x="624" y="534" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">simdjson (DOM)</text>
-<rect x="632" y="522" width="68.0" height="16" rx="4" fill="#a78bfa"/>
-<text x="922" y="534" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">74.5 K/s (13.43µs)</text>
+<rect x="632" y="522" width="72.9" height="16" rx="4" fill="#a78bfa"/>
+<text x="922" y="534" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">76.2 K/s (13.12µs)</text>
 <text x="624" y="561" text-anchor="end" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11.5" font-weight="500">nlohmann::json</text>
-<rect x="632" y="549" width="33.3" height="16" rx="4" fill="#94a3b8"/>
-<text x="922" y="561" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">36.4 K/s (27.45µs)</text>
+<rect x="632" y="549" width="35.5" height="16" rx="4" fill="#94a3b8"/>
+<text x="922" y="561" text-anchor="end" fill="#e2e8f0" font-family="'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.2" font-weight="500">37.1 K/s (26.94µs)</text>
 <rect x="24" y="600" width="912" height="54" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1"/>
 <circle cx="40" cy="615.5" r="4.8" fill="#fb923c"/>
 <text x="50" y="619.5" fill="#fed7aa" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'DejaVu Sans', Arial, sans-serif" font-size="11" font-weight="700">neojson (ordered DOM)</text>
