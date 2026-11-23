@@ -492,4 +492,159 @@ TEST(DumpNumbersAndSwar, FloatPairRunsAndFractionalSwarMatchOracleBitExact) {
     }
 }
 
+TEST(DumpNumbersAndSwar, SimdParser16ByteBoundaryUtf8AndIndentParity) {
+    // 1. Key and string value lengths 0..68 covering 16B and 32B vector boundaries.
+    for (std::size_t len = 0u; len <= 68u; ++len) {
+        const std::string ascii_key = "k" + std::string(len, 'x');
+        const std::string ascii_val(len, 'a');
+        const std::string doc1 =
+            "{\"" + ascii_key + "\":\"" + ascii_val + "\",\"tail\":\"01234567890123456789\"}";
+        ASSERT_GE(doc1.size(), 32u);
+        neojson::test::assert_equivalent(oj::parse(doc1), jk::parse(doc1));
+        EXPECT_EQ(jk::parse(doc1).dump(), oj::parse(doc1).dump());
+
+        const std::string esc_doc =
+            "{\"k" + std::string(len, 'b') + "\":\"" + std::string(len, 'c') +
+            "\\\"\\\\\\n\\r\\t\\u00e9\\uD83D\\uDE00tail\"}";
+        neojson::test::assert_equivalent(oj::parse(esc_doc), jk::parse(esc_doc));
+        EXPECT_EQ(jk::parse(esc_doc).dump(), oj::parse(esc_doc).dump());
+
+        // 2, 3, and 4-byte UTF-8 straddling every offset across 16B and 32B boundaries:
+        // both entered mid-string (`utf8_doc`) and entered at offset 0 (`utf8_stream`)
+        // so parse_string_utf8 processes prev != zero chunks AND p[-1..-3] tail retreats,
+        // plus escape-entered parse_string_slow (`slow_retreat`) across c13..c15 / c29..c31.
+        const std::string pad_before(len, 'p');
+        const std::string u2 = "\xC3\xA9";          // e-acute
+        const std::string u3 = "\xE2\x82\xAC";      // euro sign
+        const std::string u4 = "\xF0\x9F\x98\x80";  // grinning face
+        const std::string utf8_doc =
+            "{\"u" + std::to_string(len) + "\":\"" + pad_before + u2 + "q" + u3 + "r" + u4 +
+            "\",\"" + pad_before + u3 + "\":\"" + pad_before + u4 + u2 + "z\",\"pad\":\"" +
+            std::string(36u, 'm') + "\"}";
+        ASSERT_GE(utf8_doc.size(), 32u);
+        neojson::test::assert_equivalent(oj::parse(utf8_doc), jk::parse(utf8_doc));
+        EXPECT_EQ(jk::parse(utf8_doc).dump(), oj::parse(utf8_doc).dump());
+
+        const std::string utf8_stream =
+            "{\"" + u2 + pad_before + u3 + "a\":\"" + u2 + pad_before + u4 + u3 + u2 +
+            std::string(8u, 'q') + "\",\"tail\":\"" + std::string(36u, 'm') + "\"}";
+        ASSERT_GE(utf8_stream.size(), 32u);
+        neojson::test::assert_equivalent(oj::parse(utf8_stream), jk::parse(utf8_stream));
+        EXPECT_EQ(jk::parse(utf8_stream).dump(), oj::parse(utf8_stream).dump());
+
+        const std::string slow_retreat =
+            "{\"s\":\"\\n" + std::string(len, 's') + u2 + u3 + u4 + std::string(20u, 't') +
+            "\"}";
+        ASSERT_GE(slow_retreat.size(), 32u);
+        neojson::test::assert_equivalent(oj::parse(slow_retreat), jk::parse(slow_retreat));
+        EXPECT_EQ(jk::parse(slow_retreat).dump(), oj::parse(slow_retreat).dump());
+    }
+
+    // Valid multi-byte UTF-8 characters split at the final 16B/32B loop exit (<16B / <32B left
+    // in string OR EOF), exercising parse_string_utf8 p[-1..-3] retreat back into scalar tail.
+    const std::string u2 = "\xC3\xA9";
+    const std::string u3 = "\xE2\x82\xAC";
+    const std::string u4 = "\xF0\x9F\x98\x80";
+    for (const std::size_t chunk_ofs : {13u, 14u, 15u, 16u, 29u, 30u, 31u, 32u}) {
+        const std::string str_core = u2 + std::string(chunk_ofs - 2u, 'a');
+        for (const std::string& mb : {u2, u3, u4}) {
+            for (const std::string& suf : {std::string(""), std::string("z"), std::string("\xC3\xA9")}) {
+                // Closing quote right after mb+suf leaves <16B / <32B at EOF inside string.
+                const std::string s = str_core + mb + suf;
+                const std::string valid_tail = "{\"pad\":\"" + std::string(20u, 'v') + "\",\"u\":\"" + s + "\"}";
+                ASSERT_GE(valid_tail.size(), 32u);
+                neojson::test::assert_equivalent(oj::parse(valid_tail), jk::parse(valid_tail));
+                EXPECT_EQ(jk::parse(valid_tail).dump(), oj::parse(valid_tail).dump());
+
+                // Same split sequence truncated at EOF (missing closing quote) must fail cleanly.
+                const std::string eof_split = "{\"pad\":\"" + std::string(20u, 'v') + "\",\"u\":\"" + s;
+                ASSERT_GE(eof_split.size(), 32u);
+                EXPECT_FALSE(jk::accept(eof_split));
+                EXPECT_FALSE(oj::accept(eof_split));
+            }
+        }
+    }
+
+    // 2. Malformed UTF-8 and raw control bytes across offsets 0..33 (all >= 32B),
+    //    both ASCII-prefixed and UTF-8-streamed (`\xC3\xA9` prefix so prev != zero across boundaries).
+    const std::vector<std::size_t> offsets = {0u, 1u, 13u, 14u, 15u, 16u, 17u, 30u, 31u, 32u};
+    const std::vector<std::string> bad_seqs = {
+        "\xC0\x80",                 // overlong 2-byte
+        "\xE0\x80\x80",             // overlong 3-byte
+        "\xF0\x80\x80\x80",         // overlong 4-byte
+        "\xED\xA0\x80",             // UTF-16 high surrogate
+        "\xF4\x90\x80\x80",         // > U+10FFFF
+        "\x80",                     // stray continuation
+        "\xC2",                     // truncated 2-byte before closing quote or escape
+        "\xE2\x82",                 // truncated 3-byte before closing quote or escape
+        "\xF0\x9F\x98",             // truncated 4-byte before closing quote or escape
+        std::string(1u, '\x00'),    // raw NUL control byte
+        std::string(1u, '\x1F'),    // raw 0x1F control byte
+    };
+    for (const std::size_t ofs : offsets) {
+        for (const bool stream_utf8 : {false, true}) {
+            const std::string prefix = stream_utf8 ? (u2 + std::string(ofs, 'a')) : std::string(ofs, 'a');
+            for (const std::string& seq : bad_seqs) {
+                const std::string close_quote =
+                    "{\"s\":\"" + prefix + seq + "\",\"tail\":\"012345678901234567890123456789\"}";
+                ASSERT_GE(close_quote.size(), 32u);
+                EXPECT_FALSE(jk::accept(close_quote)) << "ofs=" << ofs;
+                EXPECT_FALSE(oj::accept(close_quote)) << "ofs=" << ofs;
+
+                const std::string before_esc =
+                    "{\"s\":\"" + prefix + seq + "\\n\",\"tail\":\"012345678901234567890123456789\"}";
+                ASSERT_GE(before_esc.size(), 32u);
+                EXPECT_FALSE(jk::accept(before_esc)) << "ofs=" << ofs;
+                EXPECT_FALSE(oj::accept(before_esc)) << "ofs=" << ofs;
+
+                const std::string before_quote_end =
+                    "{\"padding\":\"01234567890123456789\",\"s\":\"" + prefix + seq + "\"";
+                ASSERT_GE(before_quote_end.size(), 32u);
+                EXPECT_FALSE(jk::accept(before_quote_end)) << "ofs=" << ofs;
+                EXPECT_FALSE(oj::accept(before_quote_end)) << "ofs=" << ofs;
+            }
+            const std::string eof_trunc =
+                "{\"padding\":\"01234567890123456789\",\"s\":\"" + prefix + "\xE2\x82";
+            ASSERT_GE(eof_trunc.size(), 32u);
+            EXPECT_FALSE(jk::accept(eof_trunc)) << "ofs=" << ofs;
+            EXPECT_FALSE(oj::accept(eof_trunc)) << "ofs=" << ofs;
+        }
+    }
+
+    // 3. Indentation slot widths across 0..40 spaces (hitting 16B and 32B boundaries),
+    //    plus IndentSlot re-learning on `\n` / `,\n` indent changes & space-then-tab fallback.
+    const std::vector<int> indents = {0, 1, 2, 4, 8, 15, 16, 17, 31, 32, 33, 40};
+    for (const int ind : indents) {
+        const std::string sp(static_cast<std::size_t>(ind), ' ');
+        const std::string pretty =
+            "{\n" + sp + "\"first\": [\n" + sp + sp + "1,\n" + sp + sp + "2,\n" + sp + sp +
+            "\"val_" + std::to_string(ind) + "\"\n" + sp + "],\n" + sp + "\"nested\": {\n" +
+            sp + sp + "\"ok\": true,\n" + sp + sp + "\"pad\": \"0123456789abcdef\"\n" + sp +
+            "}\n}\n";
+        ASSERT_GE(pretty.size(), 32u);
+        neojson::test::assert_equivalent(oj::parse(pretty), jk::parse(pretty));
+        EXPECT_EQ(jk::parse(pretty).dump(), oj::parse(pretty).dump());
+    }
+    const std::string relearn_ws =
+        "{\n" +
+        std::string(17u, ' ') + "\"a\": [\n" + std::string(4u, ' ') + "1,\n" +
+        std::string(15u, ' ') + "2,\n" + std::string(33u, ' ') + "3\n" +
+        std::string(4u, ' ') + "],\n" +
+        std::string(4u, ' ') + "\"b\": 1,\n" +
+        std::string(15u, ' ') + "\"c\": 2,\n" +
+        std::string(33u, ' ') + "\"d\": 3,\n" +
+        "  \t  \"e\": 4,\n" +
+        std::string(16u, ' ') + "\"f\": \"abcdef0123456789\"\n" +
+        "}\n";
+    ASSERT_GE(relearn_ws.size(), 32u);
+    neojson::test::assert_equivalent(oj::parse(relearn_ws), jk::parse(relearn_ws));
+    EXPECT_EQ(jk::parse(relearn_ws).dump(), oj::parse(relearn_ws).dump());
+
+    const std::string mixed_ws =
+        "{\r\n\t \t  \"k1\" :\r\n\t\t[ 1 , 2 ,\r\n\t\t\t\"abcdef0123456789\" ]\r\n}";
+    ASSERT_GE(mixed_ws.size(), 32u);
+    neojson::test::assert_equivalent(oj::parse(mixed_ws), jk::parse(mixed_ws));
+    EXPECT_EQ(jk::parse(mixed_ws).dump(), oj::parse(mixed_ws).dump());
+}
+
 } // namespace
