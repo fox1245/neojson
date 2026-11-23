@@ -118,6 +118,30 @@ Each cell reports `throughput (median time, ratio vs yyjson C)`. Ratios `< 1.00�
 
 ---
 
+## Why `neojson` Outperforms `yyjson` (C)
+
+A C++ `nlohmann::ordered_json` wrapper beating the C `yyjson` baseline on parse (`1.53×` on x86-64), write (`1.46×` x86-64 / `1.27×` ARM64), and lookup (`1.70×` x86-64 / `1.27×` ARM64) comes from four architectural choices in [`src/json.cpp`](../src/json.cpp) and [`include/neojson/json.hpp`](../include/neojson/json.hpp):
+
+1. **Native AVX2/SWAR Parser & Pooled Buffers (Parse)**:
+   - On x86-64 hosts with runtime-detected AVX2, standard JSON inputs (`>= 32 B`, no comments or UTF-8 BOM) bypass `yyjson_read()` via `try_parse_native_simd_doc()` → `parse_native_simd_avx2()`. That path performs 32-byte AVX2 whitespace/string/Keiser-Lemire UTF-8 scanning, SWAR 4/8-digit integer conversion, and Eisel-Lemire float parsing into a flat `yyjson_doc`-compatible layout.
+   - Both native AVX2 parses and `yyjson` fallbacks draw large value/string pools from a bounded thread-local buffer cache (`ThreadLargeCache` via `yyjson_parse_alc()`), eliminating repeated OS `malloc`/`free` calls across parses while remaining boundable and reclaimable via `neojson::set_thread_cache_limits()` and `neojson::trim_thread_caches()`.
+   - Because `NEOJSON_X86_SIMD` is currently `0` on `__aarch64__`, ARM64 uses the vendored `yyjson` scalar parser with that pooled allocator — explaining why ARM64 parse throughput (`1,115 MB/s`) sits within `2.5%` of `yyjson (C)` (`1,145 MB/s`) instead of pulling ahead.
+
+2. **Lazy Copy-on-Write DOM vs Eager Tree Materialization (Parse & Read)**:
+   - `json::parse()` returns a 16-byte lazy handle referencing the flat parsed document rather than eagerly allocating `std::map`/`std::vector`/`std::string` nodes (`nlohmann::ordered_json` allocates per node, hence `83 MB/s` vs `2,180 MB/s`).
+   - Read-only traversal (`cbegin()`/`cend()`, `const` indexing) materializes a compact bump-allocated `DocArena` view on demand (`lazy_materialize_arena()` with key interning and `ArenaShapeCache` shape reuse), while owned mutable containers are only materialized when mutated. Even when paying full read traversal (`Parse + Full Traversal Read`), x86-64 stays faster than C `yyjson` (`1,336` vs `1,224 MB/s`).
+
+3. **Flat Direct Serializer into the Output `std::string` (Write)**:
+   - `bench_yyjson` calls `yyjson_write()` (which allocates a C buffer with `malloc`), copies it into `std::string`, and calls `free()`.
+   - For unmaterialized lazy objects/arrays, `neojson::json::dump()` runs `try_dump_yyjson_direct()` → `dump_yyjson_direct_flat()`, streaming through an 8 KiB stack staging buffer straight into a pre-reserved `std::string` (sized from `yyjson_doc_get_read_size()`), using `YYJSON_SUBTYPE_NOESC` fast paths, consecutive numeric-pair runs (helpful on `canada.json`), and AVX2 escape checks on x86-64.
+   - On the first dump/arena view of a root parsed document, `neojson` records whether all object keys are duplicate-free (`tree_unique_verified`), so subsequent timed `dump()` calls skip duplicate-key scanning (matching `yyjson_write`, which does not check duplicates). Note that even on ARM64 without x86 AVX2, `neojson` still writes **1.27× faster** than `yyjson (C)` (`1,702` vs `1,337 MB/s`).
+
+4. **Contiguous Keys & Lazy Open-Addressed Hash Index (Field Lookup)**:
+   - `yyjson` immutable objects are stored as flat preorder key/value arrays without a hash index, so `yyjson_obj_getn()` performs an `O(N)` linear scan per key lookup (stepping over nested subtrees via `uni.ofs` and dereferencing each key's string pointer).
+   - `neojson`'s `ArenaObject` stores keys in a contiguous array (cache-friendly linear comparison up to 16 keys, `kOrderedMapHashThreshold`) and lazily builds a compact open-addressed `ArenaHashIndex` above 16 keys — turning `twitter.json` repeated lookups into `O(1)` (`168.6 K/s` / `5.93 µs` on x86-64 and `124.8 K/s` / `8.02 µs` on ARM64).
+
+---
+
 ## Methodology & Fairness Details
 
 1. **Process & Symbol Isolation**: `bench/CMakeLists.txt` builds seven independent executables (`bench_neojson`, `bench_yyjson`, `bench_simdjson`, `bench_cppyyjson`, `bench_rapidjson`, `bench_nlohmann_json`, `bench_nlohmann_ordered`) so no binary ever links two copies of `yyjson` or shares allocator/global state across libraries.
