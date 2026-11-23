@@ -40,7 +40,7 @@ jobs:
       # The sanitizers slow the large-input parse tests down many times, so these jobs check their results and leave
       # their time bounds to the Release jobs below.
       - name: Configure (Debug, sanitizers ${{ matrix.sanitize }})
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=${{ matrix.sanitize }} -DNEOJSON_TEST_TIME_BOUNDS=OFF
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DNEOJSON_SANITIZE=${{ matrix.sanitize }} -DNEOJSON_TEST_TIME_BOUNDS=OFF -DNEOJSON_BUILD_EXAMPLES=ON
       - name: Show the compiler and the flags the build uses
         run: grep -E 'CMAKE_CXX_COMPILER:|NEOJSON_SANITIZE:' build/CMakeCache.txt
       - name: Build
@@ -67,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure (Release)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNEOJSON_BUILD_EXAMPLES=ON
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Test

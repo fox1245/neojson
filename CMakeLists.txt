@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(neojson VERSION 0.0.1 LANGUAGES C CXX)
 
 option(NEOJSON_BUILD_TESTS "Build the tests (differential tests need nlohmann/json, fetched at configure time)" ON)
+option(NEOJSON_BUILD_EXAMPLES "Build the example programs" OFF)
 option(NEOJSON_SANITIZE "Build everything with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(NEOJSON_TEST_TIME_BOUNDS
     "Give the large-input parse tests a short CTest timeout, so that a cost that grows with the square of the input fails them (turn OFF for sanitizer builds, which run them several hundred times slower and should check results only)"
@@ -68,4 +69,9 @@ if(NEOJSON_BUILD_TESTS)
     else()
         gtest_discover_tests(neojson_bounds_tests DISCOVERY_TIMEOUT 120)
     endif()
+endif()
+
+if(NEOJSON_BUILD_EXAMPLES)
+    enable_testing()
+    add_subdirectory(examples)
 endif()
