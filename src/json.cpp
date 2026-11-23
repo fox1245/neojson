@@ -126,8 +126,16 @@ inline void flush_doc_credit_for_teardown() noexcept;
 
 inline constexpr std::uint32_t kNumSizeClasses = static_cast<std::uint32_t>(kTCacheClasses);
 inline constexpr std::size_t kMaxPooledSize = kTCacheMaxBytes;
-inline constexpr std::uint32_t kMaxCachedEmptySlabs = 64u;
 inline constexpr std::uint32_t kReclaimScanLimit = 8u;
+
+inline std::atomic<std::size_t> g_large_cache_max_entry_bytes{
+    thread_cache_limits::default_large_cache_max_entry_bytes};
+inline std::atomic<std::size_t> g_large_cache_max_total_bytes{
+    thread_cache_limits::default_large_cache_max_total_bytes};
+inline std::atomic<std::uint32_t> g_max_cached_empty_slabs{
+    thread_cache_limits::default_max_cached_empty_slabs};
+inline std::atomic<bool> g_enable_string_pool{
+    thread_cache_limits::default_enable_string_pool};
 
 inline std::atomic<std::uint64_t> g_next_pool_id{0u};
 
@@ -356,7 +364,8 @@ struct ThreadPool {
         : owner_id(g_next_pool_id.fetch_add(1u, std::memory_order_relaxed) + 1u) {}
 
     void recycle_empty_slab(SlabHeader* s) noexcept {
-        if (empty_count < kMaxCachedEmptySlabs) {
+        const std::uint32_t max_empty = g_max_cached_empty_slabs.load(std::memory_order_relaxed);
+        if (empty_count < max_empty) {
             s->next = empty_slabs;
             empty_slabs = s;
             ++empty_count;
@@ -366,14 +375,18 @@ struct ThreadPool {
         }
     }
 
-    void teardown() noexcept {
-        while (empty_slabs != nullptr) {
+    void trim_empty_slabs(const std::uint32_t max_keep) noexcept {
+        while (empty_count > max_keep && empty_slabs != nullptr) {
             SlabHeader* s = empty_slabs;
             empty_slabs = s->next;
+            --empty_count;
             s->~SlabHeader();
             free_aligned_64k(s);
         }
-        empty_count = 0u;
+    }
+
+    void teardown() noexcept {
+        trim_empty_slabs(0u);
 
         auto release_list = [](SlabHeader* cur) noexcept {
             while (cur != nullptr) {
@@ -497,10 +510,10 @@ inline thread_local ThreadPool* t_pool = nullptr;
 inline thread_local bool t_pool_dead = false;
 inline thread_local ThreadPoolGuard t_pool_guard{};
 
-ThreadPoolGuard::~ThreadPoolGuard() {
-    armed = false;
-    flush_doc_credit_for_teardown();
-    t_slab_cache.owner_id = 0u;
+inline void flush_slab_fast_bins(const bool clear_owner_id) noexcept {
+    if (clear_owner_id) {
+        t_slab_cache.owner_id = 0u;
+    }
     for (std::size_t cls = 0u; cls < kTCacheClasses; ++cls) {
         SlabFastBin& fbin = t_slab_cache.bins[cls];
         if (fbin.active != nullptr) {
@@ -527,6 +540,48 @@ ThreadPoolGuard::~ThreadPoolGuard() {
         fbin.free_head = nullptr;
         fbin.active = nullptr;
     }
+}
+
+inline void trim_slab_pool_all() noexcept {
+    ThreadPool* const tp = t_pool;
+    if (tp == nullptr || t_pool_dead) {
+        return;
+    }
+    flush_slab_fast_bins(false);
+    for (SlabBin& sbin : tp->bins) {
+        for (SlabHeader* s = sbin.head; s != nullptr;) {
+            SlabHeader* next_s = s->next;
+            drain_remote(s);
+            if (s->hdr.local_used == 0u) {
+                list_erase(sbin.head, s);
+                s->~SlabHeader();
+                free_aligned_64k(s);
+            }
+            s = next_s;
+        }
+        for (SlabHeader* s = sbin.full_head; s != nullptr;) {
+            SlabHeader* next_s = s->next;
+            drain_remote(s);
+            if (s->hdr.local_used == 0u) {
+                queue_erase(sbin.full_head, sbin.full_tail, s);
+                s->hdr.in_full = 0u;
+                s->~SlabHeader();
+                free_aligned_64k(s);
+            } else if (s->hdr.local_free != nullptr) {
+                queue_erase(sbin.full_head, sbin.full_tail, s);
+                s->hdr.in_full = 0u;
+                list_push(sbin.head, s);
+            }
+            s = next_s;
+        }
+    }
+    tp->trim_empty_slabs(0u);
+}
+
+ThreadPoolGuard::~ThreadPoolGuard() {
+    armed = false;
+    flush_doc_credit_for_teardown();
+    flush_slab_fast_bins(true);
     t_pool_dead = true;
     ThreadPool* tp = t_pool;
     t_pool = nullptr;
@@ -757,6 +812,22 @@ void pool_free_slow(void* p, const std::uint32_t /*cls*/) noexcept {
 
 namespace {
 
+inline void flush_doc_credit_live() noexcept {
+    ThreadDocCredit& tc = t_doc_credit;
+    while (!tc.dead && tc.doc != nullptr) {
+        SharedDocHeader* doc = tc.doc;
+        const std::uint32_t credit = tc.credit;
+        tc.doc = nullptr;
+        tc.credit = 0u;
+        if (credit > 0u) {
+            if (doc->refcount.load(std::memory_order_acquire) == credit ||
+                doc->refcount.fetch_sub(credit, std::memory_order_acq_rel) == credit) {
+                destroy_shared_doc_slow(doc);
+            }
+        }
+    }
+}
+
 inline void flush_doc_credit_for_teardown() noexcept {
     ThreadDocCredit& tc = t_doc_credit;
     tc.dead = true;
@@ -857,8 +928,8 @@ struct LargeCacheSlot {
 
 inline constexpr std::size_t kLargeCacheMaxSlots = 6u;
 inline constexpr std::size_t kLargeCacheMinBytes = 256u;
-inline constexpr std::size_t kLargeCacheMaxEntryBytes = 16u * 1024u * 1024u;
-inline constexpr std::size_t kLargeCacheMaxTotalBytes = 24u * 1024u * 1024u;
+inline constexpr std::size_t kDocArenaMaxChunkBytes =
+    thread_cache_limits::default_large_cache_max_entry_bytes;
 
 struct ThreadLargeCache {
     LargeCacheSlot slots[kLargeCacheMaxSlots];
@@ -875,22 +946,51 @@ inline thread_local ThreadLargeCache t_large_cache{};
 inline thread_local bool t_large_dead = false;
 inline thread_local ThreadLargeCacheGuard t_large_guard{};
 
+inline void free_large_cache_slot(const LargeCacheSlot& slot) noexcept {
+#if defined(NEOJSON_HAS_ASAN)
+    ASAN_UNPOISON_MEMORY_REGION(slot.hdr, sizeof(LargeBufHeader) + slot.cap);
+#endif
+    std::free(slot.hdr);
+}
+
+inline void trim_large_cache_to(const std::size_t max_entry, const std::size_t max_total) noexcept {
+    if (t_large_dead || t_large_cache.count == 0u) {
+        return;
+    }
+    ThreadLargeCache& cache = t_large_cache;
+    const std::size_t eff_entry = (max_entry < max_total) ? max_entry : max_total;
+    std::size_t kept = 0u;
+    for (std::size_t i = 0u; i < cache.count; ++i) {
+        const LargeCacheSlot slot = cache.slots[i];
+        if (slot.cap > eff_entry) {
+            cache.total_bytes -= slot.cap;
+            free_large_cache_slot(slot);
+        } else {
+            cache.slots[kept++] = slot;
+        }
+    }
+    cache.count = kept;
+    if (cache.total_bytes > max_total) {
+        std::size_t start = 0u;
+        while (start < cache.count && cache.total_bytes > max_total) {
+            const LargeCacheSlot slot = cache.slots[start++];
+            cache.total_bytes -= slot.cap;
+            free_large_cache_slot(slot);
+        }
+        if (start > 0u) {
+            const std::size_t rem = cache.count - start;
+            for (std::size_t i = 0u; i < rem; ++i) {
+                cache.slots[i] = cache.slots[start + i];
+            }
+            cache.count = rem;
+        }
+    }
+}
+
 ThreadLargeCacheGuard::~ThreadLargeCacheGuard() noexcept {
     armed = false;
+    trim_large_cache_to(0u, 0u);
     t_large_dead = true;
-    ThreadLargeCache& cache = t_large_cache;
-    for (std::size_t i = 0u; i < cache.count; ++i) {
-        LargeBufHeader* hdr = cache.slots[i].hdr;
-        const std::size_t cap = cache.slots[i].cap;
-#if defined(NEOJSON_HAS_ASAN)
-        ASAN_UNPOISON_MEMORY_REGION(hdr, sizeof(LargeBufHeader) + cap);
-#else
-        (void)cap;
-#endif
-        std::free(hdr);
-    }
-    cache.count = 0u;
-    cache.total_bytes = 0u;
 }
 
 inline std::size_t large_buf_cap(const void* ptr) noexcept {
@@ -904,8 +1004,7 @@ void* large_malloc_impl(const std::size_t size, const bool ephemeral) noexcept {
         return nullptr;
     }
     const std::size_t req = (size == 0u) ? 1u : size;
-    if (!t_large_dead && t_large_cache.count > 0u &&
-        req >= kLargeCacheMinBytes && req <= kLargeCacheMaxEntryBytes) {
+    if (!t_large_dead && t_large_cache.count > 0u && req >= kLargeCacheMinBytes) {
         ThreadLargeCache& cache = t_large_cache;
         std::size_t best_idx = kLargeCacheMaxSlots;
         std::size_t best_cap = 0u;
@@ -950,26 +1049,27 @@ void large_free(void* /*ctx*/, void* ptr) noexcept {
     auto* hdr = reinterpret_cast<LargeBufHeader*>(
         static_cast<char*>(ptr) - sizeof(LargeBufHeader));
     const std::size_t cap = hdr->cap;
-    if (!t_large_dead && cap >= kLargeCacheMinBytes && cap <= kLargeCacheMaxEntryBytes) {
+    const std::size_t max_entry = g_large_cache_max_entry_bytes.load(std::memory_order_relaxed);
+    const std::size_t max_total = g_large_cache_max_total_bytes.load(std::memory_order_relaxed);
+    const std::size_t eff_entry = (max_entry < max_total) ? max_entry : max_total;
+    if (!t_large_dead && cap >= kLargeCacheMinBytes && cap <= eff_entry) {
         t_large_guard.armed = true;
         ThreadLargeCache& cache = t_large_cache;
         while (cache.count > 0u &&
                (cache.count == kLargeCacheMaxSlots ||
-                cache.total_bytes + cap > kLargeCacheMaxTotalBytes)) {
-            LargeBufHeader* ev_hdr = cache.slots[0].hdr;
-            const std::size_t ev_cap = cache.slots[0].cap;
+                cache.total_bytes > max_total ||
+                cap > max_total - cache.total_bytes)) {
+            const LargeCacheSlot ev = cache.slots[0];
             for (std::size_t i = 1u; i < cache.count; ++i) {
                 cache.slots[i - 1u] = cache.slots[i];
             }
             --cache.count;
-            cache.total_bytes -= ev_cap;
-#if defined(NEOJSON_HAS_ASAN)
-            ASAN_UNPOISON_MEMORY_REGION(ev_hdr, sizeof(LargeBufHeader) + ev_cap);
-#endif
-            std::free(ev_hdr);
+            cache.total_bytes -= ev.cap;
+            free_large_cache_slot(ev);
         }
         if (cache.count < kLargeCacheMaxSlots &&
-            cache.total_bytes + cap <= kLargeCacheMaxTotalBytes) {
+            cache.total_bytes <= max_total &&
+            cap <= max_total - cache.total_bytes) {
 #if defined(NEOJSON_HAS_ASAN)
             ASAN_POISON_MEMORY_REGION(ptr, cap);
 #endif
@@ -977,6 +1077,8 @@ void large_free(void* /*ctx*/, void* ptr) noexcept {
             cache.total_bytes += cap;
             return;
         }
+    } else if (NEOJSON_UNLIKELY(!t_large_dead && t_large_cache.total_bytes > max_total)) {
+        trim_large_cache_to(max_entry, max_total);
     }
 #if defined(NEOJSON_HAS_ASAN)
     ASAN_UNPOISON_MEMORY_REGION(hdr, sizeof(LargeBufHeader) + cap);
@@ -2880,12 +2982,9 @@ struct ThreadStrPool {
         t_str_pool_init = true;
     }
 
-    ~ThreadStrPool() noexcept {
-        dead = true;
-        t_str_pool_dead = true;
+    void trim() noexcept {
         for (auto& st : buckets) {
-            st.slots.clear();
-            st.slots.shrink_to_fit();
+            std::vector<std::string>().swap(st.slots);
             st.count = 0u;
         }
         for (std::size_t b = 0u; b < kNumBuckets; ++b) {
@@ -2898,6 +2997,12 @@ struct ThreadStrPool {
                 cur = next;
             }
         }
+    }
+
+    ~ThreadStrPool() noexcept {
+        dead = true;
+        t_str_pool_dead = true;
+        trim();
     }
 
     static std::size_t bucket_for_len(const std::size_t len) noexcept {
@@ -2948,7 +3053,7 @@ struct ThreadStrPool {
     }
 
     void release(std::string& s) noexcept {
-        if (dead) {
+        if (dead || !g_enable_string_pool.load(std::memory_order_relaxed)) {
             return;
         }
         const std::size_t cap = s.capacity();
@@ -2986,7 +3091,7 @@ struct ThreadStrPool {
     }
 
     bool release_block(SharedStrBlock* sb) noexcept {
-        if (dead || sb == nullptr) {
+        if (dead || sb == nullptr || !g_enable_string_pool.load(std::memory_order_relaxed)) {
             return false;
         }
         const std::size_t b = sb->bucket;
@@ -3011,7 +3116,15 @@ inline ThreadStrPool* try_tls_str_pool_existing() noexcept {
 }
 
 inline ThreadStrPool* try_tls_str_pool() noexcept {
-    return !t_str_pool_dead ? &tls_str_pool() : nullptr;
+    return (!t_str_pool_dead && g_enable_string_pool.load(std::memory_order_relaxed))
+               ? &tls_str_pool()
+               : nullptr;
+}
+
+inline void trim_str_pool() noexcept {
+    if (ThreadStrPool* const pool = try_tls_str_pool_existing()) {
+        pool->trim();
+    }
 }
 
 struct HeapStrBlock {
@@ -3038,8 +3151,8 @@ struct DocArena {
     NEOJSON_NOINLINE void init_first_chunk(const std::size_t est) {
         const std::size_t header_sz = (sizeof(DocArenaChunk) + 15u) & ~std::size_t{15u};
         std::size_t req = (est > header_sz + 8u) ? est : (header_sz + 8u);
-        if (req > kLargeCacheMaxEntryBytes) {
-            req = kLargeCacheMaxEntryBytes;
+        if (req > kDocArenaMaxChunkBytes) {
+            req = kDocArenaMaxChunkBytes;
         }
         std::size_t actual_cap = 0u;
         void* mem = large_alloc_full_cap(req, actual_cap);
@@ -3062,13 +3175,13 @@ struct DocArena {
         std::size_t target = 65536u;
         if (head != nullptr) {
             const std::size_t prev_cap = head->cap;
-            target = (prev_cap <= kLargeCacheMaxEntryBytes / 2u)
+            target = (prev_cap <= kDocArenaMaxChunkBytes / 2u)
                          ? (prev_cap * 2u)
-                         : kLargeCacheMaxEntryBytes;
+                         : kDocArenaMaxChunkBytes;
         }
         std::size_t req = (min_need > target) ? min_need : target;
-        if (req > kLargeCacheMaxEntryBytes && min_need <= kLargeCacheMaxEntryBytes) {
-            req = kLargeCacheMaxEntryBytes;
+        if (req > kDocArenaMaxChunkBytes && min_need <= kDocArenaMaxChunkBytes) {
+            req = kDocArenaMaxChunkBytes;
         }
         std::size_t actual_cap = 0u;
         void* mem = large_alloc_full_cap(req, actual_cap);
@@ -3453,10 +3566,26 @@ struct DupProbeEntry {
 };
 static_assert(sizeof(DupProbeEntry) == 32u, "DupProbeEntry should stay 32 bytes");
 
+inline thread_local bool t_dup_probe_init = false;
+inline thread_local bool t_dup_probe_dead = false;
+
 struct DupProbeTable {
     // Standard heap vector so arbitrary reader/writer threads never depend on ThreadPool state.
     std::vector<DupProbeEntry> slots;
     std::uint32_t stamp = 1u;
+
+    DupProbeTable() noexcept {
+        t_dup_probe_init = true;
+    }
+
+    ~DupProbeTable() noexcept {
+        t_dup_probe_dead = true;
+    }
+
+    void trim() noexcept {
+        std::vector<DupProbeEntry>().swap(slots);
+        stamp = 1u;
+    }
 
     void prepare(const std::size_t len) {
         std::size_t cap = 64u;
@@ -3515,9 +3644,15 @@ struct DupProbeTable {
     }
 };
 
-inline DupProbeTable& tls_dup_probe_table() {
+inline DupProbeTable& tls_dup_probe_table() noexcept {
     thread_local DupProbeTable table;
     return table;
+}
+
+inline void trim_dup_probe_table() noexcept {
+    if (t_dup_probe_init && !t_dup_probe_dead) {
+        tls_dup_probe_table().trim();
+    }
 }
 
 NEOJSON_NOINLINE bool check_small_object_unique(yyjson_val* obj, const std::size_t len) noexcept {
@@ -4347,12 +4482,38 @@ struct ArenaMatTLS {
     ArenaMaterializeScratch scratch;
 };
 
-inline ArenaMatTLS& tls_arena_mat() {
-    thread_local std::unique_ptr<ArenaMatTLS> tls;
-    if (NEOJSON_UNLIKELY(tls == nullptr)) {
-        tls = std::make_unique<ArenaMatTLS>();
+inline thread_local bool t_arena_mat_init = false;
+inline thread_local bool t_arena_mat_dead = false;
+
+struct ArenaMatTLSHolder {
+    std::unique_ptr<ArenaMatTLS> ptr;
+
+    ArenaMatTLSHolder() noexcept {
+        t_arena_mat_init = true;
     }
-    return *tls;
+
+    ~ArenaMatTLSHolder() noexcept {
+        t_arena_mat_dead = true;
+    }
+};
+
+inline ArenaMatTLSHolder& tls_arena_mat_holder() noexcept {
+    thread_local ArenaMatTLSHolder holder;
+    return holder;
+}
+
+inline ArenaMatTLS& tls_arena_mat() {
+    ArenaMatTLSHolder& holder = tls_arena_mat_holder();
+    if (NEOJSON_UNLIKELY(holder.ptr == nullptr)) {
+        holder.ptr = std::make_unique<ArenaMatTLS>();
+    }
+    return *holder.ptr;
+}
+
+inline void trim_arena_mat_tls() noexcept {
+    if (t_arena_mat_init && !t_arena_mat_dead) {
+        tls_arena_mat_holder().ptr.reset();
+    }
 }
 
 struct ArenaMatCtx {
@@ -6111,8 +6272,8 @@ inline const void* materialize_doc_arena(SharedYyDoc* sdoc, yyjson_val* root,
         std::size_t est = vc * 32u + 4096u;
         if (est < 65536u) {
             est = 65536u;
-        } else if (est > kLargeCacheMaxEntryBytes) {
-            est = kLargeCacheMaxEntryBytes;
+        } else if (est > kDocArenaMaxChunkBytes) {
+            est = kDocArenaMaxChunkBytes;
         }
         sdoc->arena.init_first_chunk(est);
     }
@@ -12397,6 +12558,48 @@ bool json::accept(std::string_view s, const bool ignore_comments, const parse_op
 bool json::accept(std::istream& i, const bool ignore_comments, const parse_options& options) {
     std::string buf((std::istreambuf_iterator<char>(i)), std::istreambuf_iterator<char>());
     return accept(std::string_view(buf), ignore_comments, options);
+}
+
+thread_cache_limits get_thread_cache_limits() noexcept {
+    thread_cache_limits limits;
+    limits.large_cache_max_entry_bytes =
+        detail::g_large_cache_max_entry_bytes.load(std::memory_order_relaxed);
+    limits.large_cache_max_total_bytes =
+        detail::g_large_cache_max_total_bytes.load(std::memory_order_relaxed);
+    limits.max_cached_empty_slabs =
+        detail::g_max_cached_empty_slabs.load(std::memory_order_relaxed);
+    limits.enable_string_pool =
+        detail::g_enable_string_pool.load(std::memory_order_relaxed);
+    return limits;
+}
+
+void set_thread_cache_limits(const thread_cache_limits& limits) noexcept {
+    detail::g_large_cache_max_entry_bytes.store(
+        limits.large_cache_max_entry_bytes, std::memory_order_relaxed);
+    detail::g_large_cache_max_total_bytes.store(
+        limits.large_cache_max_total_bytes, std::memory_order_relaxed);
+    detail::g_max_cached_empty_slabs.store(
+        limits.max_cached_empty_slabs, std::memory_order_relaxed);
+    detail::g_enable_string_pool.store(
+        limits.enable_string_pool, std::memory_order_relaxed);
+
+    detail::trim_large_cache_to(
+        limits.large_cache_max_entry_bytes, limits.large_cache_max_total_bytes);
+    if (!limits.enable_string_pool) {
+        detail::trim_str_pool();
+    }
+    if (detail::t_pool != nullptr && !detail::t_pool_dead) {
+        detail::t_pool->trim_empty_slabs(limits.max_cached_empty_slabs);
+    }
+}
+
+void trim_thread_caches() noexcept {
+    detail::flush_doc_credit_live();
+    detail::trim_arena_mat_tls();
+    detail::trim_dup_probe_table();
+    detail::trim_str_pool();
+    detail::trim_large_cache_to(0u, 0u);
+    detail::trim_slab_pool_all();
 }
 
 } // namespace neojson

@@ -107,6 +107,36 @@ struct adl_serializer;
 
 class json_pointer;
 
+/// Per-thread allocator and parse/serialization cache budgets (shared process-wide).
+struct thread_cache_limits {
+    static constexpr std::size_t default_large_cache_max_entry_bytes = 16u * 1024u * 1024u;
+    static constexpr std::size_t default_large_cache_max_total_bytes = 24u * 1024u * 1024u;
+    static constexpr std::uint32_t default_max_cached_empty_slabs = 64u;
+    static constexpr bool default_enable_string_pool = true;
+
+    /// Largest freed parse/dump buffer cached per slot (`large_malloc` / `DumpBuffer`).
+    std::size_t large_cache_max_entry_bytes = default_large_cache_max_entry_bytes;
+    /// Maximum aggregate bytes cached in `ThreadLargeCache` on each thread.
+    std::size_t large_cache_max_total_bytes = default_large_cache_max_total_bytes;
+    /// Maximum empty 64 KiB slabs retained per thread by `ThreadPool` between refills.
+    std::uint32_t max_cached_empty_slabs = default_max_cached_empty_slabs;
+    /// Whether `ThreadStrPool` caches `SharedStrBlock`s and `std::string` buffers per thread.
+    bool enable_string_pool = default_enable_string_pool;
+};
+
+/// Returns the current process-wide thread-local cache budget policy.
+thread_cache_limits get_thread_cache_limits() noexcept;
+
+/// Updates the process-wide thread-local cache policy and trims the calling thread to `limits`
+/// immediately without initializing untouched caches. Other threads enforce updated budgets on
+/// subsequent frees/allocations or when they call `trim_thread_caches()`.
+void set_thread_cache_limits(const thread_cache_limits& limits) noexcept;
+
+/// Releases idle thread-local caches on the calling thread (deferred document refcount credits,
+/// materialization/duplicate-probe scratch, string pool, `ThreadLargeCache`, and empty slabs)
+/// while preserving all live `json` values. Safe no-op on threads that have not used `neojson`.
+void trim_thread_caches() noexcept;
+
 namespace detail {
 
 struct json_access;
