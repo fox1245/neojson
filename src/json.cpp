@@ -10143,7 +10143,15 @@ NEOJSON_NOINLINE std::string dump_formatted_fallback(const json& val, const int 
     return buf.take_string();
 }
 
-#if NEOJSON_X86_SIMD && defined(__SIZEOF_INT128__)
+#if (NEOJSON_X86_SIMD && defined(__SIZEOF_INT128__))
+#define NEOJSON_NATIVE_PARSER 1
+#define NEOJSON_PARSER_TARGET __attribute__((target("avx2")))
+#else
+#define NEOJSON_NATIVE_PARSER 0
+#define NEOJSON_PARSER_TARGET
+#endif
+
+#if NEOJSON_NATIVE_PARSER
 
 inline constexpr double kPow10Dbl23[23] = {
     1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
@@ -10233,7 +10241,83 @@ inline constexpr std::int8_t kHexDecodeLut[256] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 };
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool decode_hex4_fast(
+struct alignas(64) SimpleEscTable {
+    char ch[256]{};
+    constexpr SimpleEscTable() noexcept {
+        ch[static_cast<unsigned char>('"')] = '"';
+        ch[static_cast<unsigned char>('\\')] = '\\';
+        ch[static_cast<unsigned char>('/')] = '/';
+        ch[static_cast<unsigned char>('b')] = '\b';
+        ch[static_cast<unsigned char>('f')] = '\f';
+        ch[static_cast<unsigned char>('n')] = '\n';
+        ch[static_cast<unsigned char>('r')] = '\r';
+        ch[static_cast<unsigned char>('t')] = '\t';
+    }
+};
+static constexpr SimpleEscTable kSimpleEsc{};
+
+struct IndentSlot {
+    std::uint32_t k = 0u;
+    std::uint32_t mask = 0u;
+};
+static_assert(sizeof(IndentSlot) == 8u, "IndentSlot must stay 8 bytes");
+
+static constexpr std::uint32_t kIndentMask32[32] = {
+    0x00000000u, 0x00000001u, 0x00000003u, 0x00000007u,
+    0x0000000Fu, 0x0000001Fu, 0x0000003Fu, 0x0000007Fu,
+    0x000000FFu, 0x000001FFu, 0x000003FFu, 0x000007FFu,
+    0x00000FFFu, 0x00001FFFu, 0x00003FFFu, 0x00007FFFu,
+    0x0000FFFFu, 0x0001FFFFu, 0x0003FFFFu, 0x0007FFFFu,
+    0x000FFFFFu, 0x001FFFFFu, 0x003FFFFFu, 0x007FFFFFu,
+    0x00FFFFFFu, 0x01FFFFFFu, 0x03FFFFFFu, 0x07FFFFFFu,
+    0x0FFFFFFFu, 0x1FFFFFFFu, 0x3FFFFFFFu, 0x7FFFFFFFu,
+};
+
+struct StrParseRes {
+    const char* p;
+    char* str_cur;
+};
+
+struct ParseRunCtx {
+    const char* p;
+    yyjson_val* val_hdr;
+    yyjson_val* val;
+    yyjson_val* val_end;
+    yyjson_val* ctn;
+    char* str_pool;
+    std::size_t val_cap;
+    std::size_t ctn_len;
+    std::size_t depth_rem;
+    IndentSlot indent_by_depth[16]{};
+};
+
+NEOJSON_NOINLINE bool grow_parse_vals_ptr(ParseRunCtx* const st, const std::size_t kHdrVals,
+                                          const std::size_t need) noexcept {
+    const std::size_t old_bytes = (kHdrVals + st->val_cap) * sizeof(yyjson_val);
+    const std::size_t new_cap = st->val_cap + (st->val_cap >> 1u) + need;
+    if (new_cap <= st->val_cap) {
+        return false;
+    }
+    const std::size_t new_bytes = (kHdrVals + new_cap) * sizeof(yyjson_val);
+    const std::size_t val_ofs_bytes = static_cast<std::size_t>(
+        reinterpret_cast<const char*>(st->val) - reinterpret_cast<const char*>(st->val_hdr));
+    const std::size_t ctn_ofs_bytes = static_cast<std::size_t>(
+        reinterpret_cast<const char*>(st->ctn) - reinterpret_cast<const char*>(st->val_hdr));
+    auto* next_hdr = static_cast<yyjson_val*>(
+        large_realloc_bounded(nullptr, st->val_hdr, old_bytes, new_bytes));
+    if (NEOJSON_UNLIKELY(next_hdr == nullptr)) {
+        return false;
+    }
+    auto* const next_bytes = reinterpret_cast<char*>(next_hdr);
+    st->val_hdr = next_hdr;
+    st->val = reinterpret_cast<yyjson_val*>(next_bytes + val_ofs_bytes);
+    st->ctn = reinterpret_cast<yyjson_val*>(next_bytes + ctn_ofs_bytes);
+    st->val_cap = new_cap;
+    st->val_end = next_hdr + kHdrVals + new_cap - 4u;
+    return true;
+}
+
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET bool decode_hex4_fast(
     const char* p, std::uint32_t& out) noexcept {
     const int d0 = kHexDecodeLut[static_cast<unsigned char>(p[0])];
     const int d1 = kHexDecodeLut[static_cast<unsigned char>(p[1])];
@@ -10246,14 +10330,58 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool decode_hex4_fast(
     return true;
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool is_made_of_8_digits_swar(
+NEOJSON_NOINLINE NEOJSON_PARSER_TARGET bool decode_unicode_escape(
+    const char*& p, const char* const end, char*& dst) noexcept {
+    if (NEOJSON_UNLIKELY(end - p < 4)) {
+        return false;
+    }
+    std::uint32_t cp = 0u;
+    if (NEOJSON_UNLIKELY(!decode_hex4_fast(p, cp))) {
+        return false;
+    }
+    p += 4;
+    if (cp <= 0x7Fu) {
+        *dst++ = static_cast<char>(cp);
+    } else if (cp <= 0x7FFu) {
+        dst[0] = static_cast<char>(0xC0u | (cp >> 6u));
+        dst[1] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        dst += 2;
+    } else if (cp >= 0xD800u && cp <= 0xDBFFu) {
+        if (NEOJSON_UNLIKELY(end - p < 6 || p[0] != '\\' || p[1] != 'u')) {
+            return false;
+        }
+        std::uint32_t cp2 = 0u;
+        if (NEOJSON_UNLIKELY(!decode_hex4_fast(p + 2, cp2) || cp2 < 0xDC00u ||
+                             cp2 > 0xDFFFu)) {
+            return false;
+        }
+        p += 6;
+        const std::uint32_t full =
+            0x10000u + (((cp - 0xD800u) << 10u) | (cp2 - 0xDC00u));
+        dst[0] = static_cast<char>(0xF0u | (full >> 18u));
+        dst[1] = static_cast<char>(0x80u | ((full >> 12u) & 0x3Fu));
+        dst[2] = static_cast<char>(0x80u | ((full >> 6u) & 0x3Fu));
+        dst[3] = static_cast<char>(0x80u | (full & 0x3Fu));
+        dst += 4;
+    } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+        return false;
+    } else {
+        dst[0] = static_cast<char>(0xE0u | (cp >> 12u));
+        dst[1] = static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu));
+        dst[2] = static_cast<char>(0x80u | (cp & 0x3Fu));
+        dst += 3;
+    }
+    return true;
+}
+
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET bool is_made_of_8_digits_swar(
     const std::uint64_t v) noexcept {
     return (((v & 0xF0F0F0F0F0F0F0F0ULL) |
              (((v + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) >> 4u)) ==
             0x3333333333333333ULL);
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) std::uint32_t parse_8_digits_swar(
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET std::uint32_t parse_8_digits_swar(
     std::uint64_t v) noexcept {
     constexpr std::uint64_t mask = 0x000000FF000000FFULL;
     constexpr std::uint64_t mul1 = 0x000F424000000064ULL;
@@ -10265,12 +10393,35 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) std::uint32_t parse_8_digi
     return static_cast<std::uint32_t>((v1 + v2) >> 32u);
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool is_made_of_4_digits_swar(
+inline constexpr std::uint64_t kPow10U64[9] = {
+    1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL, 100000000ULL
+};
+
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET std::uint64_t find_non_digit_8_swar(
+    const std::uint64_t w) noexcept {
+    const std::uint64_t bad_hi = (w & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL;
+    const std::uint64_t bad_lo =
+        ((w & 0x0F0F0F0F0F0F0F0FULL) + 0x0606060606060606ULL) & 0x1010101010101010ULL;
+    return bad_hi | bad_lo;
+}
+
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET std::uint32_t parse_8_digits_raw(
+    std::uint64_t v) noexcept {
+    constexpr std::uint64_t mask = 0x000000FF000000FFULL;
+    constexpr std::uint64_t mul1 = 0x000F424000000064ULL;
+    constexpr std::uint64_t mul2 = 0x0000271000000001ULL;
+    v = (v * 10u) + (v >> 8u);
+    const std::uint64_t v1 = (v & mask) * mul1;
+    const std::uint64_t v2 = ((v >> 16u) & mask) * mul2;
+    return static_cast<std::uint32_t>((v1 + v2) >> 32u);
+}
+
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET bool is_made_of_4_digits_swar(
     const std::uint32_t v) noexcept {
     return (((v & 0xF0F0F0F0u) | (((v + 0x06060606u) & 0xF0F0F0F0u) >> 4u)) == 0x33333333u);
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) std::uint32_t parse_4_digits_swar(
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET std::uint32_t parse_4_digits_swar(
     std::uint32_t v) noexcept {
     v -= 0x30303030u;
     v = (v * 10u) + (v >> 8u);
@@ -10303,17 +10454,15 @@ NEOJSON_NOINLINE const char* parse_number_yyjson_fallback(const char* p, const c
     return p + n;
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool try_eisel_lemire_avx2(
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET bool try_eisel_lemire(
     const bool neg, const std::uint64_t sig, const std::int32_t exp10, yyjson_val* out) noexcept {
     if (NEOJSON_UNLIKELY(exp10 < -27 || exp10 > 27)) {
         return false;
     }
     const Pow10Sig128& p10 = kPow10Sig55[exp10 + 27];
     std::int32_t exp2 = static_cast<std::int32_t>(
-                            (static_cast<std::int64_t>(exp10) * 217706LL + (1024LL << 16) -
-                             4128768LL) >>
-                            16) -
-                        1024;
+                            (static_cast<std::int64_t>(exp10) * 217706LL + (961LL << 16)) >> 16) +
+                        126;
     const int lz = __builtin_clzll(sig);
     const std::uint64_t sig1 = sig << static_cast<unsigned>(lz);
     exp2 -= lz;
@@ -10337,15 +10486,12 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool try_eisel_lemire_avx2
         const std::uint32_t lz2 = (hi < (1ULL << 63u)) ? 1u : 0u;
         hi <<= lz2;
         exp2 -= static_cast<std::int32_t>(lz2);
-        exp2 += 64;
-        const bool round_up = (hi & (1ULL << 10u)) != 0u;
-        hi += round_up ? (1ULL << 10u) : 0ULL;
+        hi += (1ULL << 10u);
         if (NEOJSON_UNLIKELY(hi < (1ULL << 10u))) {
             hi = (1ULL << 63u);
             exp2 += 1;
         }
         hi >>= 11u;
-        exp2 += 11 + 52 + 1023;
         if (NEOJSON_LIKELY(exp2 > 0 && exp2 < 2047)) {
             const std::uint64_t raw = (static_cast<std::uint64_t>(neg) << 63u) |
                                       (static_cast<std::uint64_t>(exp2) << 52u) |
@@ -10358,7 +10504,7 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool try_eisel_lemire_avx2
     return false;
 }
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* parse_number_exp_avx2(
+NEOJSON_NOINLINE NEOJSON_PARSER_TARGET const char* parse_number_exp(
     const char* const start, const char* p, const char* const end, const bool neg,
     const std::uint64_t sig, std::int32_t exp10, yyjson_val* out) noexcept {
     if (NEOJSON_LIKELY(p < end && (*p == 'e' || *p == 'E'))) {
@@ -10406,13 +10552,13 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* parse_number_exp_av
         out->uni.f64 = neg ? -d : d;
         return p;
     }
-    if (NEOJSON_LIKELY(try_eisel_lemire_avx2(neg, sig, exp10, out))) {
+    if (NEOJSON_LIKELY(try_eisel_lemire(neg, sig, exp10, out))) {
         return p;
     }
     return parse_number_yyjson_fallback(start, end, out);
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* finish_float_noexp_avx2(
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET const char* finish_float_noexp(
     const char* const start, const char* const p, const char* const end, const bool neg,
     const std::uint64_t sig, const std::int32_t exp10, yyjson_val* out) noexcept {
     if (NEOJSON_UNLIKELY(sig == 0u)) {
@@ -10420,19 +10566,19 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* finish_float_n
         out->uni.u64 = (static_cast<std::uint64_t>(neg) << 63u);
         return p;
     }
-    if (sig < (1ULL << 53u) && exp10 >= -22) {
+    if (NEOJSON_LIKELY(try_eisel_lemire(neg, sig, exp10, out))) {
+        return p;
+    }
+    if (sig < (1ULL << 53u) && exp10 >= -22 && exp10 <= 0) {
         const double d = static_cast<double>(sig) / kPow10Dbl23[-exp10];
         out->tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
         out->uni.f64 = neg ? -d : d;
         return p;
     }
-    if (NEOJSON_LIKELY(try_eisel_lemire_avx2(neg, sig, exp10, out))) {
-        return p;
-    }
     return parse_number_yyjson_fallback(start, end, out);
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_core_avx2(
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET const char* parse_number_core(
     const char* p, const char* const end, yyjson_val* out) noexcept {
     const char* const start = p;
     const bool neg = (*p == '-');
@@ -10456,7 +10602,7 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_c
                 goto core_frac;
             }
             if (c == 'e' || c == 'E') {
-                return parse_number_exp_avx2(start, p, end, neg, 0u, 0, out);
+                return parse_number_exp(start, p, end, neg, 0u, 0, out);
             }
         }
         out->tag = YYJSON_TYPE_NUM | (neg ? YYJSON_SUBTYPE_SINT : YYJSON_SUBTYPE_UINT);
@@ -10535,7 +10681,7 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_c
             return p;
         }
         if (NEOJSON_UNLIKELY(*p != '.')) {
-            return parse_number_exp_avx2(start, p, end, neg, sig, 0, out);
+            return parse_number_exp(start, p, end, neg, sig, 0, out);
         }
     }
 
@@ -10552,6 +10698,50 @@ core_frac:
             --exp10;
         }
     }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (end - p >= 8 && digits <= 11) {
+        std::uint64_t w = 0u;
+        std::memcpy(&w, p, 8u);
+        const std::uint64_t non_dig = find_non_digit_8_swar(w);
+        if (non_dig == 0u) {
+            sig = sig * 100000000ULL + parse_8_digits_raw(w - 0x3030303030303030ULL);
+            p += 8;
+            digits += 8;
+            exp10 -= 8;
+            continue;
+        }
+        const unsigned k = static_cast<unsigned>(__builtin_ctzll(non_dig)) >> 3u;
+        if (k != 0u) {
+            const unsigned shift = (8u - k) * 8u;
+            const std::uint64_t d = (w << shift) - (0x3030303030303030ULL << shift);
+            sig = sig * kPow10U64[k] + parse_8_digits_raw(d);
+            p += k;
+            digits += static_cast<int>(k);
+            exp10 -= static_cast<std::int32_t>(k);
+        }
+        goto core_frac_done;
+    }
+    if (end - p >= 8 && digits < 19) {
+        std::uint64_t w = 0u;
+        std::memcpy(&w, p, 8u);
+        const std::uint64_t non_dig = find_non_digit_8_swar(w);
+        if (non_dig != 0u) {
+            const unsigned k = static_cast<unsigned>(__builtin_ctzll(non_dig)) >> 3u;
+            if (NEOJSON_UNLIKELY(digits + static_cast<int>(k) > 19)) {
+                return parse_number_yyjson_fallback(start, end, out);
+            }
+            if (k != 0u) {
+                const unsigned shift = (8u - k) * 8u;
+                const std::uint64_t d = (w << shift) - (0x3030303030303030ULL << shift);
+                sig = sig * kPow10U64[k] + parse_8_digits_raw(d);
+                p += k;
+                digits += static_cast<int>(k);
+                exp10 -= static_cast<std::int32_t>(k);
+            }
+            goto core_frac_done;
+        }
+    }
+#else
     while (end - p >= 8 && digits <= 11) {
         std::uint64_t w = 0u;
         std::memcpy(&w, p, 8u);
@@ -10573,6 +10763,7 @@ core_frac:
             exp10 -= 4;
         }
     }
+#endif
     while (p < end) {
         const unsigned d = static_cast<unsigned>(static_cast<unsigned char>(*p) - '0');
         if (d > 9u) {
@@ -10586,18 +10777,21 @@ core_frac:
         ++digits;
         --exp10;
     }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+core_frac_done:
+#endif
     if (NEOJSON_UNLIKELY(p < end && (*p == 'e' || *p == 'E'))) {
-        return parse_number_exp_avx2(start, p, end, neg, sig, exp10, out);
+        return parse_number_exp(start, p, end, neg, sig, exp10, out);
     }
-    return finish_float_noexp_avx2(start, p, end, neg, sig, exp10, out);
+    return finish_float_noexp(start, p, end, neg, sig, exp10, out);
 }
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* parse_number_slow_dispatch_avx2(
+NEOJSON_NOINLINE NEOJSON_PARSER_TARGET const char* parse_number_slow_dispatch(
     const char* p, const char* const end, yyjson_val* const out) noexcept {
-    return parse_number_core_avx2(p, end, out);
+    return parse_number_core(p, end, out);
 }
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_inline_int_avx2(
+NEOJSON_ALWAYS_INLINE NEOJSON_PARSER_TARGET const char* parse_number_inline_int(
     const char* p, const char* const end, yyjson_val* const out) noexcept {
     const char* const start = p;
     const bool neg = (*p == '-');
@@ -10613,7 +10807,7 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_i
             const unsigned char c = static_cast<unsigned char>(*p);
             if (NEOJSON_UNLIKELY(static_cast<unsigned>(c - '0') <= 9u || c == '.' || c == 'e' ||
                                  c == 'E')) {
-                return parse_number_slow_dispatch_avx2(start, end, out);
+                return parse_number_slow_dispatch(start, end, out);
             }
         }
         out->tag = YYJSON_TYPE_NUM | (neg ? YYJSON_SUBTYPE_SINT : YYJSON_SUBTYPE_UINT);
@@ -10658,12 +10852,12 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_i
         const unsigned d = static_cast<unsigned>(static_cast<unsigned char>(*p) - '0');
         if (d > 9u) {
             if (NEOJSON_UNLIKELY(*p == '.' || *p == 'e' || *p == 'E')) {
-                return parse_number_slow_dispatch_avx2(start, end, out);
+                return parse_number_slow_dispatch(start, end, out);
             }
             break;
         }
         if (NEOJSON_UNLIKELY(digits >= 18)) {
-            return parse_number_slow_dispatch_avx2(start, end, out);
+            return parse_number_slow_dispatch(start, end, out);
         }
         sig = sig * 10ULL + d;
         ++p;
@@ -10679,33 +10873,9 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* parse_number_i
     return p;
 }
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* skip_ws_avx2_slow(
-    const char* p, const char* const end) noexcept {
-    if (p < end && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
-        return p;
-    }
-    const __m256i v_sp = _mm256_set1_epi8(' ');
-    const __m256i v_nl = _mm256_set1_epi8('\n');
-    const __m256i v_cr = _mm256_set1_epi8('\r');
-    const __m256i v_tb = _mm256_set1_epi8('\t');
-    while (end - p >= 32) {
-        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        const __m256i eq1 = _mm256_or_si256(_mm256_cmpeq_epi8(v, v_sp), _mm256_cmpeq_epi8(v, v_nl));
-        const __m256i eq2 = _mm256_or_si256(_mm256_cmpeq_epi8(v, v_cr), _mm256_cmpeq_epi8(v, v_tb));
-        const std::uint32_t non_ws =
-            ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(eq1, eq2)));
-        if (non_ws != 0u) {
-            return p + static_cast<unsigned>(__builtin_ctz(non_ws));
-        }
-        p += 32;
-    }
-    while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) {
-        ++p;
-    }
-    return p;
-}
-
 } // namespace
+
+#if NEOJSON_X86_SIMD
 
 alignas(32) extern std::uint8_t kSimdQuote32[32];
 alignas(32) extern std::uint8_t kSimdBslash32[32];
@@ -10774,108 +10944,6 @@ alignas(32) std::uint8_t kSimd80_32[32] = {
 
 namespace {
 
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_ws_inline_avx2(
-    const char* p, const char* const end) noexcept {
-    if (NEOJSON_LIKELY(p < end && static_cast<unsigned char>(*p) > 0x20u)) {
-        return p;
-    }
-    return skip_ws_avx2_slow(p, end);
-}
-
-struct IndentSlot {
-    std::uint32_t k = 0u;
-    std::uint32_t mask = 0u;
-};
-static_assert(sizeof(IndentSlot) == 8u, "IndentSlot must stay 8 bytes");
-
-static constexpr std::uint32_t kIndentMask32[32] = {
-    0x00000000u, 0x00000001u, 0x00000003u, 0x00000007u,
-    0x0000000Fu, 0x0000001Fu, 0x0000003Fu, 0x0000007Fu,
-    0x000000FFu, 0x000001FFu, 0x000003FFu, 0x000007FFu,
-    0x00000FFFu, 0x00001FFFu, 0x00003FFFu, 0x00007FFFu,
-    0x0000FFFFu, 0x0001FFFFu, 0x0003FFFFu, 0x0007FFFFu,
-    0x000FFFFFu, 0x001FFFFFu, 0x003FFFFFu, 0x007FFFFFu,
-    0x00FFFFFFu, 0x01FFFFFFu, 0x03FFFFFFu, 0x07FFFFFFu,
-    0x0FFFFFFFu, 0x1FFFFFFFu, 0x3FFFFFFFu, 0x7FFFFFFFu,
-};
-
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_spaces_once_avx2(
-    const char* p, const char* const end, IndentSlot& slot) noexcept {
-    if (NEOJSON_LIKELY(end - p >= 32)) {
-        std::uint32_t non_sp = 0u;
-        {
-            const __m256i v_sp =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            non_sp = ~static_cast<std::uint32_t>(
-                _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_sp)));
-        }
-        const std::uint32_t k = slot.k;
-        const std::uint32_t mask = slot.mask;
-        if (NEOJSON_LIKELY((non_sp & mask) == 0u &&
-                           static_cast<unsigned char>(p[k]) > 0x20u)) {
-            return p + k;
-        }
-        if (NEOJSON_LIKELY(non_sp != 0u)) {
-            const unsigned n = static_cast<unsigned>(__builtin_ctz(non_sp));
-            p += n;
-            if (NEOJSON_LIKELY(static_cast<unsigned char>(*p) > 0x20u)) {
-                if (n <= 31u) {
-                    slot = IndentSlot{n, kIndentMask32[n]};
-                }
-                return p;
-            }
-            return skip_ws_avx2_slow(p, end);
-        }
-        return skip_ws_avx2_slow(p + 32, end);
-    }
-    return skip_ws_avx2_slow(p, end);
-}
-
-struct StrParseRes {
-    const char* p;
-    char* str_cur;
-};
-
-struct ParseRunCtx {
-    const char* p;
-    yyjson_val* val_hdr;
-    yyjson_val* val;
-    yyjson_val* val_end;
-    yyjson_val* ctn;
-    char* str_pool;
-    std::size_t val_cap;
-    std::size_t ctn_len;
-    std::size_t depth_rem;
-    IndentSlot indent_by_depth[16]{};
-};
-
-NEOJSON_NOINLINE bool grow_parse_vals_ptr(ParseRunCtx* const st, const std::size_t kHdrVals,
-                                          const std::size_t need) noexcept {
-    const std::size_t old_bytes = (kHdrVals + st->val_cap) * sizeof(yyjson_val);
-    const std::size_t new_cap = st->val_cap + (st->val_cap >> 1u) + need;
-    if (new_cap <= st->val_cap) {
-        return false;
-    }
-    const std::size_t new_bytes = (kHdrVals + new_cap) * sizeof(yyjson_val);
-    const std::size_t val_ofs_bytes = static_cast<std::size_t>(
-        reinterpret_cast<const char*>(st->val) - reinterpret_cast<const char*>(st->val_hdr));
-    const std::size_t ctn_ofs_bytes = static_cast<std::size_t>(
-        reinterpret_cast<const char*>(st->ctn) - reinterpret_cast<const char*>(st->val_hdr));
-    auto* next_hdr = static_cast<yyjson_val*>(
-        large_realloc_bounded(nullptr, st->val_hdr, old_bytes, new_bytes));
-    if (NEOJSON_UNLIKELY(next_hdr == nullptr)) {
-        return false;
-    }
-    auto* const next_bytes = reinterpret_cast<char*>(next_hdr);
-    st->val_hdr = next_hdr;
-    st->val = reinterpret_cast<yyjson_val*>(next_bytes + val_ofs_bytes);
-    st->ctn = reinterpret_cast<yyjson_val*>(next_bytes + ctn_ofs_bytes);
-    st->val_cap = new_cap;
-    st->val_end = next_hdr + kHdrVals + new_cap - 4u;
-    return true;
-}
-
 alignas(32) static constexpr std::uint8_t kUtf8PrefixMask[64] = {
     0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu,
     0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu,
@@ -10942,128 +11010,175 @@ NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool utf8_chunk_valid_avx2
     return _mm256_testz_si256(err, err) != 0;
 }
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) bool decode_unicode_escape_avx2(
-    const char*& p, const char* const end, char*& dst) noexcept {
-    if (NEOJSON_UNLIKELY(end - p < 4)) {
-        return false;
-    }
-    std::uint32_t cp = 0u;
-    if (NEOJSON_UNLIKELY(!decode_hex4_fast(p, cp))) {
-        return false;
-    }
-    p += 4;
-    if (cp <= 0x7Fu) {
-        *dst++ = static_cast<char>(cp);
-    } else if (cp <= 0x7FFu) {
-        dst[0] = static_cast<char>(0xC0u | (cp >> 6u));
-        dst[1] = static_cast<char>(0x80u | (cp & 0x3Fu));
-        dst += 2;
-    } else if (cp >= 0xD800u && cp <= 0xDBFFu) {
-        if (NEOJSON_UNLIKELY(end - p < 6 || p[0] != '\\' || p[1] != 'u')) {
-            return false;
-        }
-        std::uint32_t cp2 = 0u;
-        if (NEOJSON_UNLIKELY(!decode_hex4_fast(p + 2, cp2) || cp2 < 0xDC00u ||
-                             cp2 > 0xDFFFu)) {
-            return false;
-        }
-        p += 6;
-        const std::uint32_t full =
-            0x10000u + (((cp - 0xD800u) << 10u) | (cp2 - 0xDC00u));
-        dst[0] = static_cast<char>(0xF0u | (full >> 18u));
-        dst[1] = static_cast<char>(0x80u | ((full >> 12u) & 0x3Fu));
-        dst[2] = static_cast<char>(0x80u | ((full >> 6u) & 0x3Fu));
-        dst[3] = static_cast<char>(0x80u | (full & 0x3Fu));
-        dst += 4;
-    } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
-        return false;
-    } else {
-        dst[0] = static_cast<char>(0xE0u | (cp >> 12u));
-        dst[1] = static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu));
-        dst[2] = static_cast<char>(0x80u | (cp & 0x3Fu));
-        dst += 3;
-    }
-    return true;
-}
+struct Avx2ParserOps {
+    static constexpr std::size_t kVecBytes = 32u;
+    static constexpr std::size_t kMinLen = 32u;
 
-struct alignas(64) SimpleEscTable {
-    char ch[256]{};
-    constexpr SimpleEscTable() noexcept {
-        ch[static_cast<unsigned char>('"')] = '"';
-        ch[static_cast<unsigned char>('\\')] = '\\';
-        ch[static_cast<unsigned char>('/')] = '/';
-        ch[static_cast<unsigned char>('b')] = '\b';
-        ch[static_cast<unsigned char>('f')] = '\f';
-        ch[static_cast<unsigned char>('n')] = '\n';
-        ch[static_cast<unsigned char>('r')] = '\r';
-        ch[static_cast<unsigned char>('t')] = '\t';
-    }
-};
-static constexpr SimpleEscTable kSimpleEsc{};
-
-NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_slow_avx2(
-    const char* p, const char* const end, char* const dst_start, char* dst,
-    yyjson_val* const out, const bool has_esc_init = false) noexcept {
-    bool has_esc = has_esc_init;
-    if (p < end) {
-        const unsigned char b0 = static_cast<unsigned char>(*p);
-        if (NEOJSON_UNLIKELY(b0 < 0x20u)) {
-            return {nullptr, dst_start};
+    static NEOJSON_NOINLINE __attribute__((target("avx2"))) const char* skip_ws_slow(
+        const char* p, const char* const end) noexcept {
+        if (p < end && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
+            return p;
         }
-        if (b0 == '\\') {
-            goto handle_escape;
+        const __m256i v_sp = _mm256_set1_epi8(' ');
+        const __m256i v_nl = _mm256_set1_epi8('\n');
+        const __m256i v_cr = _mm256_set1_epi8('\r');
+        const __m256i v_tb = _mm256_set1_epi8('\t');
+        while (end - p >= 32) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            const __m256i eq1 =
+                _mm256_or_si256(_mm256_cmpeq_epi8(v, v_sp), _mm256_cmpeq_epi8(v, v_nl));
+            const __m256i eq2 =
+                _mm256_or_si256(_mm256_cmpeq_epi8(v, v_cr), _mm256_cmpeq_epi8(v, v_tb));
+            const std::uint32_t non_ws =
+                ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(eq1, eq2)));
+            if (non_ws != 0u) {
+                return p + static_cast<unsigned>(__builtin_ctz(non_ws));
+            }
+            p += 32;
         }
+        while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) {
+            ++p;
+        }
+        return p;
     }
 
-    for (;;) {
-        if (end - p >= 32) {
-            const __m256i v_quote =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-            const __m256i v_bslash =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-            const __m256i v_e0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdE0_32));
-            const __m256i v_zero = _mm256_setzero_si256();
-            do {
-                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
-                const __m256i q_or_b = _mm256_or_si256(
-                    _mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
-                const __m256i ctrl = _mm256_cmpeq_epi8(_mm256_and_si256(v, v_e0), v_zero);
-                const std::uint32_t mask = static_cast<std::uint32_t>(
-                    _mm256_movemask_epi8(_mm256_or_si256(q_or_b, ctrl)));
-                if (mask == 0u) {
-                    if (_mm256_movemask_epi8(v) != 0) {
-                        if (NEOJSON_UNLIKELY(!utf8_chunk_valid_avx2(v))) {
+    static NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_ws_inline(
+        const char* p, const char* const end) noexcept {
+        if (NEOJSON_LIKELY(p < end && static_cast<unsigned char>(*p) > 0x20u)) {
+            return p;
+        }
+        return skip_ws_slow(p, end);
+    }
+
+    static NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) std::uint32_t scan_non_space_mask(
+        const char* p) noexcept {
+        const __m256i v_20 = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        return ~static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_20)));
+    }
+
+    static NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) const char* skip_spaces_once(
+        const char* p, const char* const end, IndentSlot& slot) noexcept {
+        if (NEOJSON_LIKELY(end - p >= 32)) {
+            const std::uint32_t non_sp = scan_non_space_mask(p);
+            const std::uint32_t k = slot.k;
+            const std::uint32_t mask = slot.mask;
+            if (NEOJSON_LIKELY((non_sp & mask) == 0u &&
+                               static_cast<unsigned char>(p[k]) > 0x20u)) {
+                return p + k;
+            }
+            if (NEOJSON_LIKELY(non_sp != 0u)) {
+                const unsigned n = static_cast<unsigned>(__builtin_ctz(non_sp));
+                p += n;
+                if (NEOJSON_LIKELY(static_cast<unsigned char>(*p) > 0x20u)) {
+                    if (n <= 31u) {
+                        slot = IndentSlot{n, kIndentMask32[n]};
+                    }
+                    return p;
+                }
+                return skip_ws_slow(p, end);
+            }
+            return skip_ws_slow(p + 32, end);
+        }
+        return skip_ws_slow(p, end);
+    }
+
+    static NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) std::uint32_t
+    copy_and_scan_key_ascii(const char* p, char* str_cur) noexcept {
+        const __m256i v_quote =
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
+        const __m256i v_bslash =
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
+        const __m256i v_1f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(str_cur), v);
+        const __m256i v_esc_or_q =
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
+        const __m256i v_ok = _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(v, v_1f));
+        return ~static_cast<std::uint32_t>(_mm256_movemask_epi8(v_ok));
+    }
+
+    static NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_slow(
+        const char* p, const char* const end, char* const dst_start, char* dst,
+        yyjson_val* const out, const bool has_esc_init = false) noexcept {
+        bool has_esc = has_esc_init;
+        if (p < end) {
+            const unsigned char b0 = static_cast<unsigned char>(*p);
+            if (NEOJSON_UNLIKELY(b0 < 0x20u)) {
+                return {nullptr, dst_start};
+            }
+            if (b0 == '\\') {
+                goto handle_escape;
+            }
+        }
+
+        for (;;) {
+            if (end - p >= 32) {
+                const __m256i v_quote =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
+                const __m256i v_bslash =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
+                const __m256i v_e0 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdE0_32));
+                const __m256i v_zero = _mm256_setzero_si256();
+                do {
+                    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
+                    const __m256i q_or_b = _mm256_or_si256(
+                        _mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
+                    const __m256i ctrl = _mm256_cmpeq_epi8(_mm256_and_si256(v, v_e0), v_zero);
+                    const std::uint32_t mask = static_cast<std::uint32_t>(
+                        _mm256_movemask_epi8(_mm256_or_si256(q_or_b, ctrl)));
+                    if (mask == 0u) {
+                        if (_mm256_movemask_epi8(v) != 0) {
+                            if (NEOJSON_UNLIKELY(!utf8_chunk_valid_avx2(v))) {
+                                return {nullptr, dst_start};
+                            }
+                            const unsigned char c29 = static_cast<unsigned char>(p[29]);
+                            const unsigned char c30 = static_cast<unsigned char>(p[30]);
+                            const unsigned char c31 = static_cast<unsigned char>(p[31]);
+                            std::size_t adv = 32u;
+                            adv = (c29 >= 0xF0u) ? 29u : adv;
+                            adv = (c30 >= 0xE0u) ? 30u : adv;
+                            adv = (c31 >= 0xC0u) ? 31u : adv;
+                            p += adv;
+                            dst += adv;
+                        } else {
+                            p += 32;
+                            dst += 32;
+                        }
+                        continue;
+                    }
+                    const unsigned n = static_cast<unsigned>(__builtin_ctz(mask));
+                    if (n > 0u) {
+                        const __m256i pmask = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i*>(kUtf8PrefixMask + 32u - n));
+                        const __m256i v_pre = _mm256_and_si256(v, pmask);
+                        if (_mm256_movemask_epi8(v_pre) != 0 &&
+                            NEOJSON_UNLIKELY(!utf8_chunk_valid_avx2(v_pre))) {
                             return {nullptr, dst_start};
                         }
-                        const unsigned char c29 = static_cast<unsigned char>(p[29]);
-                        const unsigned char c30 = static_cast<unsigned char>(p[30]);
-                        const unsigned char c31 = static_cast<unsigned char>(p[31]);
-                        std::size_t adv = 32u;
-                        adv = (c29 >= 0xF0u) ? 29u : adv;
-                        adv = (c30 >= 0xE0u) ? 30u : adv;
-                        adv = (c31 >= 0xC0u) ? 31u : adv;
-                        p += adv;
-                        dst += adv;
-                    } else {
-                        p += 32;
-                        dst += 32;
+                        p += n;
+                        dst += n;
                     }
-                    continue;
-                }
-                const unsigned n = static_cast<unsigned>(__builtin_ctz(mask));
-                if (n > 0u) {
-                    const __m256i pmask = _mm256_loadu_si256(
-                        reinterpret_cast<const __m256i*>(kUtf8PrefixMask + 32u - n));
-                    const __m256i v_pre = _mm256_and_si256(v, pmask);
-                    if (_mm256_movemask_epi8(v_pre) != 0 &&
-                        NEOJSON_UNLIKELY(!utf8_chunk_valid_avx2(v_pre))) {
+                    if (NEOJSON_LIKELY(*p == '"')) {
+                        *dst = '\0';
+                        const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
+                        out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
+                                   (has_esc ? YYJSON_SUBTYPE_NONE : YYJSON_SUBTYPE_NOESC);
+                        out->uni.str = dst_start;
+                        return {p + 1, dst + 1};
+                    }
+                    if (NEOJSON_UNLIKELY(*p != '\\')) {
                         return {nullptr, dst_start};
                     }
-                    p += n;
-                    dst += n;
-                }
-                if (NEOJSON_LIKELY(*p == '"')) {
+                    goto handle_escape;
+                } while (end - p >= 32);
+            }
+
+            while (p < end) {
+                const unsigned char b = static_cast<unsigned char>(*p);
+                if (b == '"') {
                     *dst = '\0';
                     const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
                     out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
@@ -11071,420 +11186,421 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_slow_a
                     out->uni.str = dst_start;
                     return {p + 1, dst + 1};
                 }
-                if (NEOJSON_UNLIKELY(*p != '\\')) {
-                    return {nullptr, dst_start};
+                if (b == '\\') {
+                    goto handle_escape;
                 }
-                goto handle_escape;
-            } while (end - p >= 32);
-        }
-
-        while (p < end) {
-            const unsigned char b = static_cast<unsigned char>(*p);
-            if (b == '"') {
-                *dst = '\0';
-                const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
-                out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
-                           (has_esc ? YYJSON_SUBTYPE_NONE : YYJSON_SUBTYPE_NOESC);
-                out->uni.str = dst_start;
-                return {p + 1, dst + 1};
-            }
-            if (b == '\\') {
-                goto handle_escape;
-            }
-            if (b >= 0x80u) {
-                do {
-                    const unsigned char b0 = static_cast<unsigned char>(*p);
-                    if (NEOJSON_LIKELY(end - p >= 4)) {
-                        std::uint32_t u = 0u;
-                        std::memcpy(&u, p, 4u);
-                        if (b0 >= 0xE1u && b0 <= 0xEFu) {
-                            if (b0 == 0xEDu) {
-                                if (NEOJSON_UNLIKELY((u & 0x00C0E000u) != 0x00808000u)) {
+                if (b >= 0x80u) {
+                    do {
+                        const unsigned char b0 = static_cast<unsigned char>(*p);
+                        if (NEOJSON_LIKELY(end - p >= 4)) {
+                            std::uint32_t u = 0u;
+                            std::memcpy(&u, p, 4u);
+                            if (b0 >= 0xE1u && b0 <= 0xEFu) {
+                                if (b0 == 0xEDu) {
+                                    if (NEOJSON_UNLIKELY((u & 0x00C0E000u) != 0x00808000u)) {
+                                        return {nullptr, dst_start};
+                                    }
+                                } else if (NEOJSON_UNLIKELY((u & 0x00C0C000u) != 0x00808000u)) {
                                     return {nullptr, dst_start};
                                 }
-                            } else if (NEOJSON_UNLIKELY((u & 0x00C0C000u) != 0x00808000u)) {
+                                std::memcpy(dst, &u, 4u);
+                                dst += 3;
+                                p += 3;
+                            } else if (b0 == 0xE0u) {
+                                if (NEOJSON_UNLIKELY((u & 0x00C0E000u) != 0x0080A000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 4u);
+                                dst += 3;
+                                p += 3;
+                            } else if (b0 >= 0xC2u && b0 <= 0xDFu) {
+                                if (NEOJSON_UNLIKELY((u & 0x0000C000u) != 0x00008000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 2u);
+                                dst += 2;
+                                p += 2;
+                            } else if (b0 >= 0xF0u && b0 <= 0xF4u) {
+                                const unsigned char b1 =
+                                    static_cast<unsigned char>((u >> 8u) & 0xFFu);
+                                if (NEOJSON_UNLIKELY((u & 0xC0C00000u) != 0x80800000u)) {
+                                    return {nullptr, dst_start};
+                                }
+                                if (b0 == 0xF0u) {
+                                    if (b1 < 0x90u || b1 > 0xBFu) {
+                                        return {nullptr, dst_start};
+                                    }
+                                } else if (b0 == 0xF4u) {
+                                    if ((u & 0x0000F000u) != 0x00008000u) {
+                                        return {nullptr, dst_start};
+                                    }
+                                } else if ((b1 & 0xC0u) != 0x80u) {
+                                    return {nullptr, dst_start};
+                                }
+                                std::memcpy(dst, &u, 4u);
+                                dst += 4;
+                                p += 4;
+                            } else {
                                 return {nullptr, dst_start};
                             }
-                            std::memcpy(dst, &u, 4u);
-                            dst += 3;
-                            p += 3;
-                        } else if (b0 == 0xE0u) {
-                            if (NEOJSON_UNLIKELY((u & 0x00C0E000u) != 0x0080A000u)) {
-                                return {nullptr, dst_start};
-                            }
-                            std::memcpy(dst, &u, 4u);
-                            dst += 3;
-                            p += 3;
                         } else if (b0 >= 0xC2u && b0 <= 0xDFu) {
-                            if (NEOJSON_UNLIKELY((u & 0x0000C000u) != 0x00008000u)) {
+                            if (NEOJSON_UNLIKELY(end - p < 2 ||
+                                                 (static_cast<unsigned char>(p[1]) & 0xC0u) !=
+                                                     0x80u)) {
                                 return {nullptr, dst_start};
                             }
-                            std::memcpy(dst, &u, 2u);
+                            dst[0] = p[0];
+                            dst[1] = p[1];
                             dst += 2;
                             p += 2;
-                        } else if (b0 >= 0xF0u && b0 <= 0xF4u) {
-                            const unsigned char b1 =
-                                static_cast<unsigned char>((u >> 8u) & 0xFFu);
-                            if (NEOJSON_UNLIKELY((u & 0xC0C00000u) != 0x80800000u)) {
+                        } else if (b0 >= 0xE0u && b0 <= 0xEFu) {
+                            if (NEOJSON_UNLIKELY(end - p < 3)) {
                                 return {nullptr, dst_start};
                             }
-                            if (b0 == 0xF0u) {
-                                if (b1 < 0x90u || b1 > 0xBFu) {
+                            const unsigned char b1 = static_cast<unsigned char>(p[1]);
+                            const unsigned char b2 = static_cast<unsigned char>(p[2]);
+                            if ((b2 & 0xC0u) != 0x80u) {
+                                return {nullptr, dst_start};
+                            }
+                            if (b0 == 0xE0u) {
+                                if (b1 < 0xA0u || b1 > 0xBFu) {
                                     return {nullptr, dst_start};
                                 }
-                            } else if (b0 == 0xF4u) {
-                                if ((u & 0x0000F000u) != 0x00008000u) {
+                            } else if (b0 == 0xEDu) {
+                                if (b1 < 0x80u || b1 > 0x9Fu) {
                                     return {nullptr, dst_start};
                                 }
                             } else if ((b1 & 0xC0u) != 0x80u) {
                                 return {nullptr, dst_start};
                             }
-                            std::memcpy(dst, &u, 4u);
-                            dst += 4;
-                            p += 4;
+                            dst[0] = p[0];
+                            dst[1] = p[1];
+                            dst[2] = p[2];
+                            dst += 3;
+                            p += 3;
                         } else {
                             return {nullptr, dst_start};
                         }
-                    } else if (b0 >= 0xC2u && b0 <= 0xDFu) {
-                        if (NEOJSON_UNLIKELY(end - p < 2 ||
-                                             (static_cast<unsigned char>(p[1]) & 0xC0u) != 0x80u)) {
-                            return {nullptr, dst_start};
-                        }
-                        dst[0] = p[0];
-                        dst[1] = p[1];
-                        dst += 2;
-                        p += 2;
-                    } else if (b0 >= 0xE0u && b0 <= 0xEFu) {
-                        if (NEOJSON_UNLIKELY(end - p < 3)) {
-                            return {nullptr, dst_start};
-                        }
-                        const unsigned char b1 = static_cast<unsigned char>(p[1]);
-                        const unsigned char b2 = static_cast<unsigned char>(p[2]);
-                        if ((b2 & 0xC0u) != 0x80u) {
-                            return {nullptr, dst_start};
-                        }
-                        if (b0 == 0xE0u) {
-                            if (b1 < 0xA0u || b1 > 0xBFu) {
-                                return {nullptr, dst_start};
-                            }
-                        } else if (b0 == 0xEDu) {
-                            if (b1 < 0x80u || b1 > 0x9Fu) {
-                                return {nullptr, dst_start};
-                            }
-                        } else if ((b1 & 0xC0u) != 0x80u) {
-                            return {nullptr, dst_start};
-                        }
-                        dst[0] = p[0];
-                        dst[1] = p[1];
-                        dst[2] = p[2];
-                        dst += 3;
-                        p += 3;
-                    } else {
-                        return {nullptr, dst_start};
-                    }
-                } while (p < end && static_cast<unsigned char>(*p) >= 0x80u);
-                continue;
-            }
-            if (NEOJSON_UNLIKELY(b < 0x20u)) {
-                return {nullptr, dst_start};
-            }
-            *dst++ = static_cast<char>(b);
-            ++p;
-        }
-        return {nullptr, dst_start};
-
-    handle_escape:
-        has_esc = true;
-        ++p;
-        if (NEOJSON_UNLIKELY(p >= end)) {
-            return {nullptr, dst_start};
-        }
-        const unsigned char esc = static_cast<unsigned char>(*p++);
-        const char dec = kSimpleEsc.ch[esc];
-        if (NEOJSON_LIKELY(dec != 0)) {
-            *dst++ = dec;
-        } else if (esc == 'u') {
-            if (NEOJSON_UNLIKELY(!decode_unicode_escape_avx2(p, end, dst))) {
-                return {nullptr, dst_start};
-            }
-        } else {
-            return {nullptr, dst_start};
-        }
-    }
-}
-
-NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_utf8_avx2(
-    const char* p, const char* const end, char* const dst_start, char* dst,
-    yyjson_val* const out, std::uint8_t subtype) noexcept {
-    const __m256i zero = _mm256_setzero_si256();
-    __m256i prev = zero;
-    __m256i err = zero;
-
-    while (end - p >= 32) {
-        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
-        std::uint32_t mask = 0u;
-        {
-            const __m256i v_quote =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-            const __m256i v_bslash =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-            const __m256i v_e0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdE0_32));
-            const __m256i q_or_b =
-                _mm256_or_si256(_mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
-            const __m256i ctrl = _mm256_cmpeq_epi8(_mm256_and_si256(v, v_e0), zero);
-            mask = static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(q_or_b, ctrl)));
-        }
-        if (mask == 0u) {
-            if (_mm256_movemask_epi8(_mm256_or_si256(prev, v)) != 0) {
-                validate_utf8_step_avx2(prev, v, err);
-            }
-            prev = v;
-            p += 32;
-            dst += 32;
-            continue;
-        }
-        const unsigned n = static_cast<unsigned>(__builtin_ctz(mask));
-        if (n > 0u) {
-            const __m256i pmask = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(kUtf8PrefixMask + 32u - n));
-            const __m256i v_pre = _mm256_and_si256(v, pmask);
-            if (_mm256_movemask_epi8(_mm256_or_si256(prev, v_pre)) != 0) {
-                validate_utf8_step_avx2(prev, v_pre, err);
-            }
-            p += n;
-            dst += n;
-        } else if (_mm256_movemask_epi8(prev) != 0) {
-            validate_utf8_step_avx2(prev, zero, err);
-        }
-        prev = zero;
-        if (NEOJSON_LIKELY(*p == '"')) {
-            if (NEOJSON_UNLIKELY(_mm256_testz_si256(err, err) == 0)) {
-                return {nullptr, dst_start};
-            }
-            *dst = '\0';
-            const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
-            out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
-            out->uni.str = dst_start;
-            return {p + 1, dst + 1};
-        }
-        if (NEOJSON_LIKELY(*p == '\\')) {
-            if (p + 1 < end) {
-                const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
-                if (NEOJSON_LIKELY(ec != 0)) {
-                    *dst++ = ec;
-                    p += 2;
-                    subtype = YYJSON_SUBTYPE_NONE;
+                    } while (p < end && static_cast<unsigned char>(*p) >= 0x80u);
                     continue;
                 }
+                if (NEOJSON_UNLIKELY(b < 0x20u)) {
+                    return {nullptr, dst_start};
+                }
+                *dst++ = static_cast<char>(b);
+                ++p;
             }
-            if (NEOJSON_UNLIKELY(_mm256_testz_si256(err, err) == 0)) {
+            return {nullptr, dst_start};
+
+        handle_escape:
+            has_esc = true;
+            ++p;
+            if (NEOJSON_UNLIKELY(p >= end)) {
                 return {nullptr, dst_start};
             }
-            return parse_string_slow_avx2(
-                p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+            const unsigned char esc = static_cast<unsigned char>(*p++);
+            const char dec = kSimpleEsc.ch[esc];
+            if (NEOJSON_LIKELY(dec != 0)) {
+                *dst++ = dec;
+            } else if (esc == 'u') {
+                if (NEOJSON_UNLIKELY(!decode_unicode_escape(p, end, dst))) {
+                    return {nullptr, dst_start};
+                }
+            } else {
+                return {nullptr, dst_start};
+            }
         }
-        return {nullptr, dst_start};
     }
 
-    if (NEOJSON_UNLIKELY(_mm256_testz_si256(err, err) == 0)) {
-        return {nullptr, dst_start};
-    }
-    if (_mm256_movemask_epi8(prev) != 0) {
-        std::size_t back = 0u;
-        if (static_cast<unsigned char>(p[-1]) >= 0xC0u) {
-            back = 1u;
-        } else if (static_cast<unsigned char>(p[-2]) >= 0xE0u) {
-            back = 2u;
-        } else if (static_cast<unsigned char>(p[-3]) >= 0xF0u) {
-            back = 3u;
-        }
-        p -= back;
-        dst -= back;
-    }
-    return parse_string_slow_avx2(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
-}
+    static NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_utf8(
+        const char* p, const char* const end, char* const dst_start, char* dst,
+        yyjson_val* const out, std::uint8_t subtype) noexcept {
+        const __m256i zero = _mm256_setzero_si256();
+        __m256i prev = zero;
+        __m256i err = zero;
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_key_tail_avx2(
-    const char* p, const char* const end, char* const dst_start, char* dst,
-    yyjson_val* const out) noexcept {
-    const __m256i v_quote =
-        _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-    const __m256i v_bslash =
-        _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-    const __m256i v_1f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
-    while (end - p >= 32) {
-        const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), vc);
-        const std::uint32_t qm = static_cast<std::uint32_t>(
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(vc, v_quote)));
-        const __m256i okc =
-            _mm256_andnot_si256(_mm256_cmpeq_epi8(vc, v_bslash), _mm256_cmpgt_epi8(vc, v_1f));
-        const std::uint32_t bm = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(okc));
-        if (NEOJSON_LIKELY(qm != 0u && (bm & (qm ^ (qm - 1u))) == 0u)) {
-            const unsigned m = static_cast<unsigned>(__builtin_ctz(qm));
-            dst[m] = '\0';
-            const std::size_t slen = static_cast<std::size_t>((dst + m) - dst_start);
-            out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
-                       YYJSON_SUBTYPE_NOESC;
-            out->uni.str = dst_start;
-            return {p + m + 1u, dst + m + 1u};
-        }
-        if (bm != 0u) {
-            const unsigned b = static_cast<unsigned>(__builtin_ctz(bm));
-            return parse_string_slow_avx2(p + b, end, dst_start, dst + b, out, false);
-        }
-        p += 32;
-        dst += 32;
-    }
-    return parse_string_slow_avx2(p, end, dst_start, dst, out, false);
-}
-
-NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool parse_string_val_fast_avx2(
-    const char*& p_io, const char* const end, char*& str_cur_io,
-    yyjson_val* const out) noexcept {
-    const char* p = p_io;
-    char* const dst_start = str_cur_io;
-    char* dst = dst_start;
-    if (NEOJSON_LIKELY(end - p >= 32)) {
-        std::uint32_t spec_mask = 0u;
-        {
-            const __m256i v_quote =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-            const __m256i v_bslash =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-            const __m256i v_1f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
+        while (end - p >= 32) {
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_start), v);
-            const __m256i v_esc_or_q = _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
-            const __m256i v_ok = _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(v, v_1f));
-            spec_mask = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(v_ok));
-        }
-        std::uint8_t subtype = YYJSON_SUBTYPE_NOESC;
-        if (spec_mask != 0u) {
-            const unsigned n = static_cast<unsigned>(__builtin_ctz(spec_mask));
-            if (NEOJSON_LIKELY(p[n] == '"')) {
-                dst_start[n] = '\0';
-                out->tag =
-                    (static_cast<std::uint64_t>(n) << 8u) | YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC;
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), v);
+            std::uint32_t mask = 0u;
+            {
+                const __m256i v_quote =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
+                const __m256i v_bslash =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
+                const __m256i v_e0 =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdE0_32));
+                const __m256i q_or_b =
+                    _mm256_or_si256(_mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
+                const __m256i ctrl = _mm256_cmpeq_epi8(_mm256_and_si256(v, v_e0), zero);
+                mask = static_cast<std::uint32_t>(
+                    _mm256_movemask_epi8(_mm256_or_si256(q_or_b, ctrl)));
+            }
+            if (mask == 0u) {
+                if (_mm256_movemask_epi8(_mm256_or_si256(prev, v)) != 0) {
+                    validate_utf8_step_avx2(prev, v, err);
+                }
+                prev = v;
+                p += 32;
+                dst += 32;
+                continue;
+            }
+            const unsigned n = static_cast<unsigned>(__builtin_ctz(mask));
+            if (n > 0u) {
+                const __m256i pmask = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(kUtf8PrefixMask + 32u - n));
+                const __m256i v_pre = _mm256_and_si256(v, pmask);
+                if (_mm256_movemask_epi8(_mm256_or_si256(prev, v_pre)) != 0) {
+                    validate_utf8_step_avx2(prev, v_pre, err);
+                }
+                p += n;
+                dst += n;
+            } else if (_mm256_movemask_epi8(prev) != 0) {
+                validate_utf8_step_avx2(prev, zero, err);
+            }
+            prev = zero;
+            if (NEOJSON_LIKELY(*p == '"')) {
+                if (NEOJSON_UNLIKELY(_mm256_testz_si256(err, err) == 0)) {
+                    return {nullptr, dst_start};
+                }
+                *dst = '\0';
+                const std::size_t slen = static_cast<std::size_t>(dst - dst_start);
+                out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
                 out->uni.str = dst_start;
-                p_io = p + n + 1u;
-                str_cur_io = dst_start + n + 1u;
-                return true;
+                return {p + 1, dst + 1};
             }
-            p += n;
-            dst = dst_start + n;
-            if (static_cast<unsigned char>(*p) >= 0x80u) {
-                const StrParseRes sr =
-                    parse_string_utf8_avx2(p, end, dst_start, dst, out, YYJSON_SUBTYPE_NOESC);
-                p_io = sr.p;
-                str_cur_io = sr.str_cur;
-                return sr.p != nullptr;
+            if (NEOJSON_LIKELY(*p == '\\')) {
+                if (p + 1 < end) {
+                    const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                    if (NEOJSON_LIKELY(ec != 0)) {
+                        *dst++ = ec;
+                        p += 2;
+                        subtype = YYJSON_SUBTYPE_NONE;
+                        continue;
+                    }
+                }
+                if (NEOJSON_UNLIKELY(_mm256_testz_si256(err, err) == 0)) {
+                    return {nullptr, dst_start};
+                }
+                return parse_string_slow(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
             }
-            if (*p == '\\' && p + 1 < end) {
-                const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
-                if (NEOJSON_LIKELY(ec != 0)) {
-                    *dst++ = ec;
-                    p += 2;
-                    subtype = YYJSON_SUBTYPE_NONE;
-                } else {
+            return {nullptr, dst_start};
+        }
+
+        if (NEOJSON_UNLIKELY(_mm256_testz_si256(err, err) == 0)) {
+            return {nullptr, dst_start};
+        }
+        if (_mm256_movemask_epi8(prev) != 0) {
+            std::size_t back = 0u;
+            if (static_cast<unsigned char>(p[-1]) >= 0xC0u) {
+                back = 1u;
+            } else if (static_cast<unsigned char>(p[-2]) >= 0xE0u) {
+                back = 2u;
+            } else if (static_cast<unsigned char>(p[-3]) >= 0xF0u) {
+                back = 3u;
+            }
+            p -= back;
+            dst -= back;
+        }
+        return parse_string_slow(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+    }
+
+    static NEOJSON_NOINLINE __attribute__((target("avx2"))) StrParseRes parse_string_key_tail(
+        const char* p, const char* const end, char* const dst_start, char* dst,
+        yyjson_val* const out) noexcept {
+        const __m256i v_quote =
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
+        const __m256i v_bslash =
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
+        const __m256i v_1f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
+        while (end - p >= 32) {
+            const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), vc);
+            const std::uint32_t qm = static_cast<std::uint32_t>(
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(vc, v_quote)));
+            const __m256i okc =
+                _mm256_andnot_si256(_mm256_cmpeq_epi8(vc, v_bslash), _mm256_cmpgt_epi8(vc, v_1f));
+            const std::uint32_t bm = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(okc));
+            if (NEOJSON_LIKELY(qm != 0u && (bm & (qm ^ (qm - 1u))) == 0u)) {
+                const unsigned m = static_cast<unsigned>(__builtin_ctz(qm));
+                dst[m] = '\0';
+                const std::size_t slen = static_cast<std::size_t>((dst + m) - dst_start);
+                out->tag = (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR |
+                           YYJSON_SUBTYPE_NOESC;
+                out->uni.str = dst_start;
+                return {p + m + 1u, dst + m + 1u};
+            }
+            if (bm != 0u) {
+                const unsigned b = static_cast<unsigned>(__builtin_ctz(bm));
+                return parse_string_slow(p + b, end, dst_start, dst + b, out, false);
+            }
+            p += 32;
+            dst += 32;
+        }
+        return parse_string_slow(p, end, dst_start, dst, out, false);
+    }
+
+    static NEOJSON_ALWAYS_INLINE __attribute__((target("avx2"))) bool parse_string_val_fast(
+        const char*& p_io, const char* const end, char*& str_cur_io,
+        yyjson_val* const out) noexcept {
+        const char* p = p_io;
+        char* const dst_start = str_cur_io;
+        char* dst = dst_start;
+        if (NEOJSON_LIKELY(end - p >= 32)) {
+            std::uint32_t spec_mask = 0u;
+            {
+                const __m256i v_quote =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
+                const __m256i v_bslash =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
+                const __m256i v_1f =
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_start), v);
+                const __m256i v_esc_or_q = _mm256_or_si256(
+                    _mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
+                const __m256i v_ok = _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(v, v_1f));
+                spec_mask = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(v_ok));
+            }
+            std::uint8_t subtype = YYJSON_SUBTYPE_NOESC;
+            if (spec_mask != 0u) {
+                const unsigned n = static_cast<unsigned>(__builtin_ctz(spec_mask));
+                if (NEOJSON_LIKELY(p[n] == '"')) {
+                    dst_start[n] = '\0';
+                    out->tag = (static_cast<std::uint64_t>(n) << 8u) | YYJSON_TYPE_STR |
+                               YYJSON_SUBTYPE_NOESC;
+                    out->uni.str = dst_start;
+                    p_io = p + n + 1u;
+                    str_cur_io = dst_start + n + 1u;
+                    return true;
+                }
+                p += n;
+                dst = dst_start + n;
+                if (static_cast<unsigned char>(*p) >= 0x80u) {
                     const StrParseRes sr =
-                        parse_string_slow_avx2(p, end, dst_start, dst, out, false);
+                        parse_string_utf8(p, end, dst_start, dst, out, YYJSON_SUBTYPE_NOESC);
+                    p_io = sr.p;
+                    str_cur_io = sr.str_cur;
+                    return sr.p != nullptr;
+                }
+                if (*p == '\\' && p + 1 < end) {
+                    const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                    if (NEOJSON_LIKELY(ec != 0)) {
+                        *dst++ = ec;
+                        p += 2;
+                        subtype = YYJSON_SUBTYPE_NONE;
+                    } else {
+                        const StrParseRes sr =
+                            parse_string_slow(p, end, dst_start, dst, out, false);
+                        p_io = sr.p;
+                        str_cur_io = sr.str_cur;
+                        return sr.p != nullptr;
+                    }
+                } else {
+                    const StrParseRes sr = parse_string_slow(p, end, dst_start, dst, out, false);
                     p_io = sr.p;
                     str_cur_io = sr.str_cur;
                     return sr.p != nullptr;
                 }
             } else {
-                const StrParseRes sr = parse_string_slow_avx2(p, end, dst_start, dst, out, false);
-                p_io = sr.p;
-                str_cur_io = sr.str_cur;
-                return sr.p != nullptr;
+                p += 32;
+                dst = dst_start + 32;
             }
-        } else {
-            p += 32;
-            dst = dst_start + 32;
-        }
 
-        if (end - p >= 32) {
-            do {
-                std::uint32_t sm = 0u;
-                {
-                    const __m256i v_quote_l =
-                        _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-                    const __m256i v_bslash_l =
-                        _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-                    const __m256i v_1f_l =
-                        _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
-                    const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), vc);
-                    const __m256i v_esc_or_q = _mm256_or_si256(
-                        _mm256_cmpeq_epi8(vc, v_quote_l), _mm256_cmpeq_epi8(vc, v_bslash_l));
-                    const __m256i okc =
-                        _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(vc, v_1f_l));
-                    sm = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(okc));
-                }
-                if (sm != 0u) {
-                    const unsigned m = static_cast<unsigned>(__builtin_ctz(sm));
-                    if (NEOJSON_LIKELY(p[m] == '"')) {
-                        dst[m] = '\0';
-                        const std::size_t slen = static_cast<std::size_t>((dst + m) - dst_start);
-                        out->tag =
-                            (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
-                        out->uni.str = dst_start;
-                        p_io = p + m + 1u;
-                        str_cur_io = dst + m + 1u;
-                        return true;
+            if (end - p >= 32) {
+                do {
+                    std::uint32_t sm = 0u;
+                    {
+                        const __m256i v_quote_l =
+                            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
+                        const __m256i v_bslash_l =
+                            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
+                        const __m256i v_1f_l =
+                            _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
+                        const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), vc);
+                        const __m256i v_esc_or_q = _mm256_or_si256(
+                            _mm256_cmpeq_epi8(vc, v_quote_l), _mm256_cmpeq_epi8(vc, v_bslash_l));
+                        const __m256i okc =
+                            _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(vc, v_1f_l));
+                        sm = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(okc));
                     }
-                    p += m;
-                    dst += m;
-                    if (static_cast<unsigned char>(*p) >= 0x80u) {
-                        const StrParseRes sr =
-                            parse_string_utf8_avx2(p, end, dst_start, dst, out, subtype);
+                    if (sm != 0u) {
+                        const unsigned m = static_cast<unsigned>(__builtin_ctz(sm));
+                        if (NEOJSON_LIKELY(p[m] == '"')) {
+                            dst[m] = '\0';
+                            const std::size_t slen =
+                                static_cast<std::size_t>((dst + m) - dst_start);
+                            out->tag =
+                                (static_cast<std::uint64_t>(slen) << 8u) | YYJSON_TYPE_STR | subtype;
+                            out->uni.str = dst_start;
+                            p_io = p + m + 1u;
+                            str_cur_io = dst + m + 1u;
+                            return true;
+                        }
+                        p += m;
+                        dst += m;
+                        if (static_cast<unsigned char>(*p) >= 0x80u) {
+                            const StrParseRes sr =
+                                parse_string_utf8(p, end, dst_start, dst, out, subtype);
+                            p_io = sr.p;
+                            str_cur_io = sr.str_cur;
+                            return sr.p != nullptr;
+                        }
+                        if (*p == '\\' && p + 1 < end) {
+                            const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
+                            if (NEOJSON_LIKELY(ec != 0)) {
+                                *dst++ = ec;
+                                p += 2;
+                                subtype = YYJSON_SUBTYPE_NONE;
+                                continue;
+                            }
+                        }
+                        const StrParseRes sr = parse_string_slow(
+                            p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
                         p_io = sr.p;
                         str_cur_io = sr.str_cur;
                         return sr.p != nullptr;
                     }
-                    if (*p == '\\' && p + 1 < end) {
-                        const char ec = kSimpleEsc.ch[static_cast<unsigned char>(p[1])];
-                        if (NEOJSON_LIKELY(ec != 0)) {
-                            *dst++ = ec;
-                            p += 2;
-                            subtype = YYJSON_SUBTYPE_NONE;
-                            continue;
-                        }
-                    }
-                    const StrParseRes sr = parse_string_slow_avx2(
-                        p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
-                    p_io = sr.p;
-                    str_cur_io = sr.str_cur;
-                    return sr.p != nullptr;
-                }
-                p += 32;
-                dst += 32;
-            } while (end - p >= 32);
+                    p += 32;
+                    dst += 32;
+                } while (end - p >= 32);
+            }
+            const StrParseRes sr =
+                parse_string_slow(p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+            p_io = sr.p;
+            str_cur_io = sr.str_cur;
+            return sr.p != nullptr;
         }
-        const StrParseRes sr = parse_string_slow_avx2(
-            p, end, dst_start, dst, out, subtype == YYJSON_SUBTYPE_NONE);
+        const StrParseRes sr = parse_string_slow(p, end, dst_start, dst, out, false);
         p_io = sr.p;
         str_cur_io = sr.str_cur;
         return sr.p != nullptr;
     }
-    const StrParseRes sr = parse_string_slow_avx2(p, end, dst_start, dst, out, false);
-    p_io = sr.p;
-    str_cur_io = sr.str_cur;
-    return sr.p != nullptr;
-}
+};
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) int parse_num_pair_run_avx2(
+#endif // NEOJSON_X86_SIMD
+
+template <typename SimdOps>
+NEOJSON_NOINLINE NEOJSON_PARSER_TARGET int parse_num_pair_run(
     ParseRunCtx* const st, const char* const end, const std::size_t kHdrVals) noexcept {
     const char* p = st->p;
     yyjson_val* val = st->val;
     yyjson_val* val_end = st->val_end;
     std::size_t ctn_len = st->ctn_len;
 
-    while (p + 4 < end &&
-           (p[1] == '-' || static_cast<unsigned>(static_cast<unsigned char>(p[1]) - '0') <= 9u)) {
+    if (NEOJSON_UNLIKELY(
+            end - p < 5 ||
+            (p[1] != '-' &&
+             static_cast<unsigned>(static_cast<unsigned char>(p[1]) - '0') > 9u))) {
+        st->p = p;
+        st->val = val;
+        st->val_end = val_end;
+        st->ctn_len = ctn_len;
+        return 1;
+    }
+
+    for (;;) {
         if (NEOJSON_UNLIKELY(val >= val_end)) {
             st->val = val;
             if (NEOJSON_UNLIKELY(!grow_parse_vals_ptr(st, kHdrVals, 8u))) {
@@ -11493,84 +11609,114 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) int parse_num_pair_run_avx2(
             val = st->val;
             val_end = st->val_end;
         }
-        const char* p1 = parse_number_core_avx2(p + 1, end, val + 1);
-        if (NEOJSON_UNLIKELY(p1 == nullptr)) {
+        const char* p1 = parse_number_core(p + 1, end, val + 1);
+        if (NEOJSON_UNLIKELY(p1 == nullptr || p1 >= end)) {
             return 0;
         }
-        if (NEOJSON_UNLIKELY(p1 < end && static_cast<unsigned char>(*p1) <= 0x20u)) {
-            p1 = skip_ws_avx2_slow(p1, end);
-        }
-        if (p1 < end && *p1 == ',') {
-            const char* p2s = p1 + 1;
-            if (NEOJSON_UNLIKELY(p2s < end && static_cast<unsigned char>(*p2s) <= 0x20u)) {
-                p2s = skip_ws_avx2_slow(p2s, end);
+        if (NEOJSON_UNLIKELY(*p1 != ',')) {
+            if (static_cast<unsigned char>(*p1) <= 0x20u) {
+                p1 = SimdOps::skip_ws_slow(p1, end);
             }
-            if (p2s < end &&
-                (*p2s == '-' ||
-                 static_cast<unsigned>(static_cast<unsigned char>(*p2s) - '0') <= 9u)) {
-                const char* p2 = parse_number_core_avx2(p2s, end, val + 2);
-                if (NEOJSON_UNLIKELY(p2 == nullptr)) {
-                    return 0;
-                }
-                if (NEOJSON_UNLIKELY(p2 < end && static_cast<unsigned char>(*p2) <= 0x20u)) {
-                    p2 = skip_ws_avx2_slow(p2, end);
-                }
-                if (p2 < end && *p2 == ']') {
-                    val[0].tag = (2ULL << 8u) | YYJSON_TYPE_ARR;
-                    val[0].uni.ofs = 3u * sizeof(yyjson_val);
-                    val += 3;
-                    ++ctn_len;
-                    p = p2 + 1;
-                    if (NEOJSON_UNLIKELY(p < end && static_cast<unsigned char>(*p) <= 0x20u)) {
-                        p = skip_ws_avx2_slow(p, end);
-                    }
-                    if (p < end && *p == ',') {
-                        const char* pn = p + 1;
-                        if (NEOJSON_UNLIKELY(pn < end &&
-                                             static_cast<unsigned char>(*pn) <= 0x20u)) {
-                            pn = skip_ws_avx2_slow(pn, end);
-                        }
-                        p = pn;
-                        if (pn + 4 < end && *pn == '[' &&
-                            (pn[1] == '-' ||
-                             static_cast<unsigned>(static_cast<unsigned char>(pn[1]) - '0') <=
-                                 9u)) {
-                            continue;
-                        }
-                        st->p = p;
-                        st->val = val;
-                        st->val_end = val_end;
-                        st->ctn_len = ctn_len;
-                        return 1;
-                    }
-                    st->p = p;
-                    st->val = val;
-                    st->val_end = val_end;
-                    st->ctn_len = ctn_len;
-                    return 2;
-                }
+            if (p1 >= end || *p1 != ',') {
+                st->p = p1;
+                st->val = val;
+                st->val_end = val_end;
+                st->ctn_len = ctn_len;
+                return 3;
             }
         }
-        st->p = p1;
+        const char* p2s = p1 + 1;
+        if (NEOJSON_UNLIKELY(p2s >= end)) {
+            st->p = p1;
+            st->val = val;
+            st->val_end = val_end;
+            st->ctn_len = ctn_len;
+            return 3;
+        }
+        if (NEOJSON_UNLIKELY(*p2s != '-' &&
+                             static_cast<unsigned>(static_cast<unsigned char>(*p2s) - '0') > 9u)) {
+            if (static_cast<unsigned char>(*p2s) <= 0x20u) {
+                p2s = SimdOps::skip_ws_slow(p2s, end);
+            }
+            if (p2s >= end ||
+                (*p2s != '-' &&
+                 static_cast<unsigned>(static_cast<unsigned char>(*p2s) - '0') > 9u)) {
+                st->p = p1;
+                st->val = val;
+                st->val_end = val_end;
+                st->ctn_len = ctn_len;
+                return 3;
+            }
+        }
+        const char* p2 = parse_number_core(p2s, end, val + 2);
+        if (NEOJSON_UNLIKELY(p2 == nullptr || p2 >= end)) {
+            return 0;
+        }
+        if (NEOJSON_UNLIKELY(*p2 != ']')) {
+            if (static_cast<unsigned char>(*p2) <= 0x20u) {
+                p2 = SimdOps::skip_ws_slow(p2, end);
+            }
+            if (p2 >= end || *p2 != ']') {
+                st->p = p1;
+                st->val = val;
+                st->val_end = val_end;
+                st->ctn_len = ctn_len;
+                return 3;
+            }
+        }
+        val[0].tag = (2ULL << 8u) | YYJSON_TYPE_ARR;
+        val[0].uni.ofs = 3u * sizeof(yyjson_val);
+        val += 3;
+        ++ctn_len;
+        p = p2 + 1;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if (NEOJSON_LIKELY(end - p >= 6)) {
+            std::uint16_t sep2 = 0u;
+            std::memcpy(&sep2, p, 2u);
+            if (NEOJSON_LIKELY(sep2 == 0x5B2Cu) &&
+                (p[2] == '-' ||
+                 static_cast<unsigned>(static_cast<unsigned char>(p[2]) - '0') <= 9u)) {
+                ++p;
+                continue;
+            }
+        }
+#endif
+        if (NEOJSON_UNLIKELY(p < end && static_cast<unsigned char>(*p) <= 0x20u)) {
+            p = SimdOps::skip_ws_slow(p, end);
+        }
+        if (p < end && *p == ',') {
+            const char* pn = p + 1;
+            if (NEOJSON_UNLIKELY(pn < end && static_cast<unsigned char>(*pn) <= 0x20u)) {
+                pn = SimdOps::skip_ws_slow(pn, end);
+            }
+            p = pn;
+            if (end - pn >= 5 && *pn == '[' &&
+                (pn[1] == '-' ||
+                 static_cast<unsigned>(static_cast<unsigned char>(pn[1]) - '0') <= 9u)) {
+                continue;
+            }
+            st->p = p;
+            st->val = val;
+            st->val_end = val_end;
+            st->ctn_len = ctn_len;
+            return 1;
+        }
+        st->p = p;
         st->val = val;
         st->val_end = val_end;
         st->ctn_len = ctn_len;
-        return 3;
+        return 2;
     }
-    st->p = p;
-    st->val = val;
-    st->val_end = val_end;
-    st->ctn_len = ctn_len;
-    return 1;
 }
 
-NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_avx2(
+template <typename SimdOps>
+NEOJSON_NOINLINE NEOJSON_PARSER_TARGET yyjson_doc* parse_native_simd_impl(
     const char* const data, const std::size_t len, const std::size_t max_depth,
     ParseRunCtx* const ctx) noexcept {
     const char* p = data;
     const char* const end = data + len;
 
-    p = skip_ws_inline_avx2(p, end);
+    p = SimdOps::skip_ws_inline(p, end);
     if (p >= end || (*p != '{' && *p != '[')) {
         return nullptr;
     }
@@ -11603,7 +11749,7 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
     ctn->uni.ofs = 0u;
     if (*p == '{') {
         ctn->tag = YYJSON_TYPE_OBJ;
-        p = skip_ws_inline_avx2(p + 1, end);
+        p = SimdOps::skip_ws_inline(p + 1, end);
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
         }
@@ -11614,7 +11760,7 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
         goto obj_key_begin_no_ws;
     } else {
         ctn->tag = YYJSON_TYPE_ARR;
-        p = skip_ws_inline_avx2(p + 1, end);
+        p = SimdOps::skip_ws_inline(p + 1, end);
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
         }
@@ -11626,14 +11772,8 @@ NEOJSON_NOINLINE __attribute__((target("avx2"))) yyjson_doc* parse_native_simd_a
     }
 
 obj_key_begin_spaces:
-    if (NEOJSON_LIKELY(end - p >= 32)) {
-        std::uint32_t non_sp = 0u;
-        {
-            const __m256i v_20 = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd20_32));
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            non_sp = ~static_cast<std::uint32_t>(
-                _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_20)));
-        }
+    if (NEOJSON_LIKELY(end - p >= static_cast<std::ptrdiff_t>(SimdOps::kVecBytes))) {
+        const std::uint32_t non_sp = SimdOps::scan_non_space_mask(p);
         IndentSlot& slot = ctx->indent_by_depth[ctx->depth_rem & 15u];
         const std::uint32_t k = slot.k;
         const std::uint32_t mask = slot.mask;
@@ -11645,27 +11785,27 @@ obj_key_begin_spaces:
             const unsigned n = static_cast<unsigned>(__builtin_ctz(non_sp));
             p += n;
             if (NEOJSON_LIKELY(*p == '"')) {
-                if (n <= 31u) {
+                if (n < SimdOps::kVecBytes) {
                     slot = IndentSlot{n, kIndentMask32[n]};
                 }
                 goto obj_key_got_quote;
             }
-            p = skip_ws_inline_avx2(p, end);
+            p = SimdOps::skip_ws_inline(p, end);
             if (NEOJSON_UNLIKELY(p >= end)) {
                 goto fail;
             }
             goto obj_key_begin_no_ws;
         }
-        p = skip_ws_avx2_slow(p + 32, end);
+        p = SimdOps::skip_ws_slow(p + SimdOps::kVecBytes, end);
     } else {
-        p = skip_ws_avx2_slow(p, end);
+        p = SimdOps::skip_ws_slow(p, end);
     }
     if (NEOJSON_UNLIKELY(p >= end)) {
         goto fail;
     }
     goto obj_key_begin_no_ws;
 obj_key_begin:
-    p = skip_ws_inline_avx2(p, end);
+    p = SimdOps::skip_ws_inline(p, end);
     if (NEOJSON_UNLIKELY(p >= end)) {
         goto fail;
     }
@@ -11686,21 +11826,8 @@ obj_key_got_quote:
     }
     ++p;
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    if (NEOJSON_LIKELY(end - p >= 35)) {
-        std::uint32_t spec_mask = 0u;
-        {
-            const __m256i v_quote =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-            const __m256i v_bslash =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-            const __m256i v_1f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(str_cur), v);
-            const __m256i v_esc_or_q = _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
-            const __m256i v_ok = _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(v, v_1f));
-            spec_mask = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(v_ok));
-        }
+    if (NEOJSON_LIKELY(end - p >= static_cast<std::ptrdiff_t>(SimdOps::kVecBytes + 3u))) {
+        const std::uint32_t spec_mask = SimdOps::copy_and_scan_key_ascii(p, str_cur);
         if (NEOJSON_LIKELY(spec_mask != 0u)) {
             const unsigned n = static_cast<unsigned>(__builtin_ctz(spec_mask));
             std::uint32_t w4 = 0u;
@@ -11744,7 +11871,7 @@ obj_key_got_quote:
                 goto obj_key_after_str;
             }
             const StrParseRes sr =
-                parse_string_slow_avx2(p + n, end, str_cur, str_cur + n, val++, false);
+                SimdOps::parse_string_slow(p + n, end, str_cur, str_cur + n, val++, false);
             p = sr.p;
             str_cur = sr.str_cur;
             if (NEOJSON_UNLIKELY(p == nullptr)) {
@@ -11752,8 +11879,8 @@ obj_key_got_quote:
             }
             goto obj_key_after_str;
         }
-        const StrParseRes sr =
-            parse_string_key_tail_avx2(p + 32, end, str_cur, str_cur + 32, val++);
+        const StrParseRes sr = SimdOps::parse_string_key_tail(
+            p + SimdOps::kVecBytes, end, str_cur, str_cur + SimdOps::kVecBytes, val++);
         p = sr.p;
         str_cur = sr.str_cur;
         if (NEOJSON_UNLIKELY(p == nullptr)) {
@@ -11762,7 +11889,7 @@ obj_key_got_quote:
         goto obj_key_after_str;
     }
     {
-        const StrParseRes sr = parse_string_slow_avx2(p, end, str_cur, str_cur, val++, false);
+        const StrParseRes sr = SimdOps::parse_string_slow(p, end, str_cur, str_cur, val++, false);
         p = sr.p;
         str_cur = sr.str_cur;
         if (NEOJSON_UNLIKELY(p == nullptr)) {
@@ -11770,21 +11897,8 @@ obj_key_got_quote:
         }
     }
 #else
-    if (NEOJSON_LIKELY(end - p >= 32)) {
-        std::uint32_t spec_mask = 0u;
-        {
-            const __m256i v_quote =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdQuote32));
-            const __m256i v_bslash =
-                _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimdBslash32));
-            const __m256i v_1f = _mm256_load_si256(reinterpret_cast<const __m256i*>(kSimd1F_32));
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(str_cur), v);
-            const __m256i v_esc_or_q = _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, v_quote), _mm256_cmpeq_epi8(v, v_bslash));
-            const __m256i v_ok = _mm256_andnot_si256(v_esc_or_q, _mm256_cmpgt_epi8(v, v_1f));
-            spec_mask = ~static_cast<std::uint32_t>(_mm256_movemask_epi8(v_ok));
-        }
+    if (NEOJSON_LIKELY(end - p >= static_cast<std::ptrdiff_t>(SimdOps::kVecBytes))) {
+        const std::uint32_t spec_mask = SimdOps::copy_and_scan_key_ascii(p, str_cur);
         if (NEOJSON_LIKELY(spec_mask != 0u)) {
             const unsigned n = static_cast<unsigned>(__builtin_ctz(spec_mask));
             if (NEOJSON_LIKELY(p[n] == '"')) {
@@ -11798,7 +11912,7 @@ obj_key_got_quote:
                 goto obj_key_after_str;
             }
             const StrParseRes sr =
-                parse_string_slow_avx2(p + n, end, str_cur, str_cur + n, val++, false);
+                SimdOps::parse_string_slow(p + n, end, str_cur, str_cur + n, val++, false);
             p = sr.p;
             str_cur = sr.str_cur;
             if (NEOJSON_UNLIKELY(p == nullptr)) {
@@ -11806,15 +11920,15 @@ obj_key_got_quote:
             }
             goto obj_key_after_str;
         }
-        const StrParseRes sr =
-            parse_string_key_tail_avx2(p + 32, end, str_cur, str_cur + 32, val++);
+        const StrParseRes sr = SimdOps::parse_string_key_tail(
+            p + SimdOps::kVecBytes, end, str_cur, str_cur + SimdOps::kVecBytes, val++);
         p = sr.p;
         str_cur = sr.str_cur;
         if (NEOJSON_UNLIKELY(p == nullptr)) {
             goto fail;
         }
     } else {
-        const StrParseRes sr = parse_string_slow_avx2(p, end, str_cur, str_cur, val++, false);
+        const StrParseRes sr = SimdOps::parse_string_slow(p, end, str_cur, str_cur, val++, false);
         p = sr.p;
         str_cur = sr.str_cur;
         if (NEOJSON_UNLIKELY(p == nullptr)) {
@@ -11831,21 +11945,21 @@ obj_key_after_str:
         if (NEOJSON_LIKELY(sep == 0x203Au)) {
             p += 2;
             if (NEOJSON_UNLIKELY(static_cast<unsigned char>(*p) <= 0x20u)) {
-                p = skip_ws_avx2_slow(p, end);
+                p = SimdOps::skip_ws_slow(p, end);
                 if (NEOJSON_UNLIKELY(p >= end)) {
                     goto fail;
                 }
             }
         } else {
             if (*p != ':') {
-                p = skip_ws_avx2_slow(p, end);
+                p = SimdOps::skip_ws_slow(p, end);
                 if (NEOJSON_UNLIKELY(p >= end || *p != ':')) {
                     goto fail;
                 }
             }
             ++p;
             if (p < end && static_cast<unsigned char>(*p) <= 0x20u) {
-                p = skip_ws_avx2_slow(p, end);
+                p = SimdOps::skip_ws_slow(p, end);
             }
             if (NEOJSON_UNLIKELY(p >= end)) {
                 goto fail;
@@ -11855,14 +11969,14 @@ obj_key_after_str:
 #endif
     {
         if (p >= end || *p != ':') {
-            p = skip_ws_avx2_slow(p, end);
+            p = SimdOps::skip_ws_slow(p, end);
             if (NEOJSON_UNLIKELY(p >= end || *p != ':')) {
                 goto fail;
             }
         }
         ++p;
         if (p < end && static_cast<unsigned char>(*p) <= 0x20u) {
-            p = skip_ws_avx2_slow(p, end);
+            p = SimdOps::skip_ws_slow(p, end);
         }
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
@@ -11872,7 +11986,7 @@ obj_key_after_str:
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     if (false) {
     obj_val_skip_ws:
-        p = skip_ws_avx2_slow(p, end);
+        p = SimdOps::skip_ws_slow(p, end);
         if (NEOJSON_UNLIKELY(p >= end)) {
             goto fail;
         }
@@ -11885,7 +11999,7 @@ obj_val_dispatch_c:
         const unsigned char c = val_c;
         if (c == '"') {
             ++p;
-            if (NEOJSON_UNLIKELY(!parse_string_val_fast_avx2(p, end, str_cur, val++))) {
+            if (NEOJSON_UNLIKELY(!SimdOps::parse_string_val_fast(p, end, str_cur, val++))) {
                 goto fail;
             }
             ++ctn_len;
@@ -11902,10 +12016,10 @@ obj_val_dispatch_c:
                     p += 2;
                 } else {
                     if (p + 1 < end && p[1] == '\n') {
-                        p = skip_spaces_once_avx2(
+                        p = SimdOps::skip_spaces_once(
                             p + 2, end, ctx->indent_by_depth[(ctx->depth_rem - 1u) & 15u]);
                     } else {
-                        p = skip_ws_inline_avx2(p + 1, end);
+                        p = SimdOps::skip_ws_inline(p + 1, end);
                     }
                     if (NEOJSON_UNLIKELY(p >= end)) {
                         goto fail;
@@ -11939,10 +12053,10 @@ obj_val_dispatch_c:
                     p += 2;
                 } else {
                     if (p + 1 < end && p[1] == '\n') {
-                        p = skip_spaces_once_avx2(
+                        p = SimdOps::skip_spaces_once(
                             p + 2, end, ctx->indent_by_depth[(ctx->depth_rem - 1u) & 15u]);
                     } else {
-                        p = skip_ws_inline_avx2(p + 1, end);
+                        p = SimdOps::skip_ws_inline(p + 1, end);
                     }
                     if (NEOJSON_UNLIKELY(p >= end)) {
                         goto fail;
@@ -11971,7 +12085,7 @@ obj_val_dispatch_c:
         } else if (static_cast<unsigned>(static_cast<unsigned>(c) - static_cast<unsigned>('0')) <=
                        9u ||
                    c == '-') {
-            p = parse_number_inline_int_avx2(p, end, val++);
+            p = parse_number_inline_int(p, end, val++);
             if (NEOJSON_UNLIKELY(p == nullptr)) {
                 goto fail;
             }
@@ -12031,9 +12145,10 @@ obj_val_end:
             goto obj_end;
         }
         if (*p == '\n') {
-            p = skip_spaces_once_avx2(p + 1, end, ctx->indent_by_depth[(ctx->depth_rem + 1u) & 15u]);
+            p = SimdOps::skip_spaces_once(
+                p + 1, end, ctx->indent_by_depth[(ctx->depth_rem + 1u) & 15u]);
         } else {
-            p = skip_ws_inline_avx2(p, end);
+            p = SimdOps::skip_ws_inline(p, end);
         }
         if (NEOJSON_LIKELY(p < end)) {
             if (*p == '}') {
@@ -12067,13 +12182,13 @@ obj_end: {
 }
 
 arr_val_begin_spaces:
-    p = skip_spaces_once_avx2(p, end, ctx->indent_by_depth[ctx->depth_rem & 15u]);
+    p = SimdOps::skip_spaces_once(p, end, ctx->indent_by_depth[ctx->depth_rem & 15u]);
     if (NEOJSON_UNLIKELY(p >= end)) {
         goto fail;
     }
     goto arr_val_begin_no_ws;
 arr_val_begin:
-    p = skip_ws_inline_avx2(p, end);
+    p = SimdOps::skip_ws_inline(p, end);
     if (NEOJSON_UNLIKELY(p >= end)) {
         goto fail;
     }
@@ -12104,10 +12219,10 @@ arr_val_begin_no_ws:
                     p += 2;
                 } else {
                     if (p + 1 < end && p[1] == '\n') {
-                        p = skip_spaces_once_avx2(
+                        p = SimdOps::skip_spaces_once(
                             p + 2, end, ctx->indent_by_depth[(ctx->depth_rem - 1u) & 15u]);
                     } else {
-                        p = skip_ws_inline_avx2(p + 1, end);
+                        p = SimdOps::skip_ws_inline(p + 1, end);
                     }
                     if (NEOJSON_UNLIKELY(p >= end)) {
                         goto fail;
@@ -12139,7 +12254,7 @@ arr_val_begin_no_ws:
                     ++val;
                     ++ctn_len;
                     p += 2;
-                } else if (p + 4 < end &&
+                } else if (end - p >= 5 &&
                            (p[1] == '-' ||
                             static_cast<unsigned>(static_cast<unsigned char>(p[1]) - '0') <= 9u)) {
                     ctx->p = p;
@@ -12147,7 +12262,7 @@ arr_val_begin_no_ws:
                     ctx->val_end = val_end;
                     ctx->ctn = ctn;
                     ctx->ctn_len = ctn_len;
-                    const int pair_rc = parse_num_pair_run_avx2(ctx, end, kHdrVals);
+                    const int pair_rc = parse_num_pair_run<SimdOps>(ctx, end, kHdrVals);
                     val = ctx->val;
                     val_end = ctx->val_end;
                     ctn = ctx->ctn;
@@ -12175,10 +12290,10 @@ arr_val_begin_no_ws:
                     goto arr_val_end;
                 } else {
                     if (p + 1 < end && p[1] == '\n') {
-                        p = skip_spaces_once_avx2(
+                        p = SimdOps::skip_spaces_once(
                             p + 2, end, ctx->indent_by_depth[(ctx->depth_rem - 1u) & 15u]);
                     } else {
-                        p = skip_ws_inline_avx2(p + 1, end);
+                        p = SimdOps::skip_ws_inline(p + 1, end);
                     }
                     if (NEOJSON_UNLIKELY(p >= end)) {
                         goto fail;
@@ -12207,14 +12322,14 @@ arr_val_begin_no_ws:
         } else if (static_cast<unsigned>(static_cast<unsigned>(c) - static_cast<unsigned>('0')) <=
                        9u ||
                    c == '-') {
-            p = parse_number_inline_int_avx2(p, end, val++);
+            p = parse_number_inline_int(p, end, val++);
             if (NEOJSON_UNLIKELY(p == nullptr)) {
                 goto fail;
             }
             ++ctn_len;
         } else if (c == '"') {
             ++p;
-            if (NEOJSON_UNLIKELY(!parse_string_val_fast_avx2(p, end, str_cur, val++))) {
+            if (NEOJSON_UNLIKELY(!SimdOps::parse_string_val_fast(p, end, str_cur, val++))) {
                 goto fail;
             }
             ++ctn_len;
@@ -12261,9 +12376,10 @@ arr_val_end:
             goto arr_end;
         }
         if (*p == '\n') {
-            p = skip_spaces_once_avx2(p + 1, end, ctx->indent_by_depth[(ctx->depth_rem + 1u) & 15u]);
+            p = SimdOps::skip_spaces_once(
+                p + 1, end, ctx->indent_by_depth[(ctx->depth_rem + 1u) & 15u]);
         } else {
-            p = skip_ws_inline_avx2(p, end);
+            p = SimdOps::skip_ws_inline(p, end);
         }
         if (NEOJSON_LIKELY(p < end)) {
             if (*p == ']') {
@@ -12297,7 +12413,7 @@ arr_end: {
 }
 
 doc_end: {
-    p = skip_ws_inline_avx2(p, end);
+    p = SimdOps::skip_ws_inline(p, end);
     if (NEOJSON_UNLIKELY(p != end)) {
         goto fail;
     }
@@ -12319,15 +12435,15 @@ fail:
     return nullptr;
 }
 
-#endif // NEOJSON_X86_SIMD && defined(__SIZEOF_INT128__)
+#endif // NEOJSON_NATIVE_PARSER
 
 inline yyjson_doc* try_parse_native_simd_doc(const std::string_view s,
                                              const std::size_t max_depth) {
-#if NEOJSON_X86_SIMD && defined(__SIZEOF_INT128__)
-    if (NEOJSON_LIKELY(has_avx2() && s.size() >= 32u && max_depth > 0u &&
+#if NEOJSON_NATIVE_PARSER && NEOJSON_X86_SIMD
+    if (NEOJSON_LIKELY(has_avx2() && s.size() >= Avx2ParserOps::kMinLen && max_depth > 0u &&
                        static_cast<unsigned char>(s[0]) != 0xEFu)) {
         ParseRunCtx ctx{};
-        return parse_native_simd_avx2(s.data(), s.size(), max_depth, &ctx);
+        return parse_native_simd_impl<Avx2ParserOps>(s.data(), s.size(), max_depth, &ctx);
     }
 #else
     (void)s;
