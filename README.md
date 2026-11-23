@@ -21,6 +21,29 @@ nlohmann/json are the specification. Work in progress.
 
 License: MIT. yyjson (vendor/yyjson) is MIT licensed.
 
+## Benchmarks
+
+Single-thread in-memory throughput across the standard 4-file JSON benchmark corpus (`canada.json`, `citm_catalog.json`, `gsoc-2018.json`, `twitter.json`; `7.94 MB` total, median of 7 alternating rounds × 7 batches, GCC 13.3.0 `-O3 -DNDEBUG`, no `-march=native`, C++20 benchmark harnesses with `libneojson` built as C++17 per root `CMakeLists.txt`).
+
+On x86-64 AVX2 (`Intel Core i7-8750H`), `neojson` parses **26.2× faster** than `nlohmann::ordered_json` and **1.53× faster** than the `yyjson` C API while serializing **1.46× faster**. On ARM64 NEON (`ARM Neoverse-N1`), where `neojson` currently uses its portable scalar `yyjson` + COW path rather than native ARM SIMD intrinsics, parse throughput stays within **2.5%** of `yyjson` (`0.97×`) while serialization remains **1.27× faster**.
+
+![neojson throughput on x86-64 AVX2](assets/bench_overview_x86_64.svg)
+
+| Architecture / CPU | Workload | `neojson` | `yyjson (C)` | `simdjson` (DOM) | `cpp-yyjson` | `RapidJSON` | `nlohmann::json` | `nlohmann::ordered` |
+|---|---|---|---|---|---|---|---|---|
+| **x86-64 AVX2**<br>Intel Core i7-8750H | Parse (4 files) | **2,180 MB/s** (`3.64 ms`) | 1,425 MB/s | 1,754 MB/s | 1,391 MB/s | 598 MB/s | 97 MB/s | 83 MB/s |
+| | Parse + Full Read | 1,336 MB/s (`5.94 ms`) | 1,224 MB/s | **1,379 MB/s** | 1,202 MB/s | 564 MB/s | 94 MB/s | 82 MB/s |
+| | Write (Minified) | **2,553 MB/s** (`3.11 ms`) | 1,745 MB/s | 1,600 MB/s | 1,807 MB/s | 716 MB/s | 311 MB/s | 280 MB/s |
+| | Mutable Build | 2,530 MB/s (`3.14 ms`) | 4,129 MB/s | — *(read-only)* | 4,034 MB/s | **5,177 MB/s** | 353 MB/s | 224 MB/s |
+| | Field Lookup (`twitter.json`) | **168.6 K/s** (`5.93 µs`) | 99.0 K/s | 74.5 K/s | 89.6 K/s | 105.2 K/s | 36.4 K/s | 119.2 K/s |
+| **ARM64 NEON**<br>ARM Neoverse-N1 | Parse (4 files) | 1,115 MB/s (`7.12 ms`) | 1,145 MB/s | **1,174 MB/s** | 1,145 MB/s | 443 MB/s | 62 MB/s | 56 MB/s |
+| | Parse + Full Read | 779 MB/s (`10.2 ms`) | 973 MB/s | 968 MB/s | **1,005 MB/s** | 419 MB/s | 60 MB/s | 55 MB/s |
+| | Write (Minified) | **1,702 MB/s** (`4.66 ms`) | 1,337 MB/s | 1,083 MB/s | 1,340 MB/s | 557 MB/s | 258 MB/s | 267 MB/s |
+| | Mutable Build | 1,670 MB/s (`4.75 ms`) | 3,421 MB/s | — *(read-only)* | 3,096 MB/s | **4,137 MB/s** | 240 MB/s | 168 MB/s |
+| | Field Lookup (`twitter.json`) | **124.8 K/s** (`8.02 µs`) | 98.2 K/s | 63.5 K/s | 84.2 K/s | 96.4 K/s | 49.1 K/s | 106.6 K/s |
+
+See [docs/benchmarks.md](docs/benchmarks.md) for the ARM64 NEON chart, full per-file breakdown chart and tables, methodology notes (`simdjson` pre-padded DOM, `RapidJSON` baseline SIMD flags), and reproduction commands under [`bench/`](bench/).
+
 ## Examples
 
 Runnable C++17 examples are listed in [examples/README.md](examples/README.md) (`NEOJSON_BUILD_EXAMPLES` defaults to `OFF` so downstream `FetchContent` consumers do not build examples unless requested):

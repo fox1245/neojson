@@ -1,0 +1,11 @@
+{
+  "source": "https://github.com/ibireme/yyjson_benchmark (MIT), the files that cpp-yyjson's benchmark also uses",
+  "base_url": "https://raw.githubusercontent.com/ibireme/yyjson_benchmark/45cc4a308eafcebd696101e74146127a72ecec85/data/json/",
+  "files": [
+    {"name": "canada.json", "sha256": "f83b3b354030d5dd58740c68ac4fecef64cb730a0d12a90362a7f23077f50d78"},
+    {"name": "citm_catalog.json", "sha256": "a73e7a883f6ea8de113dff59702975e60119b4b58d451d518a929f31c92e2059"},
+    {"name": "gsoc-2018.json", "sha256": "72f1ef4898d88049da856c2ab8f4ec3e2c968ce209b2bbfd16cef842eb2e185f"},
+    {"name": "twitter.json", "sha256": "a08b769f32b95f426cbc3abafcec65c1a19d3eb544d4ddf320eae142c99efc5d",
+     "lookup": ["statuses", "user", "screen_name", "retweet_count", "entities", "hashtags"]}
+  ]
+}
