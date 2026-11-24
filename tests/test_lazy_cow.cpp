@@ -3757,4 +3757,271 @@ TEST(LazyCow, MutableDomBuildNeonAndHashIndexStress) {
     }
 }
 
+TEST(LazyCow, Short15LongMruAndNestedLargeObjectShapeHints) {
+    // 1. 40 sequential documents crossing the 5-bit doc_stamp wrap (31 -> 1)
+    //    for both ShortStr7Cache and ShortStr15Cache, verifying repeated vs altered
+    //    1..7B, 8..15B, and empty strings never alias stale slots across docs.
+    for (int d = 0; d < 40; ++d) {
+        std::string ds = std::to_string(d);
+        if (ds.size() < 2u) {
+            ds = "0" + ds;
+        }
+        std::string text = "{";
+        text += R"("empty":"",)";
+        text += R"("s1":"a","s1_rep":"a",)";
+        text += R"("s7":"tag_007","s7_rep":"tag_007",)";
+        text += R"("s7_var":"d_var)" + ds + R"(",)";
+        text += R"("s8":"eight_ch","s8_rep":"eight_ch",)";
+        text += R"("s8_var":"v8_doc)" + ds + R"(",)";
+        text += R"("s15":"fifteen_chars15","s15_rep":"fifteen_chars15",)";
+        text += R"("s15_var":"fifteen_var__)" + ds + R"(",)";
+        text += R"("arr":["","a","tag_007","eight_ch","fifteen_chars15","fifteen_var__)" + ds +
+                R"("])";
+        text.push_back('}');
+
+        jk doc = jk::parse(text);
+        oj ref = oj::parse(text);
+        // Visit all materialized fields to trigger lazy arena materialization.
+        for (auto it = doc.cbegin(); it != doc.cend(); ++it) {
+            EXPECT_FALSE(it.key().empty());
+        }
+        neojson::test::assert_equivalent(ref, doc);
+        EXPECT_EQ(doc.dump(), ref.dump());
+    }
+
+    // 2. LongStrInternCache MRU promotion, near-collision rejection (matching
+    //    head/mid/tail & len%256 with a single interior flipped byte), and
+    //    length sweeps spanning NEON 256B + <64B tail / AVX2 64B/128B boundaries.
+    {
+        auto make_long = [](const std::size_t len, const char fill, const std::size_t flip_pos,
+                            const char flip_ch) {
+            std::string s(len, fill);
+            for (std::size_t i = 0; i < 10u && i < len; ++i) {
+                s[i] = static_cast<char>('A' + (i % 26));
+                s[len - 1u - i] = static_cast<char>('z' - (i % 26));
+            }
+            const std::size_t mid = len >> 1u;
+            for (std::size_t i = 0; i < 10u && (mid + i) < len; ++i) {
+                s[mid + i] = static_cast<char>('0' + (i % 10));
+            }
+            if (flip_pos < len) {
+                s[flip_pos] = flip_ch;
+            }
+            return s;
+        };
+
+        const std::vector<std::size_t> lens = {16u,  17u,  31u,  32u,  33u,  63u,  64u,  65u,
+                                               127u, 128u, 129u, 255u, 256u, 257u, 271u, 289u,
+                                               319u, 520u};
+        std::string text = "[";
+        bool first = true;
+        for (const std::size_t len : lens) {
+            const std::size_t flip = (len > 24u) ? 12u : (len - 9u);
+            const std::string a = make_long(len, 'm', flip, 'X');
+            const std::string b = make_long(len, 'm', flip, 'Y');
+            const std::string c = make_long(len + 256u, 'm', flip, 'Z');
+            for (const std::string& val : {a, b, a, b, c, a}) {
+                if (!first) {
+                    text.push_back(',');
+                }
+                first = false;
+                text += "\"" + val + "\"";
+            }
+        }
+        text.push_back(']');
+
+        jk doc = jk::parse(text);
+        oj ref = oj::parse(text);
+        for (const auto& el : doc) {
+            EXPECT_GE(el.get_ref<const std::string&>().size(), 16u);
+        }
+        neojson::test::assert_equivalent(ref, doc);
+        EXPECT_EQ(doc.dump(), ref.dump());
+    }
+
+    // 3. Nested >64-key objects with duplicate keys (exercising med_keys/med_vals
+    //    re-entrant slicing and sibling prev_shape_slot hits/misses across shapes,
+    //    empty containers, scalars, and workstack depth > 36).
+    {
+        auto make_item_s1 = [](const int id) {
+            return std::string(R"({"id":)") + std::to_string(id) +
+                   R"(,"name":"fifteen_chars15","short7":"ok_7chr","sub":{"flag":true,"k":)" +
+                   std::to_string(id * 2) +
+                   R"(},"long":"repeated_long_string_value_exceeding_32_bytes_for_interning"})";
+        };
+        auto make_item_s2 = [](const int id) {
+            return std::string(R"({"id":)") + std::to_string(id) +
+                   R"(,"other_very_long_key_above_thirty_two_bytes":false})";
+        };
+
+        std::string inner_large = "{";
+        for (int i = 0; i < 75; ++i) {
+            if (i > 0) {
+                inner_large.push_back(',');
+            }
+            inner_large += "\"inner_k_" + std::to_string(i) + "\":" + make_item_s1(i + 100);
+        }
+        inner_large += ",\"inner_k_0\":" + make_item_s2(999);
+        inner_large += ",\"inner_k_37\":\"overwritten_leaf\"}";
+
+        // Deep chain (> 38 levels) to force workstack pushes inside nested medium object.
+        std::string deep = "{\"leaf\":42}";
+        for (int d = 0; d < 38; ++d) {
+            deep = "{\"lvl\":" + deep + "}";
+        }
+
+        std::string outer = "{";
+        for (int i = 0; i < 82; ++i) {
+            if (i > 0) {
+                outer.push_back(',');
+            }
+            outer += "\"outer_key_" + std::to_string(i) + "\":";
+            if (i == 5 || i == 40) {
+                outer += inner_large;
+            } else if (i == 12) {
+                outer += make_item_s2(i);
+            } else if (i == 20) {
+                outer += "{}";
+            } else if (i == 21) {
+                outer += "[]";
+            } else if (i == 22) {
+                outer += "12345";
+            } else if (i == 55) {
+                outer += deep;
+            } else {
+                outer += make_item_s1(i);
+            }
+        }
+        outer += ",\"outer_key_1\":\"replaced_scalar\"";
+        outer += ",\"outer_key_50\":" + make_item_s1(777);
+        outer.push_back('}');
+
+        jk doc = jk::parse(outer);
+        oj ref = oj::parse(outer);
+        EXPECT_EQ(doc.at("outer_key_1"), "replaced_scalar");
+        neojson::test::assert_equivalent(ref, doc);
+        EXPECT_EQ(doc.dump(), ref.dump());
+    }
+
+    // 4. Homogeneous 2-key and 3-key object runs breaking on key0/key1/key2 boundaries,
+    //    length differences, escaped/string values, and >16B keys.
+    {
+        const std::string text = R"([
+            {"x":1,"y":2},
+            {"x":3,"y":4},
+            {"x":5,"y":6},
+            {"x":7,"z":8},
+            {"a":9,"y":10},
+            {"xx":11,"y":12},
+            {"x":13,"y":"str_break"},
+            {"very_long_key_over_16_bytes":1,"k":2},
+            {"very_long_key_over_16_bytes":3,"k":4},
+            {"very_long_key_over_16_bytes":5,"m":6},
+            {"x":1,"y":2,"z":3},
+            {"x":4,"y":5,"z":6},
+            {"x":7,"y":8,"w":9},
+            {"x":10,"yy":11,"z":12},
+            {"q":13,"y":14,"z":15},
+            {"x":16,"y":"brk","z":18},
+            {"another_key_longer_than_16":1,"b":2,"c":3},
+            {"another_key_longer_than_16":4,"b":5,"c":6},
+            {"another_key_longer_than_16":7,"b":8,"d":9}
+        ])";
+
+        jk doc = jk::parse(text);
+        oj ref = oj::parse(text);
+        EXPECT_EQ(doc.size(), ref.size());
+        neojson::test::assert_equivalent(ref, doc);
+        EXPECT_EQ(doc.dump(), ref.dump());
+    }
+}
+
+TEST(LazyCow, SimdStringUnrollUnicodeEscapesAndWideIndent) {
+    // 1. Long ASCII strings (>=64B..600B) with consecutive simple escapes, inline \u
+    //    escapes (ASCII, 2-byte, 3-byte, embedded NUL, surrogate pair) in the first
+    //    chunk, mid-string with >200B ASCII tail, right before closing quote, and <16B
+    //    before EOF.
+    {
+        const std::string tail_ascii(240, 'a');
+        const std::string mid_ascii(130, 'b');
+        const std::vector<std::string> cases = {
+            R"({"s":"hello\r\n\r\n\n\n\"\"\\\\\t\b\f\/)" + tail_ascii + R"("})",
+            R"({"u0":"\u0041\u00e9\u4e2d)" + tail_ascii + R"("})",
+            R"({"u1":"\uD83D\uDE00_head_)" + mid_ascii + R"(\r\n\u00e9_mid_)" + tail_ascii +
+                R"("})",
+            R"({"u2":")" + tail_ascii + R"(\u4e2d\uD83D\uDE00\n\"\\"})",
+            R"({"early":")" + std::string(14, 'x') + R"(\u0041\n","end":")" +
+                std::string(70, 'y') + R"(\u00e9"})",
+            R"({"short_u":"\uD83D\uDE00"})",
+            R"({"eof_tail":")" + std::string(64, 'z') + R"(\u0041abc"})",
+        };
+        for (const std::string& raw : cases) {
+            jk doc = jk::parse(raw);
+            oj ref = oj::parse(raw);
+            for (auto it = doc.cbegin(); it != doc.cend(); ++it) {
+                EXPECT_FALSE(it.key().empty());
+            }
+            neojson::test::assert_equivalent(ref, doc);
+            EXPECT_EQ(doc.dump(), ref.dump());
+        }
+
+        // Embedded NUL via \u0000 inside long unrolled string must preserve full length.
+        const std::string nul_raw =
+            R"({"nul":")" + mid_ascii + R"(\u0000)" + tail_ascii + R"(\u0000tail"})";
+        jk nul_doc = jk::parse(nul_raw);
+        oj nul_ref = oj::parse(nul_raw);
+        EXPECT_EQ(nul_doc.at("nul").get_ref<const std::string&>(),
+                  nul_ref.at("nul").get_ref<const std::string&>());
+        EXPECT_EQ(nul_doc.dump(), nul_ref.dump());
+    }
+
+    // 2. Invalid escape sequences inside fast string paths must throw parse_error.
+    {
+        const std::string pad(80, 'p');
+        const std::vector<std::string> bad_cases = {
+            R"({"x":")" + pad + R"(\u123G)" + pad + R"("})",
+            R"({"x":")" + pad + R"(\uD800)" + pad + R"("})",
+            R"({"x":")" + pad + R"(\uD800\u0041)" + pad + R"("})",
+            R"({"x":")" + pad + R"(\u12)" + R"("})",
+            R"({"x":")" + pad + R"(\q)" + pad + R"("})",
+            R"({"x":"\uD800"})",
+            R"({"x":")" + pad + R"(\"})",
+        };
+        for (const std::string& bad : bad_cases) {
+            EXPECT_THROW((void)jk::parse(bad), jk::parse_error) << bad;
+        }
+    }
+
+    // 3. Pretty-printed JSON with 15..40 space indentations before object keys, array
+    //    elements, and closing braces/brackets (exercising 16..31B and >=32B paths).
+    {
+        const std::vector<std::size_t> indents = {15u, 16u, 17u, 20u, 24u,
+                                                  29u, 31u, 32u, 33u, 40u};
+        for (const std::size_t sp_cnt : indents) {
+            const std::string ind(sp_cnt, ' ');
+            const std::string ind2(sp_cnt + 2u, ' ');
+            std::string pretty = "{\n";
+            pretty += ind + "\"k1\": [\n";
+            pretty += ind2 + "1,\n";
+            pretty += ind2 + "2,\n";
+            pretty += ind2 + "{\n";
+            pretty += ind2 + "  \"nested_a\": \"val_a\",\n";
+            pretty += ind2 + "  \"nested_b\": true\n";
+            pretty += ind2 + "}\n";
+            pretty += ind + "],\n";
+            pretty += ind + "\"k2\": {\n";
+            pretty += ind2 + "\"x\": 10,\n";
+            pretty += ind2 + "\"y\": 20\n";
+            pretty += ind + "},\n";
+            pretty += ind + "\"k3\": \"done\"\n";
+            pretty += "}";
+
+            jk doc = jk::parse(pretty);
+            oj ref = oj::parse(pretty);
+            neojson::test::assert_equivalent(ref, doc);
+            EXPECT_EQ(doc.dump(), ref.dump());
+        }
+    }
+}
+
 } // namespace

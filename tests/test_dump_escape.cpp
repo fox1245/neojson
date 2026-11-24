@@ -103,4 +103,79 @@ TEST(DumpEscape, RandomBytes) {
     }
 }
 
+TEST(DumpEscape, LazyDirectFlatBoundariesAndAllEscapes) {
+    auto verify_raw = [](const std::string& raw) {
+        const auto oracle = nlohmann::ordered_json::parse(raw);
+        const auto candidate = neojson::json::parse(raw);
+        EXPECT_EQ(candidate.dump(), oracle.dump());
+    };
+
+    // 1. Every control byte 0x00..0x1F, quote, backslash, slash-escape, and multi-byte UTF-8
+    // across prefix lengths 0..64 and suffix lengths 0..33 (exercising 32B AVX2, 16B SSE2/NEON, and <16B tails).
+    std::vector<std::string> esc_tokens;
+    constexpr char kHex[] = "0123456789abcdef";
+    for (int b = 0; b < 0x20; ++b) {
+        std::string tok = "\\u00";
+        tok.push_back(kHex[(b >> 4) & 0xF]);
+        tok.push_back(kHex[b & 0xF]);
+        esc_tokens.push_back(tok);
+    }
+    esc_tokens.push_back("\\\"");
+    esc_tokens.push_back("\\\\");
+    esc_tokens.push_back("\\/"); // decoded to '/' with NOESC cleared
+    esc_tokens.push_back("\xC3\xA9");
+    esc_tokens.push_back("\xE2\x82\xAC");
+    esc_tokens.push_back("\xF0\x9F\x98\x80");
+
+    for (std::size_t tok_i = 0; tok_i < esc_tokens.size(); ++tok_i) {
+        for (std::size_t pre = 0; pre <= 64u; ++pre) {
+            if (pre > 35u && pre < 62u && tok_i > 3u) continue;
+            const std::size_t suf = (tok_i + pre) % 34u;
+            const std::string inner = std::string(pre, 'a') + esc_tokens[tok_i] + std::string(suf, 'z');
+            verify_raw("{\"" + inner + "\":\"ok\",\"k\":\"" + inner + "\"}");
+            verify_raw("[\"" + inner + "\"]");
+            if (::testing::Test::HasFailure()) return;
+        }
+    }
+    for (std::size_t suf = 0; suf <= 33u; ++suf) {
+        const std::string s0 = std::string(15u, 'p') + "\\u0007" + std::string(suf, 'q');
+        const std::string s1 = std::string(31u, 'r') + "\\n" + std::string(suf, 's');
+        verify_raw("{\"a\":\"" + s0 + "\",\"" + s1 + "\":\"" + s1 + "\"}");
+        if (::testing::Test::HasFailure()) return;
+    }
+
+    // 2. Consecutive escape runs placed at SIMD/scalar boundary offsets.
+    const std::string run = "\\n\\n\\t\\\"\\\\\\u0000\\u0001\\u001f\\/\\b\\f\\r";
+    for (const std::size_t off : {std::size_t{0}, std::size_t{14}, std::size_t{15}, std::size_t{16},
+                                  std::size_t{30}, std::size_t{31}, std::size_t{32}, std::size_t{33}}) {
+        const std::string inner = std::string(off, 'x') + run + std::string((off + 7u) % 20u, 'y');
+        verify_raw("{\"" + inner + "\":\"" + inner + "\"}");
+        if (::testing::Test::HasFailure()) return;
+    }
+
+    // 3. Long escaped strings crossing stage buffer boundaries (8192 / 16384) and long NOESC strings as final entries.
+    for (const std::size_t len : {std::size_t{9000}, std::size_t{18000}}) {
+        std::string inner(len, 'm');
+        inner.replace(17, 6, "\\u0001");
+        inner.replace(8188, 4, "\\\"\\\\");
+        if (len > 16395) {
+            inner.replace(16380, 6, "\\u001e");
+        }
+        verify_raw("{\"tail\":\"" + inner + "\"}");
+        verify_raw("[\"" + inner + "\"]");
+        verify_raw("{\"" + inner + "\":\"" + inner + "\"}");
+        if (::testing::Test::HasFailure()) return;
+    }
+    for (const std::size_t noesc_len : {std::size_t{300}, std::size_t{8200}, std::size_t{17000}}) {
+        const std::string plain(noesc_len, 'k');
+        verify_raw("{\"" + plain + "\":\"" + plain + "\"}");
+        verify_raw("[\"" + plain + "\"]");
+        if (::testing::Test::HasFailure()) return;
+    }
+
+    // 4. Empty string and pure slash-escape string.
+    verify_raw("{\"empty\":\"\",\"slash\":\"\\/\"}");
+    verify_raw("[\"\",\"\\/\"]");
+}
+
 }  // namespace
