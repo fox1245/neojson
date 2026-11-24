@@ -1,0 +1,11 @@
+prefix=@NEOJSON_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@NEOJSON_PC_LIBDIR@
+includedir=@NEOJSON_PC_INCLUDEDIR@
+
+Name: neojson
+Description: @PROJECT_DESCRIPTION@
+URL: @PROJECT_HOMEPAGE_URL@
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lneojson
+Cflags: -I${includedir}

@@ -48,6 +48,9 @@
 #include <sanitizer/asan_interface.h>
 #endif
 
+#if !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+#define yyjson_api __attribute__((visibility("hidden")))
+#endif
 #include "yyjson.h"
 
 namespace neojson {

@@ -7,6 +7,7 @@
 **An nlohmann-compatible C++ JSON API combining native AVX2/NEON/SWAR SIMD parsers, vendored yyjson, and a lazy COW DOM.**
 
 [![CI](https://github.com/fox1245/neojson/actions/workflows/ci.yml/badge.svg)](https://github.com/fox1245/neojson/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/fox1245/neojson)](https://github.com/fox1245/neojson/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](CMakeLists.txt)
 
@@ -14,7 +15,7 @@
 
 ---
 
-An implementation of the `nlohmann::ordered_json` API combining native x86-64 AVX2 and ARM64 NEON SIMD parsers (with vendored `yyjson` fallback on unsupported targets and small/comment/BOM inputs) and a lazy Copy-on-Write DOM. The library exposes one value type, `neojson::json`: an owned node tree with nlohmann's semantics (objects keep the order of insertion, integers are signed or unsigned, and so on) that materializes lazily from the flat parsed document. Differential tests against nlohmann/json are the specification. Work in progress.
+An implementation of the `nlohmann::ordered_json` API combining native x86-64 AVX2 and ARM64 NEON SIMD parsers (with vendored `yyjson` fallback on unsupported targets and small/comment/BOM inputs) and a lazy Copy-on-Write DOM. The library exposes one value type, `neojson::json`: an owned node tree with nlohmann's semantics (objects keep the order of insertion, integers are signed or unsigned, and so on) that materializes lazily from the flat parsed document. Differential tests against nlohmann/json serve as the behavioral specification.
 
 License: MIT. yyjson (vendor/yyjson) is MIT licensed.
 
@@ -47,6 +48,60 @@ On x86-64 AVX2 (`Intel Core i7-8750H`), `neojson` parses **31.1× faster** than 
 4. **Contiguous keys + open-addressed indexing & compact DOM builders (`1.71×` lookup x86-64, `1.26×` ARM64)**: Unlike `yyjson`'s flat preorder object scan (`O(N)`), `ArenaObject` stores keys contiguously and builds an open-addressed `ArenaHashIndex` lazily above 16 keys (`kOrderedMapHashThreshold`), while mutable `json` containers use compact `SmallArray2`/`SmallObject4` slabs with NEON/SSE2 tag scanning and single-probe `ordered_map` indexing (`11.0×` / `10.1×` faster build than `nlohmann::ordered_json` on x86-64 / ARM64).
 
 See [docs/benchmarks.md](docs/benchmarks.md) for the ARM64 NEON chart, full per-file breakdown chart and tables, methodology notes (`simdjson` pre-padded DOM, `RapidJSON` baseline SIMD flags), and reproduction commands under [`bench/`](bench/).
+
+## Installation
+
+### CMake `FetchContent` (Recommended)
+
+When consumed as a CMake subproject via `FetchContent` or `add_subdirectory`, `NEOJSON_BUILD_TESTS`, `NEOJSON_BUILD_EXAMPLES`, and `NEOJSON_INSTALL` default to `OFF` automatically:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+    neojson
+    GIT_REPOSITORY https://github.com/fox1245/neojson.git
+    GIT_TAG        v0.1.0
+)
+FetchContent_MakeAvailable(neojson)
+
+target_link_libraries(my_app PRIVATE neojson::neojson)
+```
+
+### System / Prefix Install (`find_package`)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNEOJSON_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build --parallel
+cmake --install build
+```
+
+Then in your downstream `CMakeLists.txt`:
+
+```cmake
+find_package(neojson 0.1 CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE neojson::neojson)
+```
+
+### `pkg-config`
+
+```bash
+g++ -std=c++17 main.cpp $(pkg-config --cflags --libs neojson) -o my_app
+```
+
+### Quick Start
+
+```cpp
+#include <neojson/json.hpp>
+#include <iostream>
+#include <utility>
+
+int main() {
+    neojson::json doc = neojson::json::parse(R"({"z":1,"a":[10,20]})");
+    const auto& ro = std::as_const(doc);
+    std::cout << ro.at("a").at(1).get<int>() << '\n';  // 20
+    std::cout << ro.dump() << '\n';                    // {"z":1,"a":[10,20]}
+}
+```
 
 ## Examples
 

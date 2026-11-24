@@ -1,8 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(neojson VERSION 0.0.1 LANGUAGES C CXX)
+project(neojson
+    VERSION 0.1.0
+    DESCRIPTION "An nlohmann-compatible C++17 JSON library with native AVX2/NEON SIMD parsers and a lazy COW DOM"
+    HOMEPAGE_URL "https://github.com/fox1245/neojson"
+    LANGUAGES C CXX)
 
-option(NEOJSON_BUILD_TESTS "Build the tests (differential tests need nlohmann/json, fetched at configure time)" ON)
+string(COMPARE EQUAL "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}" NEOJSON_IS_TOP_LEVEL)
+
+option(NEOJSON_BUILD_TESTS "Build the tests (differential tests need nlohmann/json, fetched at configure time)" ${NEOJSON_IS_TOP_LEVEL})
 option(NEOJSON_BUILD_EXAMPLES "Build the example programs" OFF)
+option(NEOJSON_INSTALL "Generate installation targets for neojson" ${NEOJSON_IS_TOP_LEVEL})
 option(NEOJSON_SANITIZE "Build everything with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(NEOJSON_TEST_TIME_BOUNDS
     "Give the large-input parse tests a short CTest timeout, so that a cost that grows with the square of the input fails them (turn OFF for sanitizer builds, which run them several hundred times slower and should check results only)"
@@ -17,15 +24,35 @@ if(NEOJSON_SANITIZE)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_library(neojson_yyjson OBJECT vendor/yyjson/yyjson.c)
-set_target_properties(neojson_yyjson PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+include(GNUInstallDirs)
 
-file(GLOB NEOJSON_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/*.cpp)
-add_library(neojson ${NEOJSON_SOURCES} $<TARGET_OBJECTS:neojson_yyjson>)
+add_library(neojson_yyjson OBJECT vendor/yyjson/yyjson.c)
+set_target_properties(neojson_yyjson PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden)
+target_compile_definitions(neojson_yyjson PRIVATE yyjson_api=)
+
+if(WIN32)
+    add_library(neojson STATIC
+        src/json.cpp
+        $<TARGET_OBJECTS:neojson_yyjson>)
+else()
+    add_library(neojson
+        src/json.cpp
+        $<TARGET_OBJECTS:neojson_yyjson>)
+endif()
 add_library(neojson::neojson ALIAS neojson)
+set_target_properties(neojson PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_EXTENSIONS OFF
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+target_compile_features(neojson PUBLIC cxx_std_17)
 target_include_directories(neojson
-    PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-    PRIVATE ${PROJECT_SOURCE_DIR}/vendor/yyjson)
+    PUBLIC
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/vendor/yyjson)
 target_compile_options(neojson PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>
     $<$<CXX_COMPILER_ID:MSVC>:/W4>)
@@ -74,4 +101,61 @@ endif()
 if(NEOJSON_BUILD_EXAMPLES)
     enable_testing()
     add_subdirectory(examples)
+endif()
+
+if(NEOJSON_INSTALL)
+    include(CMakePackageConfigHelpers)
+
+    install(TARGETS neojson
+        EXPORT neojsonTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    install(EXPORT neojsonTargets
+        FILE neojsonTargets.cmake
+        NAMESPACE neojson::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neojson)
+
+    configure_package_config_file(
+        ${PROJECT_SOURCE_DIR}/cmake/neojsonConfig.cmake.in
+        ${PROJECT_BINARY_DIR}/neojsonConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neojson)
+
+    write_basic_package_version_file(
+        ${PROJECT_BINARY_DIR}/neojsonConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion)
+
+    install(FILES
+        ${PROJECT_BINARY_DIR}/neojsonConfig.cmake
+        ${PROJECT_BINARY_DIR}/neojsonConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/neojson)
+
+    if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(NEOJSON_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(NEOJSON_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        file(RELATIVE_PATH NEOJSON_PC_REL_TO_PREFIX
+            "${PROJECT_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${PROJECT_BINARY_DIR}")
+        string(REGEX REPLACE "/$" "" NEOJSON_PC_REL_TO_PREFIX "${NEOJSON_PC_REL_TO_PREFIX}")
+        set(NEOJSON_PC_PREFIX "\${pcfiledir}/${NEOJSON_PC_REL_TO_PREFIX}")
+        set(NEOJSON_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(NEOJSON_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(NEOJSON_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+    configure_file(
+        ${PROJECT_SOURCE_DIR}/cmake/neojson.pc.in
+        ${PROJECT_BINARY_DIR}/neojson.pc
+        @ONLY)
+    install(FILES ${PROJECT_BINARY_DIR}/neojson.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
