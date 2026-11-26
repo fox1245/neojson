@@ -840,6 +840,9 @@ struct ArenaCtnHeader {
     std::uint32_t count = 0u;
     std::uint32_t pad = 0u;
     SharedDocHeader* doc = nullptr;
+#if defined(UINTPTR_MAX) && UINTPTR_MAX <= 0xFFFFFFFFu
+    std::uint32_t doc_pad = 0u;
+#endif
 };
 static_assert(sizeof(ArenaCtnHeader) == 16u && alignof(ArenaCtnHeader) == alignof(void*),
               "ArenaCtnHeader must stay 16-byte pointer-aligned");
@@ -863,7 +866,13 @@ struct ArenaHashIndex {
 
 struct ArenaObject : ArenaCtnHeader {
     const std::string* keys_ptr = nullptr;
+#if defined(UINTPTR_MAX) && UINTPTR_MAX <= 0xFFFFFFFFu
+    std::uint32_t keys_pad = 0u;
+#endif
     mutable std::atomic<ArenaHashIndex*> index{nullptr};
+#if defined(UINTPTR_MAX) && UINTPTR_MAX <= 0xFFFFFFFFu
+    std::uint32_t index_pad = 0u;
+#endif
 
     const std::string* keys() const noexcept {
         return keys_ptr;
@@ -7296,6 +7305,9 @@ struct SmallArray2 {
     std::uint8_t slab_cls = 2u;
     std::uint8_t pad[5]{};
     mutable std::atomic<void*> materialized_vec{nullptr};
+#if defined(UINTPTR_MAX) && UINTPTR_MAX <= 0xFFFFFFFFu
+    std::uint32_t ptr_pad = 0u;
+#endif
 
     SmallArray2() noexcept = default;
     NEOJSON_ALWAYS_INLINE SmallArray2(const std::uint8_t n, const std::uint8_t c,
@@ -7385,6 +7397,9 @@ struct SmallObject4 {
     std::uint16_t key_used = 0u;
     std::uint16_t key_cap = 0u;
     mutable std::atomic<SmallObjAux*> aux{nullptr};
+#if defined(UINTPTR_MAX) && UINTPTR_MAX <= 0xFFFFFFFFu
+    std::uint32_t ptr_pad = 0u;
+#endif
 
     SmallObject4() noexcept = default;
     NEOJSON_ALWAYS_INLINE SmallObject4(const std::uint8_t n, const std::uint8_t c,
