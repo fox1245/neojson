@@ -924,12 +924,18 @@ void shared_doc_release_slow(SharedDocHeader* hdr, const std::uint32_t n,
 
 namespace {
 
-struct alignas(16) LargeBufHeader {
+inline constexpr std::size_t kLargeBufAlign =
+    (sizeof(void*) >= 8u)
+        ? 16u
+        : (alignof(std::max_align_t) >= 8u ? 8u : alignof(std::max_align_t));
+
+struct alignas(kLargeBufAlign) LargeBufHeader {
     std::size_t cap;
     std::size_t pad;
 };
-static_assert(sizeof(LargeBufHeader) == 16u && alignof(LargeBufHeader) == 16u,
-              "LargeBufHeader must preserve 16-byte payload alignment");
+static_assert(sizeof(LargeBufHeader) == (sizeof(void*) >= 8u ? 16u : 8u) &&
+                  alignof(LargeBufHeader) == kLargeBufAlign,
+              "LargeBufHeader must preserve allocator alignment");
 
 struct LargeCacheSlot {
     LargeBufHeader* hdr;
@@ -3392,14 +3398,8 @@ struct DocArena {
     NEOJSON_NOINLINE void track_heap_string(std::string* s) {
         HeapStrBlock* b = heap_str_head;
         if (b == nullptr || b->count == HeapStrBlock::kCap) {
-            try {
-                void* mem = alloc(sizeof(HeapStrBlock));
-                b = ::new (mem) HeapStrBlock();
-            } catch (...) {
-                using StringT = std::string;
-                s->~StringT();
-                throw;
-            }
+            void* mem = alloc(sizeof(HeapStrBlock));
+            b = ::new (mem) HeapStrBlock();
             b->next = heap_str_head;
             heap_str_head = b;
         }
@@ -3424,7 +3424,8 @@ struct DocArena {
         if (len <= 15u) {
             ::new (static_cast<void*>(dst)) std::string(p, len);
 #if !(defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1) && \
-    !defined(_LIBCPP_VERSION) && !defined(_MSVC_STL_VERSION)
+    !(defined(_LIBCPP_VERSION) && defined(UINTPTR_MAX) && UINTPTR_MAX > 0xFFFFFFFFu) && \
+    !defined(_MSVC_STL_VERSION)
             if (!string_is_inline(*dst)) {
                 try {
                     track_heap_string_fast(dst);
@@ -3744,7 +3745,8 @@ struct DupProbeEntry {
     std::uint32_t vec_idx = 0;
     std::uint32_t stamp = 0;
 };
-static_assert(sizeof(DupProbeEntry) == 32u, "DupProbeEntry should stay 32 bytes");
+static_assert(sizeof(DupProbeEntry) == (sizeof(void*) == 8u ? 32u : 20u),
+              "DupProbeEntry layout regression");
 
 inline thread_local bool t_dup_probe_init = false;
 inline thread_local bool t_dup_probe_dead = false;
@@ -4214,7 +4216,8 @@ struct KeyInternSlot {
     std::uint32_t len = 0u;
     std::uint32_t key_id = 0u;
 };
-static_assert(sizeof(KeyInternSlot) == 24u, "KeyInternSlot must stay 24 bytes");
+static_assert(sizeof(KeyInternSlot) == (sizeof(void*) == 8u ? 24u : 20u),
+              "KeyInternSlot layout regression");
 
 struct KeySeenToken {
     std::uint64_t token = 0u;
@@ -4538,7 +4541,8 @@ struct ShapeEntry {
         return static_cast<std::size_t>(static_cast<std::uint16_t>(header64 >> 48u));
     }
 };
-static_assert(sizeof(ShapeEntry) == 32u, "ShapeEntry must stay 32 bytes");
+static_assert(sizeof(ShapeEntry) <= 32u && (sizeof(void*) != 8u || sizeof(ShapeEntry) == 32u),
+              "ShapeEntry must stay <= 32 bytes (exact 32 on 64-bit)");
 
 struct ArenaShapeCache {
     static constexpr std::size_t kNumSets = 32u;
@@ -4764,7 +4768,8 @@ NEOJSON_ALWAYS_INLINE SharedString* alloc_arena_string_short_with_bump(
     ss->refcount.store(kArenaStringRef, std::memory_order_relaxed);
     ss->owner_doc = sdoc;
 #if !(defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI == 1) && \
-    !defined(_LIBCPP_VERSION) && !defined(_MSVC_STL_VERSION)
+    !(defined(_LIBCPP_VERSION) && defined(UINTPTR_MAX) && UINTPTR_MAX > 0xFFFFFFFFu) && \
+    !defined(_MSVC_STL_VERSION)
     if (!string_is_inline(ss->value)) {
         sdoc->arena.bump_ptr = bp;
         try {
